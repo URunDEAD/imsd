@@ -5,7 +5,7 @@
 # (or replaced here by a bootstrap invocation). Until then this documents
 # the packaging shape.
 pkgname=imsd
-pkgver=0.2.7
+pkgver=0.3.0
 pkgrel=0
 pkgdesc="Userspace IMS/VoLTE daemon for mainline Linux phones"
 url="https://forgejo.catcrafts.net/Catcrafts/imsd"

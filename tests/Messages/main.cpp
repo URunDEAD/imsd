@@ -222,6 +222,44 @@ int main() {
         Eq(BuildInvite(c, d, Sdp, /*precond=*/false), Invite, "INVITE + AMR-WB SDP offer");
     }
 
+    // ---- emergency INVITE: byte-identical to the plain INVITE except the
+    // Request-URI and To carry the service URN (RFC 5031 / TS 24.229 5.1.6)
+    {
+        Dialog d;
+        d.ruri = std::string(SosUrn);
+        d.callid = "CALLID789@2001:db8::db43";
+        d.itag = "ITAG123456";
+        d.invBranch = "INVBRANCH0000000000";
+        std::string want(Invite);
+        auto swap = [&](std::string_view from, std::string_view to) {
+            std::size_t at = want.find(from);
+            Check(at != std::string::npos, "sos pin template line present");
+            if (at != std::string::npos) want.replace(at, from.size(), to);
+        };
+        swap("INVITE sip:1233;phone-context=ims.mnc001.mcc001.3gppnetwork.org@ims.mnc001.mcc001.3gppnetwork.org;user=phone SIP/2.0\r\n",
+             "INVITE urn:service:sos SIP/2.0\r\n");
+        swap("To: <sip:1233;phone-context=ims.mnc001.mcc001.3gppnetwork.org@ims.mnc001.mcc001.3gppnetwork.org;user=phone>\r\n",
+             "To: <urn:service:sos>\r\n");
+        Eq(BuildInvite(c, d, Sdp, /*precond=*/false), want, "emergency INVITE (urn:service:sos)");
+    }
+
+    // ---- IsEmergency classification
+    Check(IsEmergency("112"), "112 is emergency");
+    Check(IsEmergency("911"), "911 is emergency");
+    Check(IsEmergency("1 1 2"), "space separators stripped");
+    Check(IsEmergency("1-1-2"), "dash separators stripped");
+    Check(!IsEmergency("0112"), "prefixed 112 is not emergency");
+    Check(!IsEmergency("1120"), "suffixed 112 is not emergency");
+    Check(!IsEmergency("+31612345678"), "E.164 number is not emergency");
+    Check(!IsEmergency(""), "empty string is not emergency");
+    Check(!IsEmergency("199"), "extra number not classified by default");
+    {
+        std::vector<std::string> extra = {"199", "088"};
+        Check(IsEmergency("199", extra), "EMERGENCY_NUMBERS extra matches");
+        Check(IsEmergency("088", extra), "second extra matches");
+        Check(!IsEmergency("19", extra), "extra requires exact match");
+    }
+
     // ---- in-dialog PRACK/BYE + ACK + CANCEL + 200 (structural checks)
     {
         Dialog d;

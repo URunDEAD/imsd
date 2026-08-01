@@ -41,7 +41,7 @@ import Imsd;
 namespace {
 
 // ---- static config (env-overridable, same knobs as imsd.py) ---------------
-constexpr const char* Version = "0.2.7";
+constexpr const char* Version = "0.3.0";
 constexpr const char* BusName = "net.catcrafts.IMS1";
 constexpr const char* ObjPath = "/net/catcrafts/IMS1";
 constexpr const char* Iface = "net.catcrafts.IMS1";
@@ -571,6 +571,18 @@ public:
         precond_ = EnvOr("PRECOND", "0") == "1";
         ealgOffer_ = EnvOr("EALG", "aes-cbc");
         mediaBin_ = ResolveMediaBin();
+        // EMERGENCY_NUMBERS: comma-separated additions to the builtin
+        // 112/911 (a lab core's advertised short code, carrier extras).
+        std::string extra = EnvOr("EMERGENCY_NUMBERS", "");
+        for (std::size_t pos = 0; pos <= extra.size();) {
+            std::size_t comma = extra.find(',', pos);
+            std::size_t end = comma == std::string::npos ? extra.size() : comma;
+            std::string n = extra.substr(pos, end - pos);
+            std::erase(n, ' ');
+            if (!n.empty()) emergencyExtra_.push_back(std::move(n));
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
     }
 
     void SetLocal(std::string l) { local_ = std::move(l); }
@@ -672,6 +684,7 @@ private:
 
     // config
     std::string pcscf_, dev_, outDir_, local_, ealgOffer_, mediaBin_;
+    std::vector<std::string> emergencyExtra_;
     int pcscfPort_ = 5060;
     int rtpPort_ = 50004;
     bool precond_ = false;
@@ -1098,20 +1111,34 @@ private:
     void HandleCmd(const Cmd& c) {
         if (c.kind == Cmd::Kind::Stop) { quit_.store(true); return; }
         if (c.kind == Cmd::Kind::Dial) {
+            bool emergency = imsd::msg::IsEmergency(c.number, emergencyExtra_);
             if (call_) {
-                Log(std::format("dial({}) refused: call in progress", c.number));
-                CallInfo bad{c.uni, c.number, "terminated", "error", NowEpoch(), 0};
-                PostAdded(bad);
-                PostState(c.uni, "terminated", "error");
-                PostDeleted(c.uni);
-                return;
+                if (!emergency) {
+                    Log(std::format("dial({}) refused: call in progress", c.number));
+                    CallInfo bad{c.uni, c.number, "terminated", "error", NowEpoch(), 0};
+                    PostAdded(bad);
+                    PostState(c.uni, "terminated", "error");
+                    PostDeleted(c.uni);
+                    return;
+                }
+                // an emergency dial preempts whatever exists (TS 22.101):
+                // release it; if it lingers awaiting a CANCEL's 487, abandon
+                // it — the late final is ignored by Call-ID mismatch
+                Log(std::format("emergency dial: preempting call {}", call_->Uni()));
+                Execute(call_->OnHangup());
+                MaybeDropCall();
+                if (call_) { Execute(call_->Abandon("preempted by emergency dial")); MaybeDropCall(); }
             }
             // a dead client flow fails the INVITE instantly — give the
             // reconnect path one immediate shot first (user action beats
             // the backoff timer)
             if (!sip_.Alive()) { nextReconnect_ = 0; MaybeReconnect(); }
             RefreshPani();
-            call_.emplace(ctx_, rng_, c.uni, c.number, rtpPort_, precond_);
+            if (emergency)
+                Log(std::format("EMERGENCY dial ({}): urn:service:sos over the live registration, "
+                                "fallback plain INVITE — stage 1, no emergency registration/PDN; "
+                                "carrier-side behavior UNVERIFIED", c.number));
+            call_.emplace(ctx_, rng_, c.uni, c.number, rtpPort_, precond_, emergency);
             CallInfo info{c.uni, c.number, "dialing", "outgoing", NowEpoch(), 0};
             PostAdded(info);
             bool ok = Execute(call_->Start());

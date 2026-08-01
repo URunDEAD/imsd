@@ -13,10 +13,12 @@ state and returns a list of Actions for the daemon shell to carry out — send
 this on the client flow, answer the request on the channel it came in on,
 start/stop the media leg, emit this D-Bus state change, arm this deadline.
 That keeps the whole call FSM — PRACK on reliable 18x, ACK of 2xx vs non-2xx
-finals, CANCEL/answer races, remote BYE, media-plane far-end-hangup, and the
-terminating (UAS) side: 100/180 on an inbound INVITE, 200-with-answer on
-Accept, 486 reject, the remote-CANCEL 200+487 pair — unit-testable against
-recorded network dialogs with no I/O (tests/Engine).
+finals, CANCEL/answer races, remote BYE, media-plane far-end-hangup, the
+emergency attempt chain (urn:service:sos first for a classified number, one
+fallback to a plain INVITE of the digits; a 380 Alternative Service upgrade
+the other way), and the terminating (UAS) side: 100/180 on an inbound INVITE,
+200-with-answer on Accept, 486 reject, the remote-CANCEL 200+487 pair —
+unit-testable against recorded network dialogs with no I/O (tests/Engine).
 
 State/reason strings are the frozen D-Bus vocabulary the dialer maps on
 (dialing/ringing/incoming/active/terminated; outgoing/incoming/accepted/
@@ -94,13 +96,12 @@ export namespace imsd::engine {
 
     class CallMachine {
     public:
-        CallMachine(const imsd::msg::Context& ctx, imsd::util::Rng& rng, std::string uni, std::string number, int rtpPort, bool precond)
+        // `emergency`: the shell classified the dialled string as an
+        // emergency number — the first attempt targets urn:service:sos.
+        CallMachine(const imsd::msg::Context& ctx, imsd::util::Rng& rng, std::string uni, std::string number, int rtpPort, bool precond, bool emergency = false)
             : ctx_(ctx), rng_(rng), uni_(std::move(uni)), number_(std::move(number)),
-              rtpPort_(rtpPort), precond_(precond) {
-            d_.ruri = imsd::msg::RuriFor(number_, ctx_.id.domain);
-            d_.callid = std::format("{}@{}", rng_.Token(20), ctx_.local);
-            d_.itag = rng_.Token(10);
-            d_.invBranch = rng_.Token(20);
+              rtpPort_(rtpPort), precond_(precond), attemptSos_(emergency) {
+            ResetDialog();
         }
 
         CallMachine(const imsd::msg::Context& ctx, imsd::util::Rng& rng, std::string uni, IncomingInvite in, int rtpPort)
@@ -135,8 +136,12 @@ export namespace imsd::engine {
         const std::string& Reason() const { return reason_; }
         bool Terminated() const { return state_ == CallState::Terminated; }
 
-        // Build + queue the INVITE and arm the ring timeout.
+        // Build + queue the INVITE for the current attempt and arm the ring
+        // timeout.
         std::vector<Action> Start() {
+            if (attemptSos_) sosTried_ = true;
+            else
+                plainTried_ = true;
             imsd::sdp::Offer offer;
             offer.local = ctx_.local;
             offer.rtpPort = rtpPort_;
@@ -239,13 +244,17 @@ export namespace imsd::engine {
                 return a;  // 1xx other than 100<code<200 (only 100): nothing
             if (code == 200) {
                 a.push_back(Send(imsd::msg::BuildAck2xx(ctx_, d_, rng_.Token(20), std::string(imsd::sip::Header(msg, "To").value_or("")))));
-                if (cancelled_) {
-                    // answered in the CANCEL race — we no longer want it
+                if (cancelled_ && userCancelled_) {
+                    // answered in the user's CANCEL race — we no longer want it
                     nextCseq_++;
                     a.push_back(Send(imsd::msg::BuildInDialog(ctx_, d_, "BYE", nextCseq_, rng_.Token(20))));
                     Append(a, Finish("local-hangup", "answered during our CANCEL; BYE sent"));
                     return a;
                 }
+                // An answer racing a DEADLINE-initiated CANCEL is still
+                // wanted — the user never hung up. Matters most when the sos
+                // attempt is answered at the wire just as the timeout fires:
+                // BYEing an answering PSAP is the worst possible outcome.
                 MediaLeg leg = ParseAnswer();
                 a.push_back(StartMediaAct(leg));
                 state_ = CallState::Active;
@@ -255,6 +264,10 @@ export namespace imsd::engine {
             // non-2xx final
             a.push_back(Send(imsd::msg::BuildAckNon2xx(ctx_, d_, std::string(imsd::sip::Header(msg, "To").value_or("")))));
             std::string fin = WithReason(std::format("INVITE final {}", code), msg);
+            if (auto sos = FallbackTo(code, msg)) {
+                Append(a, Retry(*sos, fin));
+                return a;
+            }
             if (cancelled_ || code == 487) Append(a, Finish("local-hangup", fin));
             else if (code == 486 || code == 480 || code == 603) Append(a, Finish("refused-or-busy", fin));
             else
@@ -338,12 +351,25 @@ export namespace imsd::engine {
                 nextCseq_++;
                 a.push_back(Send(imsd::msg::BuildInDialog(ctx_, d_, "BYE", nextCseq_, rng_.Token(20))));
                 Append(a, Finish("local-hangup", "HangUp; BYE sent"));
-            } else if ((state_ == CallState::Dialing || state_ == CallState::Ringing) && !cancelled_) {
-                a.push_back(Send(imsd::msg::BuildCancel(ctx_, d_)));
-                cancelled_ = true;
-                a.push_back(Deadline(Cancel487Timeout));
+            } else if (state_ == CallState::Dialing || state_ == CallState::Ringing) {
+                // even when a deadline already CANCELled: the user's intent
+                // also kills the emergency fallback chain
+                userCancelled_ = true;
+                if (!cancelled_) {
+                    a.push_back(Send(imsd::msg::BuildCancel(ctx_, d_)));
+                    cancelled_ = true;
+                    a.push_back(Deadline(Cancel487Timeout));
+                }
             }
             return a;
+        }
+
+        // The shell is abandoning this machine (an emergency dial preempts
+        // it while it waits on a CANCEL's 487): terminate bookkeeping only —
+        // the CANCEL already sent stands, and the late final for this
+        // Call-ID is ignored by dispatch.
+        std::vector<Action> Abandon(std::string_view detail) {
+            return Finish("local-hangup", detail);
         }
 
         // The media subprocess exited. code 3 = the downlink RTP dried up
@@ -375,6 +401,10 @@ export namespace imsd::engine {
                 a.push_back(Send(imsd::msg::BuildCancel(ctx_, d_)));
                 cancelled_ = true;
                 a.push_back(Deadline(Cancel487Timeout));
+            } else if (auto sos = FallbackTo(0, {})) {
+                // the 487 never came; an abandoned sos attempt still gets
+                // its digits fallback rather than dying silently
+                Append(a, Retry(*sos, "no final after CANCEL"));
             } else {
                 Append(a, Finish("error", "setup deadline expired"));
             }
@@ -403,8 +433,66 @@ export namespace imsd::engine {
         imsd::msg::Dialog d_;
         int nextCseq_ = 2;
         bool cancelled_ = false;
+        // The emergency attempt chain (outgoing only). attemptSos_ is what
+        // the CURRENT attempt targets; the tried flags bound the chain to
+        // one step in each direction, never a loop.
+        bool attemptSos_ = false;
+        bool sosTried_ = false;
+        bool plainTried_ = false;
+        bool userCancelled_ = false;   // CANCEL came from OnHangup, not a deadline
         std::set<std::string> pracked_;
         std::string answerSdp_;
+
+        // Fresh dialog identity for the current attempt. A fallback INVITE
+        // after a final response is a new transaction AND a clean new dialog
+        // attempt (fresh Call-ID) — the shell's dispatch then ignores late
+        // responses to the abandoned attempt by Call-ID mismatch.
+        void ResetDialog() {
+            d_ = {};
+            d_.ruri = attemptSos_ ? std::string(imsd::msg::SosUrn)
+                                  : imsd::msg::RuriFor(number_, ctx_.id.domain);
+            d_.callid = std::format("{}@{}", rng_.Token(20), ctx_.local);
+            d_.itag = rng_.Token(10);
+            d_.invBranch = rng_.Token(20);
+            nextCseq_ = 2;
+            pracked_.clear();
+            answerSdp_.clear();
+            cancelled_ = false;
+            userCancelled_ = false;
+        }
+
+        // The emergency fallback chain — where the next attempt (if any)
+        // points. `msg` may be empty (deadline paths).
+        //  - a sos INVITE that fails for any reason other than the user
+        //    hanging up is re-attempted as a plain INVITE of the dialled
+        //    digits: the pre-emergency-support behavior, so classification
+        //    can only improve on the status quo, never block a call the old
+        //    code would have placed.
+        //  - a plain INVITE answered 380 Alternative Service whose body
+        //    names emergency (TS 24.229 5.1.6: the network classified a
+        //    number we didn't) is re-attempted as urn:service:sos. A 380
+        //    without that indication terminates as an error: promoting an
+        //    arbitrary redirect would put a non-emergency call through to a
+        //    PSAP.
+        std::optional<bool> FallbackTo(int code, std::string_view msg) const {
+            if (userCancelled_) return std::nullopt;
+            if (attemptSos_) return plainTried_ ? std::nullopt : std::optional(false);
+            if (code == 380 && !sosTried_ && Body(msg).contains("emergency")) return true;
+            return std::nullopt;
+        }
+
+        // Switch the attempt and send its INVITE. Same uni: the dialer keeps
+        // seeing one continuous call, back in "dialing".
+        std::vector<Action> Retry(bool sos, std::string_view why) {
+            attemptSos_ = sos;
+            ResetDialog();
+            state_ = CallState::Dialing;
+            std::vector<Action> a;
+            a.push_back(LogAct(std::format("call {}: {} — retrying as {}", uni_, why, sos ? "emergency (urn:service:sos)" : "plain INVITE of the digits")));
+            a.push_back(StateAct("outgoing"));
+            Append(a, Start());
+            return a;
+        }
 
         static std::string_view Body(std::string_view msg) {
             std::size_t at = msg.find("\r\n\r\n");

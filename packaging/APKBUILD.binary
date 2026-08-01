@@ -6,7 +6,7 @@
 # apk-managed on the phone while crafter-build itself isn't packaged for
 # Alpine yet. The source tarball is produced by packaging/make-bin-tarball.sh.
 pkgname=imsd
-pkgver=0.2.7
+pkgver=0.3.0
 pkgrel=0
 pkgdesc="Userspace IMS/VoLTE daemon for mainline Linux phones"
 url="https://forgejo.catcrafts.net/Catcrafts/imsd"

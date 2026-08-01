@@ -133,6 +133,27 @@ export namespace imsd::msg {
         return s;
     }
 
+    // The service URN an emergency INVITE targets (RFC 5031); Request-URI and
+    // To both carry it (TS 24.229 5.1.6). No sos subtype: a dialled string
+    // does not say police/ambulance/fire.
+    inline constexpr std::string_view SosUrn = "urn:service:sos";
+
+    // Emergency-number classification. 112 and 911 are emergency numbers on
+    // every network (TS 22.101 §10.1.1), so they are compiled in; `extra`
+    // adds carrier- or lab-specific numbers (the EMERGENCY_NUMBERS list —
+    // e.g. a private test core's advertised short code). Exact match after
+    // stripping "1 1 2"-style separators; prefixed/suffixed strings ("0112",
+    // "1120") are ordinary numbers. SIM EF_ECC is not read yet.
+    inline bool IsEmergency(std::string_view target, std::span<const std::string> extra = {}) {
+        std::string t;
+        for (char ch : target)
+            if (ch != ' ' && ch != '-' && ch != '.') t.push_back(ch);
+        if (t == "112" || t == "911") return true;
+        for (const std::string& e : extra)
+            if (!e.empty() && t == e) return true;
+        return false;
+    }
+
     // Map a dialled string to a Request-URI (imscall.ruri_for): E.164/national
     // numbers become user=phone SIP URIs at the home domain; a bare short code
     // gets phone-context.

@@ -6,7 +6,7 @@
 Userspace IMS/VoLTE daemon for mainline Linux phones.
 
 > [!WARNING]  
-> imsd currently cannot make emergency calls
+> Emergency calling is unverified
 
 Modem firmware on typical mainline-Linux phones will bring up the IMS PDN but
 can't be used for actual call audio. imsd implements the whole IMS client in
@@ -21,20 +21,6 @@ Call-capable, both directions. Outgoing VoLTE calls place, answer, carry
 full-duplex AMR-WB audio, and tear down; incoming calls ring, answer via
 `Accept`, and carry media the same way — driven end-to-end from a stock
 dialer over the frozen D-Bus ABI. Current state:
-
-| Piece | State |
-|---|---|
-| SIP message layer + TCP framing (`Imsd:Sip`) | done, tested |
-| SDP offer/answer for AMR-WB (`Imsd:Sdp`) | done, tested |
-| USIM AKA + AKAv1-MD5 digest, SIM parsers (`Imsd:Aka`) | done, tested |
-| IPsec SA commands + warm-SA reader (`Imsd:Ipsec`) | done, tested |
-| SIP request/response builders (`Imsd:Messages`) | done, byte-pinned |
-| Outgoing + incoming call state machine (`Imsd:Engine`) | done, tested |
-| Registration (fresh + warm resume + keepalive refresh, MMTEL feature tags) | done |
-| RTP + AMR-WB media plane into PipeWire (`imsd-media`) | done |
-| D-Bus service `net.catcrafts.IMS1` (register, Dial, Accept, HangUp, live media) | done |
-| Plasma Dialer session backend (`imsd-dialerd`, org.kde.telephony.*) | done |
-| DTMF (`SendDtmf`, RFC 4733) | not yet implemented |
 
 The engine core (`imsd-core`) is a GLib-free, pure-`std` static library whose
 every decision — SIP framing, SDP selection, the AKAv1-MD5 digest, the
@@ -165,6 +151,7 @@ PCSCF=2001:db8::105
 | `RESUME` | `auto` | `0` forces a fresh registration (ignores a warm SA) |
 | `REFRESH_INTERVAL` | *(auto)* | keepalive re-REGISTER period in s; default = half the granted expiry, clamped to [120, 1800] |
 | `EALG` | `aes-cbc` | offered ESP cipher (`aes-cbc`, `des-ede3-cbc`, `null`) |
+| `EMERGENCY_NUMBERS` | *(empty)* | comma-separated additions to the builtin 112/911 emergency numbers (e.g. a private test core's short code). SIM `EF_ECC` is not read yet |
 | `RTP_PORT` | `50004` | local RTP port advertised in SDP |
 | `PRECOND` | `0` | `1` offers SDP QoS preconditions |
 | `DUMP_SIP` | `0` | `1` writes raw REGISTER-200/SUBSCRIBE-200/INVITE dumps (mode 0600) for debugging — they contain your IMSI/MSISDN and addresses |
