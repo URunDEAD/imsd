@@ -95,6 +95,21 @@ crafter-build -- --product=dialerd  # bin/imsd-dialerd-.../imsd-dialerd (dialer 
 crafter-build test                  # unit tests (Util, Aka, Ipsec, Messages, Engine, Sip, Sdp)
 ```
 
+### Building with make (distro packaging)
+
+For environments without crafter-build, the Makefile mirrors the same clang
+module pipeline: GNU make, clang++ with libc++ and the libc++ std module
+sources (`std.cppm` — package `llvm-runtimes` on Alpine, `libc++` on Arch),
+lld, and gio-2.0 headers.
+
+```sh
+make            # build/make/{imsd,imsd-media,imsd-dialerd}
+make check      # the same 7 unit-test suites
+make install    # DESTDIR/PREFIX staged install incl. the packaging/ files
+```
+
+`project.cpp` stays the canonical build description; the Makefile tracks it.
+
 ### Cross-compiling for a phone (aarch64 Alpine/postmarketOS)
 
 ```sh
@@ -121,8 +136,9 @@ after `packaging/ims-pdn-up.sh` has brought up the ims PDN through
 ModemManager. It spawns `/usr/libexec/imsd-media` per call. Registration
 resumes an in-kernel IPsec SA when one is present (avoiding the network's
 fresh-SA throttle) and keeps itself alive with a re-REGISTER refresh at half
-the granted lifetime. `packaging/APKBUILD.binary` + `make-bin-tarball.sh`
-wrap a cross-compiled build into an apk.
+the granted lifetime. `packaging/APKBUILD` builds the apk from source via
+the Makefile; `packaging/APKBUILD.binary` + `make-bin-tarball.sh` wrap a
+cross-compiled build into an apk instead.
 
 ## Configuration
 

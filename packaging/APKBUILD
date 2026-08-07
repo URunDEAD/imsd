@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # SPDX-FileCopyrightText: Copyright (C) 2026 Catcrafts®
 # Maintainer: Jorijn van der Graaf <jorijnvdgraaf@catcrafts.net>
-# APKBUILD skeleton — buildable once crafter-build is packaged for Alpine
-# (or replaced here by a bootstrap invocation). Until then this documents
-# the packaging shape.
 pkgname=imsd
 pkgver=0.3.0
 pkgrel=0
@@ -14,29 +11,25 @@ license="GPL-3.0-only"
 # the media leg dlopen's the AMR-WB codecs; pw-record/pw-play drive PipeWire —
 # none of which abuild's .so auto-scan can see
 depends="modemmanager opencore-amr vo-amrwbenc pipewire-tools"
-# versioned provides = imsd satisfies soc-qcom-modem's 81voltd dependency AND
-# excludes the real package: 81voltd serves the modem's own ims-PDN requests,
-# which races imsd for the PDN and flaps it with a new prefix every ~2.5 min
-# (fp6 journal/ims.md s57) — the two IMS stacks cannot share one PDN
+# clang/libc++ C++26 modules build (see Makefile); llvm-runtimes ships the
+# libc++ std module sources (/usr/share/libc++/v1/std.cppm) it precompiles
+makedepends="clang lld libc++-dev llvm-libunwind-dev llvm-runtimes glib-dev pkgconf"
+# the versioned provides both satisfies soc-qcom-modem's 81voltd dependency
+# and excludes the real package: 81voltd serves the modem's own ims-PDN
+# requests, which races imsd for the PDN and flaps it with a new prefix every
+# ~2.5 min — the two IMS stacks cannot share one PDN
 provides="81voltd=$pkgver-r$pkgrel"
-makedepends="clang lld libc++-dev glib-dev crafter-build"
-source=""
-options="!check"  # crafter-build test needs qemu for cross; run natively in CI
+source="$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
+builddir="$srcdir/$pkgname"
 
 build() {
-    crafter-build
-    crafter-build -- --product=media
-    crafter-build -- --product=dialerd
+	make
+}
+
+check() {
+	make check
 }
 
 package() {
-    install -Dm755 bin/imsd-*/imsd "$pkgdir"/usr/bin/imsd
-    install -Dm755 bin/imsd-media-*/imsd-media "$pkgdir"/usr/libexec/imsd-media
-    install -Dm755 bin/imsd-dialerd-*/imsd-dialerd "$pkgdir"/usr/bin/imsd-dialerd
-    install -Dm755 packaging/ims-pdn-up.sh "$pkgdir"/usr/libexec/ims-pdn-up.sh
-    install -Dm644 packaging/imsd.service "$pkgdir"/usr/lib/systemd/system/imsd.service
-    install -Dm644 packaging/imsd-dialerd.desktop \
-        "$pkgdir"/etc/xdg/autostart/imsd-dialerd.desktop
-    install -Dm644 packaging/net.catcrafts.IMS1.conf \
-        "$pkgdir"/usr/share/dbus-1/system.d/net.catcrafts.IMS1.conf
+	make install DESTDIR="$pkgdir"
 }
