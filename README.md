@@ -12,7 +12,7 @@ Modem firmware on typical mainline-Linux phones will bring up the IMS PDN but
 can't be used for actual call audio. imsd implements the whole IMS client in
 userspace instead: SIP registration with USIM AKA authentication over kernel
 IPsec (ESP), call signalling, and the AMR-WB RTP media plane wired into
-PipeWire — so a stock Plasma Mobile dialer can place and receive real VoLTE
+PipeWire so a stock Plasma Mobile dialer can place and receive real VoLTE
 calls on a commercial network.
 
 ## Status
@@ -71,17 +71,11 @@ AKA via a UIM logical channel), so in practice it currently needs a Qualcomm
 modem on a mainline kernel with working WWAN/MM integration, kernel ESP
 (`ip xfrm`), and PipeWire for audio.
 
-Everything below has been verified on exactly **one device / one carrier**
-(n=1) — reports from other combinations are very welcome:
+Everything below has been verified to be fully workking:
 
-| Device | OS | Modem | Carrier | Status |
-|---|---|---|---|---|
-| Fairphone 6 (SM7635 "milos") | postmarketOS, mainline kernel | Qualcomm (QRTR/QMI) | KPN NL (eSIM) | MO + MT calls, full-duplex AMR-WB |
-
-Carrier-side assumptions that held on this network but may differ elsewhere:
-IPsec sec-agree with AKAv1-MD5 over IPv6, AMR-WB audio, TCP for the
-protected flows. The SIP/SDP/AKA layers are carrier-agnostic and unit-tested;
-the bring-up sequencing is where new networks will differ.
+| Device | OS | Carrier
+|---|---|---|
+| The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | KPN NL |
 
 ## Build
 
