@@ -71,12 +71,14 @@ AKA via a UIM logical channel), so in practice it currently needs a Qualcomm
 modem on a mainline kernel with working WWAN/MM integration, kernel ESP
 (`ip xfrm`), and PipeWire for audio.
 
-Everything below has been verified to be fully workking:
+Everything below has been verified by community members to be fully workking:
 
 | Device | OS | Carrier
 |---|---|---|
 | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | KPN NL |
 | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Telekom Deutschland GER |
+| The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Phonero |
+| The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Telia Norge |
 
 ## Build
 
