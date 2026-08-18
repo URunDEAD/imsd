@@ -5,9 +5,6 @@
 
 Userspace IMS/VoLTE daemon for mainline Linux phones.
 
-> [!WARNING]  
-> Emergency calling is unverified
-
 Modem firmware on typical mainline-Linux phones will bring up the IMS PDN but
 can't be used for actual call audio. imsd implements the whole IMS client in
 userspace instead: SIP registration with USIM AKA authentication over kernel
