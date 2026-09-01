@@ -18,9 +18,9 @@ name: package
 # pinned checkout of this repo (packaging/aport/); APKBUILD.binary's payload
 # must stay identical to that aport's, so the two pipelines cannot skew.
 #
-# Requires the PACKAGE_TOKEN secret (catbot account, package:write scope) to
-# publish; without it the build still runs and the publish step skips
-# quietly.
+# Publishing needs PACKAGE_TOKEN (catbot account, package:write scope) — an
+# org-level secret on Catcrafts since 2026-09-02, shared with fp6-img;
+# without it the build still runs and the publish step skips quietly.
 
 on:
   workflow_dispatch:
