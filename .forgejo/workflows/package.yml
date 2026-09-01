@@ -1,0 +1,60 @@
+name: package
+
+# Builds the imsd apk(s) for aarch64 from packaging/aport/ at the pushed
+# commit and publishes them to the Forgejo Alpine registry — the repo
+# installed phones already point at (via catcrafts-fp6-repo), so a release
+# reaches users through plain 'apk upgrade' without an fp6-img image run.
+#
+# Release gating is the pkgver: the registry answers 409 for an
+# already-published version and the publish step treats that as "nothing to
+# do" — so pushes only release when packaging/aport/APKBUILD bumps
+# pkgver/pkgrel. fp6-img images keep building imsd from their own pinned
+# checkout of this repo; same aport, so the two pipelines cannot skew.
+#
+# Runs on the privileged "pmos" runner (qemu-user binfmt on the host for
+# pmbootstrap's aarch64 chroots). Requires the PACKAGE_TOKEN secret
+# (catbot account, package:write scope) to publish; without it the build
+# still runs and the publish step skips quietly.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  package:
+    runs-on: pmos
+    timeout-minutes: 180
+    steps:
+      # actions/checkout is a Node action; bare alpine has no node
+      - name: Provision job container
+        run: apk add -q nodejs git curl
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build package
+        run: ./packaging/build-package.sh
+
+      - name: Publish to the apk registry
+        env:
+          PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+        run: |
+          if [ -z "$PACKAGE_TOKEN" ]; then
+            echo "no PACKAGE_TOKEN secret configured; skipping package publish"
+            exit 0
+          fi
+          found=0
+          for f in /home/build/.local/var/pmbootstrap/packages/*/aarch64/imsd*.apk; do
+            [ -e "$f" ] || continue
+            found=1
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              --user "catbot:$PACKAGE_TOKEN" --upload-file "$f" \
+              "https://forgejo.catcrafts.net/api/packages/Catcrafts/alpine/edge/fp6")
+            case "$code" in
+              201) echo "published: $(basename "$f")" ;;
+              409) echo "already published: $(basename "$f")" ;;
+              *)   echo "FAILED ($code): $(basename "$f")"; exit 1 ;;
+            esac
+          done
+          [ "$found" = 1 ] || { echo "no packages found to publish"; exit 1; }
