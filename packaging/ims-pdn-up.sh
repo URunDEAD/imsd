@@ -1,21 +1,41 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-only
 # SPDX-FileCopyrightText: Copyright (C) 2026 Catcrafts®
-# ims-pdn-up.sh — boot bring-up for the IPv6 `ims` PDN (journal/ims.md s45).
+# ims-pdn-up.sh — boot bring-up for the `ims` PDN (journal/ims.md s45).
 #
-# Finds-or-creates the ims ipv6 bearer via ModemManager, connects it, and
+# Finds-or-creates the ims bearer via ModemManager, connects it, and
 # configures the muxed netdev with the MM-assigned address (the s34 recipe,
 # automated). Idempotent — safe to run when the PDN is already up. Runs as
 # ExecStartPre of imsd.service, so imsd only starts once the PDN exists; a
 # nonzero exit fails the unit and systemd retries per Restart/RestartSec.
+#
+# Configuration, via the unit's EnvironmentFile /etc/imsd.env (also read
+# directly so manual runs behave the same):
+#   IMS_IP_TYPE      bearer ip-type (default ipv6)
+#   IMS_REG_TIMEOUT  max seconds to wait for network registration before
+#                    connect attempts start counting anyway (default 300)
 
 log() { echo "ims-pdn-up: $*"; }
 
 kv() { mmcli "$@" -K 2>/dev/null; }
 
+# mmcli's multi-line error text as one journal-friendly line
+squash() { printf '%s' "$1" | tr '\n' ' ' | sed 's/  */ /g'; }
+
+modem_state()  { kv -m "$MODEM" | sed -n 's/^modem\.generic\.state *: *//p'; }
+packet_state() { kv -m "$MODEM" | sed -n 's/^modem\.3gpp\.packet-service-state *: *//p'; }
+
 bearer_paths() {
     kv -m "$MODEM" | sed -n 's/^modem\.generic\.bearers\.value\[[0-9]*\] *: *//p'
 }
+
+envval() {  # $1 = key — for manual runs; under systemd the vars are inherited
+    sed -n "s/^$1=//p" /etc/imsd.env 2>/dev/null | tail -n1 | tr -d '"'
+}
+IP_TYPE=${IMS_IP_TYPE:-$(envval IMS_IP_TYPE)}
+IP_TYPE=${IP_TYPE:-ipv6}
+REG_TIMEOUT=${IMS_REG_TIMEOUT:-$(envval IMS_REG_TIMEOUT)}
+REG_TIMEOUT=${REG_TIMEOUT:-300}
 
 # ---- wait for a modem (MM + modem firmware take a while after boot)
 n=0
@@ -29,11 +49,11 @@ done
 log "modem $MODEM"
 
 # ---- find a connected ims bearer; else find-or-create one and connect it
-# (LTE attach can lag boot, so connect attempts retry)
 find_ims_bearer() {  # $1 = required bearer.status.connected value
     for B in $(bearer_paths); do
         INFO=$(kv -b "$B") || continue
         echo "$INFO" | grep -q '^bearer\.properties\.apn  *: *ims$' || continue
+        echo "$INFO" | grep -q "^bearer\.properties\.ip-type  *: *$IP_TYPE\$" || continue
         echo "$INFO" | grep -q "^bearer\.status\.connected  *: *$1\$" || continue
         echo "$B"
         return 0
@@ -42,20 +62,48 @@ find_ims_bearer() {  # $1 = required bearer.status.connected value
 }
 
 BEARER=$(find_ims_bearer yes)
+
+# ---- gate the connect attempts on network registration: the 10x10 s window
+# below is shorter than some carriers' post-boot attach (measured ~2 min), so
+# without this every attempt can fail on no-service and the retries end
+# before the network is even attached
+if [ -z "$BEARER" ]; then
+    waited=0 last=
+    while :; do
+        STATE=$(modem_state)
+        case "$STATE" in registered|connecting|connected) break ;; esac
+        [ "$STATE" != "$last" ] && log "waiting for registration (state: ${STATE:-unknown})"
+        last=$STATE
+        if [ "$waited" -ge "$REG_TIMEOUT" ]; then
+            log "not registered after $REG_TIMEOUT s — attempting anyway"
+            break
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    log "modem state: $(modem_state), packet service: $(packet_state)"
+fi
+
 n=0
 while [ -z "$BEARER" ]; do
     n=$((n + 1))
     [ "$n" -gt 10 ] && { log "bearer connect failed after 10 attempts"; exit 1; }
     B=$(find_ims_bearer no)   # reuse a stale disconnected ims bearer
     if [ -z "$B" ]; then
-        B=$(mmcli -m "$MODEM" --create-bearer='apn=ims,ip-type=ipv6' 2>/dev/null |
-            sed -n 's,.*\(/org/freedesktop/ModemManager1/Bearer/[0-9]*\).*,\1,p')
-        [ -n "$B" ] && log "created bearer $B"
+        OUT=$(mmcli -m "$MODEM" --create-bearer="apn=ims,ip-type=$IP_TYPE" 2>&1)
+        B=$(printf '%s' "$OUT" | sed -n 's,.*\(/org/freedesktop/ModemManager1/Bearer/[0-9]*\).*,\1,p')
+        if [ -n "$B" ]; then
+            log "created bearer $B (ip-type=$IP_TYPE)"
+        else
+            log "create-bearer attempt $n failed: $(squash "$OUT"); retrying in 10 s"
+            sleep 10
+            continue
+        fi
     fi
-    if [ -n "$B" ] && mmcli -b "$B" --connect >/dev/null 2>&1; then
+    if OUT=$(mmcli -b "$B" --connect 2>&1); then
         BEARER=$B
     else
-        log "connect attempt $n failed; retrying in 10 s"
+        log "connect attempt $n failed (state: $(modem_state)): $(squash "$OUT"); retrying in 10 s"
         sleep 10
     fi
 done
