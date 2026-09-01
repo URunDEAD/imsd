@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # SPDX-FileCopyrightText: Copyright (C) 2026 Catcrafts®
 # Maintainer: Jorijn van der Graaf <jorijnvdgraaf@catcrafts.net>
-# Interim packaging: wraps a crafter-build binary cross-compiled on a dev box
-# (see README "Cross-compiling") into a proper apk, so the daemon is
-# apk-managed on the phone while crafter-build itself isn't packaged for
-# Alpine yet. The source tarball is produced by packaging/make-bin-tarball.sh.
+# Binary packaging: wraps a crafter-build binary cross-compiled per the
+# README's "Cross-compiling" section into a proper apk — used by this repo's
+# package CI (packaging/build-package.sh, which also seds pkgver from
+# implementations/main.cpp) and runnable by hand. The source tarball is
+# produced by packaging/make-bin-tarball.sh; the desktop/preset files come
+# from packaging/aport/ (copy them next to this file). The package payload
+# must stay identical to packaging/aport/APKBUILD's, or an apk upgrade
+# across the two pipelines would add/strip files on users' phones.
 pkgname=imsd
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=0
 pkgdesc="Userspace IMS/VoLTE daemon for mainline Linux phones"
 url="https://forgejo.catcrafts.net/Catcrafts/imsd"
@@ -19,8 +23,15 @@ depends="modemmanager libc++ opencore-amr vo-amrwbenc pipewire-tools"
 # which races imsd for the PDN and flaps it with a new prefix every ~2.5 min
 # (fp6 journal/ims.md s57) — the two IMS stacks cannot share one PDN
 provides="81voltd=$pkgver-r$pkgrel"
-options="!check"
-source="imsd-$pkgver.tar.gz"
+# no OpenRC service yet: the unit's PDN-bring-up/env-file sequencing is only
+# tested under systemd; an initd is welcome once someone can verify one
+subpackages="$pkgname-systemd"
+options="!check !tracedeps"
+source="
+	imsd-$pkgver.tar.gz
+	org.kde.modem.daemon.desktop
+	80-imsd.preset
+"
 
 package() {
     cd "$srcdir/imsd-$pkgver"
@@ -33,4 +44,26 @@ package() {
         "$pkgdir"/etc/xdg/autostart/imsd-dialerd.desktop
     install -Dm644 net.catcrafts.IMS1.conf \
         "$pkgdir"/usr/share/dbus-1/system.d/net.catcrafts.IMS1.conf
+    # the skel override hides kde-telephony's modem daemon autostart for the
+    # account created at install — imsd-dialerd owns those session bus names
+    install -Dm644 "$srcdir"/org.kde.modem.daemon.desktop \
+        "$pkgdir"/etc/skel/.config/autostart/org.kde.modem.daemon.desktop
+    # enabled by preset: the unit is a no-op until /etc/imsd.env exists, and
+    # VoLTE surviving reboots must not depend on a manual systemctl enable
+    install -Dm644 "$srcdir"/80-imsd.preset \
+        "$pkgdir"/usr/lib/systemd/system-preset/80-imsd.preset
+    mkdir -p "$pkgdir"/etc/systemd/system/multi-user.target.wants
+    ln -s /usr/lib/systemd/system/imsd.service \
+        "$pkgdir"/etc/systemd/system/multi-user.target.wants/imsd.service
+    # ...but only actually start once the carrier config exists, so
+    # unconfigured systems don't boot into a failing unit
+    mkdir -p "$pkgdir"/usr/lib/systemd/system/imsd.service.d
+    printf '[Unit]\nConditionPathExists=/etc/imsd.env\n' \
+        > "$pkgdir"/usr/lib/systemd/system/imsd.service.d/10-require-config.conf
+}
+
+systemd() {
+    install_if="$pkgname=$pkgver-r$pkgrel systemd"
+
+    amove usr/lib/systemd/system
 }

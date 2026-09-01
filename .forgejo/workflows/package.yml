@@ -1,20 +1,26 @@
 name: package
 
-# Builds the imsd apk(s) for aarch64 from packaging/aport/ at the pushed
-# commit and publishes them to the Forgejo Alpine registry — the repo
-# installed phones already point at (via catcrafts-fp6-repo), so a release
-# reaches users through plain 'apk upgrade' without an fp6-img image run.
+# Builds the imsd apk(s) for aarch64 from the pushed commit and publishes
+# them to the Forgejo Alpine registry — the repo installed phones already
+# point at (via catcrafts-fp6-repo), so a release reaches users through
+# plain 'apk upgrade' without an fp6-img image run.
 #
-# Release gating is the pkgver: the registry answers 409 for an
-# already-published version and the publish step treats that as "nothing to
-# do" — so pushes only release when packaging/aport/APKBUILD bumps
-# pkgver/pkgrel. fp6-img images keep building imsd from their own pinned
-# checkout of this repo; same aport, so the two pipelines cannot skew.
+# Build: crafter-build cross-compiles against an Alpine aarch64 sysroot
+# (packaging/build-package.sh — the README's "Cross-compiling" flow), the
+# test suite runs natively, and packaging/APKBUILD.binary wraps the result.
+# This needs no privileged runner: it runs in an alpine:edge container on
+# the ordinary arch-latest runner.
 #
-# Runs on the privileged "pmos" runner (qemu-user binfmt on the host for
-# pmbootstrap's aarch64 chroots). Requires the PACKAGE_TOKEN secret
-# (catbot account, package:write scope) to publish; without it the build
-# still runs and the publish step skips quietly.
+# Release gating is the version: pkgver comes from implementations/main.cpp,
+# the registry answers 409 for an already-published version, and the publish
+# step treats that as "nothing to do" — so pushes only release when the
+# Version constant bumps. fp6-img images keep building imsd from their own
+# pinned checkout of this repo (packaging/aport/); APKBUILD.binary's payload
+# must stay identical to that aport's, so the two pipelines cannot skew.
+#
+# Requires the PACKAGE_TOKEN secret (catbot account, package:write scope) to
+# publish; without it the build still runs and the publish step skips
+# quietly.
 
 on:
   workflow_dispatch:
@@ -23,8 +29,10 @@ on:
 
 jobs:
   package:
-    runs-on: pmos
-    timeout-minutes: 180
+    runs-on: arch-latest
+    container:
+      image: alpine:edge
+    timeout-minutes: 90
     steps:
       # actions/checkout is a Node action; bare alpine has no node
       - name: Provision job container
@@ -33,7 +41,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build package
+      - name: Build and package
         run: ./packaging/build-package.sh
 
       - name: Publish to the apk registry
@@ -45,7 +53,7 @@ jobs:
             exit 0
           fi
           found=0
-          for f in /home/build/.local/var/pmbootstrap/packages/*/aarch64/imsd*.apk; do
+          for f in /home/build/.local/share/abuild/*/aarch64/imsd*.apk; do
             [ -e "$f" ] || continue
             found=1
             code=$(curl -s -o /dev/null -w '%{http_code}' \
