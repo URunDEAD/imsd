@@ -8,8 +8,10 @@
 // after), the CANCEL/answer race, and busy/error finals. Incoming: 100+180
 // on the INVITE (reliable when the caller requires 100rel), Accept -> 200
 // with the SDP answer at the offer's payload types + media, ACK silence,
-// reject -> 486, remote CANCEL -> 200+487, unusable offer -> 488, ring
-// timeout -> 480, BYE both ways. Pure reducer, no I/O.
+// reject -> 486, remote CANCEL -> 200+487, unusable offer -> 488 (naming
+// what was offered), a landline gateway's G.711-only and AMR-NB offers
+// ring and are answered at the offer's own payload types, ring timeout ->
+// 480, BYE both ways. Pure reducer, no I/O.
 import std;
 import Imsd;
 
@@ -479,26 +481,109 @@ int main() {
         Check(m.Terminated(), "terminated after remote CANCEL");
     }
 
-    // ---- offer we cannot serve (no AMR-WB): 488 before ringing
+    // an inbound INVITE around an arbitrary offer (the gateway shapes below)
+    auto MtInviteSdp = [](std::string_view callid, std::string_view sdp) {
+        return std::format(
+            "INVITE sip:me SIP/2.0\r\nVia: SIP/2.0/UDP [x]:1;branch=z9hG4bKi\r\n"
+            "From: <sip:+31612345678@ims;user=phone>;tag=caller1\r\n"
+            "To: <sip:+31611111111@ims;user=phone>\r\n"
+            "Call-ID: {}\r\nCSeq: 1 INVITE\r\n"
+            "Contact: <sip:origgw@[2001:db8::9]:5060>\r\n"
+            "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            callid, sdp.size(), sdp);
+    };
+
+    // ---- a landline caller: the PSTN gateway offers G.711 only, by static
+    // payload type with no rtpmap (the shape that used to be 488'd). It
+    // rings, and Accept answers PCMA at the offer's pt with narrowband DTMF.
     {
         imsd::util::Rng rng(29);
         std::string sdp =
             "v=0\r\no=- 5 5 IN IP6 2001:db8::30c\r\ns=-\r\n"
             "c=IN IP6 2001:db8::30c\r\nt=0 0\r\n"
-            "m=audio 27864 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n";
-        std::string inv = std::format(
-            "INVITE sip:me SIP/2.0\r\nVia: SIP/2.0/UDP [x]:1;branch=z9hG4bKi\r\n"
-            "From: <sip:+31612345678@ims;user=phone>;tag=caller1\r\n"
-            "To: <sip:+31611111111@ims;user=phone>\r\n"
-            "Call-ID: mt-pcma\r\nCSeq: 1 INVITE\r\n"
-            "Contact: <sip:origgw@[2001:db8::9]:5060>\r\n"
-            "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
-            sdp.size(), sdp);
-        CallMachine m(c, rng, "ims-call-11", IncomingInvite{inv}, 50004);
+            "m=audio 27864 RTP/AVP 8 0 101\r\na=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n";
+        CallMachine m(c, rng, "ims-call-11", IncomingInvite{MtInviteSdp("mt-pcma", sdp)}, 50004);
         auto ai = m.OnInvite();
-        Check(Responded(ai, "SIP/2.0 488 Not Acceptable Here") != nullptr, "non-AMR-WB offer refused with 488");
+        Check(Responded(ai, "SIP/2.0 488 Not Acceptable Here") == nullptr, "G.711 offer is not refused");
+        Check(Responded(ai, "SIP/2.0 180 Ringing") != nullptr, "G.711 offer rings");
+        Check(!m.Terminated(), "G.711 call alive after INVITE");
+        auto aa = m.OnAccept();
+        const Action* ok = Responded(aa, "SIP/2.0 200 OK");
+        Check(ok != nullptr, "Accept answers 200");
+        Check(ok && ok->text.contains("m=audio 50004 RTP/AVP 8 101\r\n"), "answer keeps the offer's PCMA + DTMF pts");
+        Check(ok && ok->text.contains("a=rtpmap:8 PCMA/8000/1\r\n"), "answer names PCMA");
+        Check(ok && ok->text.contains("a=rtpmap:101 telephone-event/8000\r\n"), "DTMF at the narrowband clock");
+        Check(ok && !ok->text.contains("octet-align"), "no octet-align for G.711");
+        const Action* med = Find(aa, Action::Type::StartMedia);
+        Check(med && med->media.codec == "PCMA" && med->media.payloadType == 8 && !med->media.octetAlign, "media leg starts PCMA pt 8");
+        Check(med && med->media.remoteIp == "2001:db8::30c" && med->media.remotePort == 27864, "media leg targets the gateway");
+    }
+
+    // ---- a gateway offering narrowband AMR (octet-aligned) + G.711: AMR wins
+    {
+        imsd::util::Rng rng(31);
+        std::string sdp =
+            "v=0\r\no=- 6 6 IN IP6 2001:db8::30c\r\ns=-\r\n"
+            "c=IN IP6 2001:db8::30c\r\nt=0 0\r\n"
+            "m=audio 27866 RTP/AVP 8 100 110\r\n"
+            "a=rtpmap:100 AMR/8000/1\r\na=fmtp:100 octet-align=1;mode-set=0,2,4,7\r\n"
+            "a=rtpmap:110 telephone-event/8000\r\n";
+        CallMachine m(c, rng, "ims-call-12", IncomingInvite{MtInviteSdp("mt-amrnb", sdp)}, 50004);
+        auto ai = m.OnInvite();
+        Check(Responded(ai, "SIP/2.0 180 Ringing") != nullptr, "AMR-NB offer rings");
+        auto aa = m.OnAccept();
+        const Action* ok = Responded(aa, "SIP/2.0 200 OK");
+        Check(ok && ok->text.contains("m=audio 50004 RTP/AVP 100 110\r\n"), "answer picks AMR over PCMA");
+        Check(ok && ok->text.contains("a=rtpmap:100 AMR/8000/1\r\n") && ok->text.contains("a=fmtp:100 octet-align=1\r\n"), "answer mirrors octet-aligned AMR");
+        const Action* med = Find(aa, Action::Type::StartMedia);
+        Check(med && med->media.codec == "AMR" && med->media.payloadType == 100 && med->media.octetAlign, "media leg starts octet-aligned AMR pt 100");
+    }
+
+    // ---- a mobile caller offering everything: still AMR-WB (no regression)
+    {
+        imsd::util::Rng rng(33);
+        std::string sdp =
+            "v=0\r\no=- 7 7 IN IP6 2001:db8::310\r\ns=-\r\n"
+            "c=IN IP6 2001:db8::310\r\nt=0 0\r\n"
+            "m=audio 27868 RTP/AVP 116 107 8 100 111 110 13\r\n"
+            "a=rtpmap:116 AMR-WB/16000/1\r\na=fmtp:116 mode-change-capability=2;max-red=0\r\n"
+            "a=rtpmap:107 AMR-WB/16000/1\r\na=fmtp:107 octet-align=1;mode-change-capability=2;max-red=0\r\n"
+            "a=rtpmap:100 AMR/8000/1\r\na=rtpmap:111 telephone-event/16000\r\n"
+            "a=rtpmap:110 telephone-event/8000\r\na=rtpmap:13 CN/8000\r\n";
+        CallMachine m(c, rng, "ims-call-13", IncomingInvite{MtInviteSdp("mt-mobile", sdp)}, 50004);
+        m.OnInvite();
+        auto aa = m.OnAccept();
+        const Action* ok = Responded(aa, "SIP/2.0 200 OK");
+        Check(ok && ok->text.contains("m=audio 50004 RTP/AVP 107 111\r\n"), "mobile caller answered with octet-aligned AMR-WB + wideband DTMF");
+        const Action* med = Find(aa, Action::Type::StartMedia);
+        Check(med && med->media.codec == "AMR-WB" && med->media.payloadType == 107, "media leg stays AMR-WB for a mobile caller");
+    }
+
+    // ---- offer we cannot serve (nothing we play): 488 before ringing, and
+    // the log names what was offered
+    {
+        imsd::util::Rng rng(35);
+        std::string sdp =
+            "v=0\r\no=- 8 8 IN IP6 2001:db8::30c\r\ns=-\r\n"
+            "c=IN IP6 2001:db8::30c\r\nt=0 0\r\n"
+            "m=audio 27864 RTP/AVP 18 101\r\na=rtpmap:18 G729/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+        CallMachine m(c, rng, "ims-call-14", IncomingInvite{MtInviteSdp("mt-g729", sdp)}, 50004);
+        auto ai = m.OnInvite();
+        Check(Responded(ai, "SIP/2.0 488 Not Acceptable Here") != nullptr, "G729-only offer refused with 488");
         Check(Responded(ai, "SIP/2.0 180 Ringing") == nullptr, "no 180 for a 488");
         Check(m.Terminated(), "terminated on 488");
+        bool named = false;
+        for (const auto& x : ai)
+            if (x.type == Action::Type::Log && x.text.contains("offered: 18 G729, 101 TELEPHONE-EVENT")) named = true;
+        Check(named, "488 log names the offered codecs");
+    }
+    // ---- no audio line at all: 488 too
+    {
+        imsd::util::Rng rng(37);
+        CallMachine m(c, rng, "ims-call-15", IncomingInvite{MtInviteSdp("mt-noaudio", "v=0\r\no=- 9 9 IN IP6 2001:db8::30c\r\ns=-\r\nc=IN IP6 2001:db8::30c\r\nt=0 0\r\n")}, 50004);
+        auto ai = m.OnInvite();
+        Check(Responded(ai, "SIP/2.0 488 Not Acceptable Here") != nullptr, "offer without m=audio refused with 488");
+        Check(m.Terminated(), "terminated on 488 (no audio line)");
     }
 
     // ---- ring timeout: 480, missed call

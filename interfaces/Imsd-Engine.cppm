@@ -52,7 +52,8 @@ export namespace imsd::engine {
         return d == Direction::Incoming ? "incoming" : "outgoing";
     }
 
-    // Parsed SDP answer needed to bring up the media leg.
+    // Parsed SDP answer needed to bring up the media leg. `codec` is one of
+    // imsd-media's: "AMR-WB", "AMR", "PCMA", "PCMU" (empty = none we play).
     struct MediaLeg {
         std::string remoteIp;
         int remotePort = 0;
@@ -156,16 +157,20 @@ export namespace imsd::engine {
 
         // UAS: answer the inbound INVITE with 100 Trying + 180 Ringing (made
         // reliable only when the caller Requires 100rel) and arm the ring
-        // timeout. An offer we cannot serve — no audio line, or no AMR-WB
-        // (the media plane is AMR-WB-only) — is refused with 488 up front,
-        // before the UI ever rings.
+        // timeout. An offer we cannot serve — no audio line, or none of the
+        // codecs imsd-media plays (AMR-WB, AMR, PCMA, PCMU) — is refused
+        // with 488 up front, before the UI ever rings; the log line names
+        // what WAS offered, so a field journal answers "which codec did the
+        // gateway want" without a raw SIP dump.
         std::vector<Action> OnInvite() {
             std::vector<Action> a;
             if (direction_ != Direction::Incoming || state_ != CallState::Incoming) return a;
             MediaLeg leg = ParseAnswer();
-            if (!leg.Valid() || leg.codec != "AMR-WB") {
+            if (!leg.Valid() || leg.codec.empty()) {
                 a.push_back(Respond(imsd::msg::BuildInviteResponse(ctx_, invite_, 488, "Not Acceptable Here", d_.itag)));
-                Append(a, Finish("error", "incoming offer unusable (need AMR-WB audio); 488 sent"));
+                std::string why = !leg.Valid() ? "no usable audio line"
+                                               : std::format("no playable codec, offered: {}", imsd::sdp::OfferedCodecs(answerSdp_));
+                Append(a, Finish("error", std::format("incoming offer unusable ({}); 488 sent", why)));
                 return a;
             }
             a.push_back(Respond(imsd::msg::BuildInviteResponse(ctx_, invite_, 100, "Trying", d_.itag)));
@@ -196,7 +201,7 @@ export namespace imsd::engine {
             spec.payloadType = leg.payloadType;
             spec.octetAlign = leg.octetAlign;
             spec.codec = leg.codec;
-            spec.dtmfPt = imsd::sdp::TelephoneEventPt(Body(invite_), 16000);
+            spec.dtmfPt = imsd::sdp::TelephoneEventPt(Body(invite_), imsd::sdp::CodecRate(leg.codec));
             localSdp_ = imsd::sdp::BuildAnswer(spec);
             // session timers: echo the caller's Session-Expires; with no
             // refresher stated, make the caller (uac) the refresher — its

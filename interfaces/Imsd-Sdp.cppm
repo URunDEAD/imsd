@@ -3,17 +3,20 @@
 
 // lint-disable-file fixed-width-types
 /*
-Imsd:Sdp — AMR-WB SDP offer/answer building + parsing.
+Imsd:Sdp — SDP offer/answer building + parsing for the voice media plane.
 
 The offer is a fixed AMR-WB (octet-aligned) + telephone-event shape with an
 optional GSMA IR.92 QoS-precondition block; it is what commercial IMS cores
 expect from a VoLTE UE, and its exact bytes are pinned by tests/Sdp. The
 parser extracts only what the media plane needs: remote address/port, the
-negotiated payload type, and octet-align mode — it reads answers to our
-offers and inbound offers alike (same fields either way). BuildAnswer is the
-terminating side: it answers an inbound offer with the offer's own payload
-type numbers (RFC 3264) and mirrors its octet-align mode (RFC 4867 requires
-both directions to use one mode). Pure std C++.
+negotiated payload type, the codec and octet-align mode — it reads answers
+to our offers and inbound offers alike (same fields either way). The codecs
+it knows are the ones imsd-media can play: AMR-WB, AMR (narrowband) and
+G.711 (PCMA/PCMU) — the last two are what a PSTN gateway offers when a
+landline calls. BuildAnswer is the terminating side: it answers an inbound
+offer with the offer's own payload type numbers (RFC 3264) and mirrors its
+octet-align mode (RFC 4867 requires both directions to use one mode). Pure
+std C++.
 */
 
 export module Imsd:Sdp;
@@ -88,18 +91,60 @@ export namespace imsd::sdp {
         int port = -1;                  // -1 = no m=audio line found
         int payloadType = -1;
         bool octetAlign = false;
-        std::string codec = "AMR-WB";
+        std::string codec = "AMR-WB";   // "AMR-WB" | "AMR" | "PCMA" | "PCMU" | "" (none we play)
     };
 
+    // The encoding name an offer gives a payload type: its a=rtpmap line,
+    // upper-cased (RFC 4566 §6: encoding names are case-insensitive), else
+    // the static assignment for 0/8 (RFC 3551 §6 — a G.711 offer may carry
+    // no rtpmap at all). Empty when neither applies.
+    std::string CodecName(std::string_view body, int pt) {
+        std::string key = std::format("a=rtpmap:{} ", pt);
+        if (auto at = Find(body, key)) {
+            std::size_t nameBegin = *at + key.size();
+            std::size_t nameEnd = body.find_first_of("/\r\n", nameBegin);
+            std::string name(body.substr(nameBegin, nameEnd == std::string_view::npos ? std::string_view::npos : nameEnd - nameBegin));
+            for (char& c : name)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return name;
+        }
+        if (pt == 0) return "PCMU";
+        if (pt == 8) return "PCMA";
+        return "";
+    }
+
+    // The offer's audio payload types with their names, "8 PCMA, 96 AMR,
+    // 101 telephone-event" — for the log line of a refused offer, so a
+    // field journal says WHAT the gateway offered without a raw SIP dump.
+    std::string OfferedCodecs(std::string_view body) {
+        auto m = Find(body, "m=audio ");
+        if (!m) return "no m=audio line";
+        std::size_t lineEnd = body.find_first_of("\r\n", *m);
+        std::string_view line = body.substr(*m, lineEnd == std::string_view::npos ? std::string_view::npos : lineEnd - *m);
+        std::string out;
+        int field = 0;
+        for (auto part : std::views::split(line, ' ')) {
+            std::string_view tok(part);
+            if (field++ < 3 || tok.empty()) continue;  // m=audio <port> <proto> <pt>...
+            auto pt = ParseInt(tok);
+            if (!pt) continue;
+            std::string name = CodecName(body, *pt);
+            if (!out.empty()) out += ", ";
+            out += name.empty() ? std::format("{}", *pt) : std::format("{} {}", *pt, name);
+        }
+        return out.empty() ? std::string(line) : out;
+    }
+
     // Payload-type preference: AMR-WB with octet-align=1 > AMR-WB > AMR with
-    // octet-align=1 > AMR. Octet-aligned wins within a codec because it is
-    // the media leg's native, call-proven format (bandwidth-efficient is
-    // supported but was the s56 static-audio culprit) — when the peer offers
-    // both variants, taking the octet-aligned pt keeps real calls on the
-    // battle-tested path. With no rtpmap match at all, the first pt is used
-    // and codec comes back EMPTY — the body named no AMR variant (e.g. a
-    // PCMA offer), and pretending otherwise would defeat codec checks
-    // upstream.
+    // octet-align=1 > AMR > PCMA > PCMU. Octet-aligned wins within a codec
+    // because it is the media leg's native, call-proven format
+    // (bandwidth-efficient is supported but was the s56 static-audio
+    // culprit) — when the peer offers both variants, taking the
+    // octet-aligned pt keeps real calls on the battle-tested path. Wideband
+    // beats narrowband, AMR beats G.711 (a mobile-to-mobile call must never
+    // land on a G.711 leg just because the gateway listed it). With no
+    // playable codec at all, the first pt is used and codec comes back EMPTY
+    // — pretending otherwise would defeat codec checks upstream.
     Answer ParseAnswer(std::string_view body) {
         Answer a;
         if (auto at = Find(body, "c=IN IP6 ")) a.ip = TokenAt(body, *at + 9);
@@ -135,20 +180,20 @@ export namespace imsd::sdp {
         int wb = -1;
         int nbOa = -1;
         int nb = -1;
+        int pcma = -1;
+        int pcmu = -1;
         for (int p : pts) {
-            std::string key = std::format("a=rtpmap:{} ", p);
-            auto at = Find(body, key);
-            if (!at) continue;
-            // codec name: up to '/', CR or LF
-            std::size_t nameBegin = *at + key.size();
-            std::size_t nameEnd = body.find_first_of("/\r\n", nameBegin);
-            std::string_view name = body.substr(nameBegin, nameEnd == std::string_view::npos ? std::string_view::npos : nameEnd - nameBegin);
-            if (name.contains("AMR-WB")) {
+            std::string name = CodecName(body, p);
+            if (name == "AMR-WB") {
                 if (wb == -1) wb = p;
                 if (wbOa == -1 && hasOctetAlign(p)) wbOa = p;
-            } else if (name.contains("AMR")) {
+            } else if (name == "AMR") {
                 if (nb == -1) nb = p;
                 if (nbOa == -1 && hasOctetAlign(p)) nbOa = p;
+            } else if (name == "PCMA") {
+                if (pcma == -1) pcma = p;
+            } else if (name == "PCMU") {
+                if (pcmu == -1) pcmu = p;
             }
         }
         if (wbOa != -1 || wb != -1) {
@@ -157,11 +202,17 @@ export namespace imsd::sdp {
         } else if (nbOa != -1 || nb != -1) {
             a.payloadType = nbOa != -1 ? nbOa : nb;
             a.codec = "AMR";
+        } else if (pcma != -1) {
+            a.payloadType = pcma;
+            a.codec = "PCMA";
+        } else if (pcmu != -1) {
+            a.payloadType = pcmu;
+            a.codec = "PCMU";
         } else {
             a.payloadType = pts.front();
             a.codec.clear();
         }
-        a.octetAlign = hasOctetAlign(a.payloadType);
+        a.octetAlign = a.codec.starts_with("AMR") && hasOctetAlign(a.payloadType);
         return a;
     }
 
@@ -189,18 +240,24 @@ export namespace imsd::sdp {
         int rtpPort = 0;
         std::uint64_t sessionId = 0;    // o= sess-id/version; caller randomizes
         int payloadType = 97;           // the offer's pt for the chosen codec
-        bool octetAlign = true;         // mirror of the offer's mode
-        std::string codec = "AMR-WB";   // "AMR-WB" or "AMR"
+        bool octetAlign = true;         // mirror of the offer's mode (AMR codecs only)
+        std::string codec = "AMR-WB";   // "AMR-WB" | "AMR" | "PCMA" | "PCMU"
         std::optional<int> dtmfPt;      // the offer's telephone-event pt, if any
     };
 
+    // Sample rate of a codec we play: AMR-WB is 16 kHz, everything else
+    // (AMR, G.711) is narrowband 8 kHz. Also the RTP clock rate.
+    int CodecRate(std::string_view codec) { return codec == "AMR-WB" ? 16000 : 8000; }
+
     // SDP answer to an inbound audio offer: single codec at the offer's own
     // payload type, octet-align echoed only when the offer used it (absence
-    // = bandwidth-efficient, RFC 4867 §8.1), telephone-event kept when
-    // offered. Byte layout pinned by tests/Sdp.
+    // = bandwidth-efficient, RFC 4867 §8.1; G.711 has no fmtp at all),
+    // telephone-event kept when offered. b=AS is the codec's peak payload
+    // rate plus IP/UDP/RTP overhead at 20 ms. Byte layout pinned by tests/Sdp.
     std::string BuildAnswer(const AnswerSpec& s) {
         std::string ipver = Is6(s.local) ? "IP6" : "IP4";
-        int rate = s.codec == "AMR-WB" ? 16000 : 8000;
+        int rate = CodecRate(s.codec);
+        int as = s.codec == "AMR-WB" ? 41 : (s.codec == "AMR" ? 30 : 80);
         std::string out;
         out += "v=0\r\n";
         out += std::format("o=- {} {} IN {} {}\r\n", s.sessionId, s.sessionId, ipver, s.local);
@@ -210,11 +267,11 @@ export namespace imsd::sdp {
         if (s.dtmfPt) out += std::format("m=audio {} RTP/AVP {} {}\r\n", s.rtpPort, s.payloadType, *s.dtmfPt);
         else
             out += std::format("m=audio {} RTP/AVP {}\r\n", s.rtpPort, s.payloadType);
-        out += std::format("b=AS:{}\r\n", s.codec == "AMR-WB" ? 41 : 30);
+        out += std::format("b=AS:{}\r\n", as);
         out += "b=RS:512\r\n";
         out += "b=RR:1536\r\n";
         out += std::format("a=rtpmap:{} {}/{}/1\r\n", s.payloadType, s.codec, rate);
-        if (s.octetAlign) out += std::format("a=fmtp:{} octet-align=1\r\n", s.payloadType);
+        if (s.octetAlign && s.codec.starts_with("AMR")) out += std::format("a=fmtp:{} octet-align=1\r\n", s.payloadType);
         if (s.dtmfPt) {
             out += std::format("a=rtpmap:{} telephone-event/{}\r\n", *s.dtmfPt, rate);
             out += std::format("a=fmtp:{} 0-15\r\n", *s.dtmfPt);
