@@ -5,9 +5,9 @@
 /*
 Imsd:Sdp — SDP offer/answer building + parsing for the voice media plane.
 
-The offer is a fixed AMR-WB (octet-aligned) + telephone-event shape with an
-optional GSMA IR.92 QoS-precondition block; it is what commercial IMS cores
-expect from a VoLTE UE, and its exact bytes are pinned by tests/Sdp. The
+The offer is a fixed AMR-WB (octet-aligned) + AMR + telephone-event shape
+with an optional GSMA IR.92 QoS-precondition block; it is what commercial IMS
+cores expect from a VoLTE UE, and its exact bytes are pinned by tests/Sdp. The
 parser extracts only what the media plane needs: remote address/port, the
 negotiated payload type, the codec and octet-align mode — it reads answers
 to our offers and inbound offers alike (same fields either way). The codecs
@@ -57,7 +57,11 @@ export namespace imsd::sdp {
         std::string currRemote = "none";  // a=curr:qos remote <this>
     };
 
-    // AMR-WB (octet-aligned) offer. Byte layout is pinned by tests/Sdp.
+    // Our offer: AMR-WB (octet-aligned) first, AMR narrowband second — the
+    // 3GPP-mandatory codec every IMS core and PSTN gateway can answer, so a
+    // call we place TO a landline no longer depends on the far side
+    // transcoding up to wideband — each with telephone-event at its own
+    // clock. Byte layout is pinned by tests/Sdp.
     std::string BuildOffer(const Offer& o) {
         std::string ipver = Is6(o.local) ? "IP6" : "IP4";
         std::string s;
@@ -66,14 +70,18 @@ export namespace imsd::sdp {
         s += "s=-\r\n";
         s += std::format("c=IN {} {}\r\n", ipver, o.local);
         s += "t=0 0\r\n";
-        s += std::format("m=audio {} RTP/AVP 97 98\r\n", o.rtpPort);
+        s += std::format("m=audio {} RTP/AVP 97 99 98 100\r\n", o.rtpPort);
         s += "b=AS:41\r\n";
         s += "b=RS:512\r\n";
         s += "b=RR:1536\r\n";
         s += "a=rtpmap:97 AMR-WB/16000/1\r\n";
         s += "a=fmtp:97 octet-align=1;mode-change-capability=2;max-red=0\r\n";
+        s += "a=rtpmap:99 AMR/8000/1\r\n";
+        s += "a=fmtp:99 octet-align=1;mode-change-capability=2;max-red=0\r\n";
         s += "a=rtpmap:98 telephone-event/16000\r\n";
         s += "a=fmtp:98 0-15\r\n";
+        s += "a=rtpmap:100 telephone-event/8000\r\n";
+        s += "a=fmtp:100 0-15\r\n";
         s += "a=ptime:20\r\n";
         s += "a=maxptime:240\r\n";
         if (o.precond) {
