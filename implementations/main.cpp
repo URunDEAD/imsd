@@ -1201,16 +1201,32 @@ private:
         call_.emplace(ctx_, rng_, uni, imsd::engine::IncomingInvite{msg}, rtpPort_);
         callReply_ = reply_;
         Log(std::format("incoming call {} from {}", uni, call_->Number()));
+        // Validate the offer BEFORE the UI hears of the call. A refused
+        // INVITE (488: nothing we can play) is answered and dropped without
+        // ever announcing it — announcing first produced a 24 ms
+        // added/terminated/deleted burst that left Plasma Dialer stuck as a
+        // lock-screen overlay with no call to show (field report 2026-09-01).
+        // The journal keeps the record: caller and reason are logged above
+        // and by the engine's teardown line.
+        auto actions = call_->OnInvite();
+        if (call_->Terminated()) {
+            Execute(actions, /*announce=*/false);
+            MaybeDropCall();
+            return;
+        }
         CallInfo info{uni, call_->Number(), "incoming", "incoming", NowEpoch(), 0,
                       "incoming"};
         PostAdded(info);
-        Execute(call_->OnInvite());
+        Execute(actions);
         MaybeDropCall();
     }
 
     // ---- action execution -------------------------------------------------
     // Returns false if a client-flow send failed (used to fail a dial's INVITE).
-    bool Execute(const std::vector<imsd::engine::Action>& actions) {
+    // `announce` false suppresses the D-Bus state/deleted events — for a call
+    // that was never announced (refused before ringing), so the bus never
+    // sees a call it cannot show.
+    bool Execute(const std::vector<imsd::engine::Action>& actions, bool announce = true) {
         using T = imsd::engine::Action::Type;
         bool sendOk = true;
         for (const auto& a : actions) {
@@ -1224,8 +1240,13 @@ private:
                     break;
                 case T::StartMedia: StartMedia(a.media); break;
                 case T::StopMedia: StopMedia(); break;
-                case T::State: PostState(call_->Uni(), a.state, a.reason); break;
-                case T::Deleted: PostDeleted(call_->Uni()); dropCall_ = true; break;
+                case T::State:
+                    if (announce) PostState(call_->Uni(), a.state, a.reason);
+                    break;
+                case T::Deleted:
+                    if (announce) PostDeleted(call_->Uni());
+                    dropCall_ = true;
+                    break;
                 case T::SetDeadline: deadline_ = Mono() + a.seconds; break;
                 case T::Log: Log(a.text); break;
             }
