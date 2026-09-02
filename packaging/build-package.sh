@@ -88,8 +88,8 @@ PKG="$HOME/pkg"
 rm -rf "$PKG"
 mkdir -p "$PKG"
 cp "$SRC/packaging/APKBUILD.binary" "$PKG/APKBUILD"
-cp "$SRC/packaging/aport/org.kde.modem.daemon.desktop" \
-   "$SRC/packaging/aport/80-imsd.preset" "$PKG/"
+cp "$SRC/packaging/org.kde.modem.daemon.desktop" \
+   "$SRC/packaging/80-imsd.preset" "$PKG/"
 mv "imsd-$VER.tar.gz" "$PKG/"
 sed -i "s/^pkgver=.*/pkgver=$VER/" "$PKG/APKBUILD"
 # a throwaway signing key: phones trust the registry-signed APKINDEX, not

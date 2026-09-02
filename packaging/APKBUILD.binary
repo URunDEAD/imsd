@@ -5,10 +5,10 @@
 # README's "Cross-compiling" section into a proper apk — used by this repo's
 # package CI (packaging/build-package.sh, which also seds pkgver from
 # implementations/main.cpp) and runnable by hand. The source tarball is
-# produced by packaging/make-bin-tarball.sh; the desktop/preset files come
-# from packaging/aport/ (copy them next to this file). The package payload
-# must stay identical to packaging/aport/APKBUILD's, or an apk upgrade
-# across the two pipelines would add/strip files on users' phones.
+# produced by packaging/make-bin-tarball.sh; the desktop/preset files live
+# next to it in packaging/ (copy them beside this file). Since 2026-09-02
+# this is the only imsd packaging: fp6-img images install the apk this
+# builds from the registry rather than building their own.
 pkgname=imsd
 pkgver=0.3.1
 pkgrel=0

@@ -14,9 +14,10 @@ name: package
 # Release gating is the version: pkgver comes from implementations/main.cpp,
 # the registry answers 409 for an already-published version, and the publish
 # step treats that as "nothing to do" — so pushes only release when the
-# Version constant bumps. fp6-img images keep building imsd from their own
-# pinned checkout of this repo (packaging/aport/); APKBUILD.binary's payload
-# must stay identical to that aport's, so the two pipelines cannot skew.
+# Version constant bumps. This is the only producer of the imsd apk: fp6-img
+# images install the published package from the registry (pinned version,
+# pinned sha256) instead of building their own, so image and 'apk upgrade'
+# carry the same binary.
 #
 # Publishing needs PACKAGE_TOKEN (catbot account, package:write scope) — an
 # org-level secret on Catcrafts since 2026-09-02, shared with fp6-img;
