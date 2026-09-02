@@ -1257,6 +1257,7 @@ private:
             setenv("AMR_MODE", EnvOr("AMR_MODE", "2").c_str(), 1);
             setenv("DTX", EnvOr("DTX", "0").c_str(), 1);
             setenv("OCTET_ALIGN", leg.octetAlign ? "1" : "0", 1);
+            setenv("CODEC", leg.codec.c_str(), 1);
             std::vector<char*> c;
             for (auto& s : argv) c.push_back(const_cast<char*>(s.c_str()));
             c.push_back(nullptr);
