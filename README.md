@@ -110,7 +110,7 @@ make install    # DESTDIR/PREFIX staged install incl. the packaging/ files
 packaging/make-sysroot.sh                  # one-time: Alpine aarch64 sysroot from the CDN
 crafter-build -- --target=aarch64-alpine-linux-musl \
     --sysroot=$HOME/.cache/imsd/sysroot-aarch64-alpine \
-    --march=armv8-a --mtune=generic
+    --march=armv8.6-a+fp16fml+aes+sha3+sm4 --mtune=cortex-a720
 # same flags after `crafter-build test --target=aarch64-alpine-linux-musl`
 # run the suite under qemu-aarch64 against the sysroot
 ```

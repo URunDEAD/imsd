@@ -75,7 +75,11 @@ retry "make sysroot" "$SRC/packaging/make-sysroot.sh" "$SYSROOT"
 # host arch — the aarch64 binaries are additionally exercised by fp6-img's
 # chroot `make check` whenever an image builds)
 cd "$SRC"
-XTARGET="--target=aarch64-alpine-linux-musl --sysroot=$SYSROOT --march=armv8-a --mtune=generic"
+# The phone is one SoC, 4x Cortex-A520 + 4x Cortex-A720, so build for it.
+# armv8.6-a is the highest level whose mandatory set it exposes (8.7 would
+# assume WFxT, 9.x SVE2 - neither is in its hwcaps); +fp16fml+aes+sha3+sm4 are
+# the optional extensions it has. Same string as the fp6-img aports.
+XTARGET="--target=aarch64-alpine-linux-musl --sysroot=$SYSROOT --march=armv8.6-a+fp16fml+aes+sha3+sm4 --mtune=cortex-a720"
 crafter-build -- $XTARGET
 crafter-build -- --product=media $XTARGET
 crafter-build -- --product=dialerd $XTARGET
