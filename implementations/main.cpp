@@ -571,6 +571,15 @@ public:
         precond_ = EnvOr("PRECOND", "0") == "1";
         ealgOffer_ = EnvOr("EALG", "aes-cbc");
         mediaBin_ = ResolveMediaBin();
+        // CODECS: restrict + reorder the codecs we offer and accept (bench
+        // knob — a gateway that transcodes every caller up to AMR-WB never
+        // lets the narrowband path run otherwise). Empty = defaults.
+        codecs_ = imsd::sdp::ParseCodecList(EnvOr("CODECS", ""));
+        if (!codecs_.empty()) {
+            std::string list;
+            for (const auto& c : codecs_) list += (list.empty() ? "" : ",") + c;
+            Log(std::format("CODECS override active: {}", list));
+        }
         // EMERGENCY_NUMBERS: comma-separated additions to the builtin
         // 112/911 (a lab core's advertised short code, carrier extras).
         std::string extra = EnvOr("EMERGENCY_NUMBERS", "");
@@ -688,6 +697,7 @@ private:
     int pcscfPort_ = 5060;
     int rtpPort_ = 50004;
     bool precond_ = false;
+    std::vector<std::string> codecs_;   // CODECS override; empty = defaults
 
     // registration
     imsd::msg::Context ctx_;
@@ -1138,7 +1148,7 @@ private:
                 Log(std::format("EMERGENCY dial ({}): urn:service:sos over the live registration, "
                                 "fallback plain INVITE — stage 1, no emergency registration/PDN; "
                                 "carrier-side behavior UNVERIFIED", c.number));
-            call_.emplace(ctx_, rng_, c.uni, c.number, rtpPort_, precond_, emergency);
+            call_.emplace(ctx_, rng_, c.uni, c.number, rtpPort_, precond_, emergency, codecs_);
             CallInfo info{c.uni, c.number, "dialing", "outgoing", NowEpoch(), 0};
             PostAdded(info);
             bool ok = Execute(call_->Start());
@@ -1198,7 +1208,7 @@ private:
         }
         std::string uni = std::format("ims-call-{}", ++callSeq_);
         DumpRaw("imsd-invite-in.raw", msg);
-        call_.emplace(ctx_, rng_, uni, imsd::engine::IncomingInvite{msg}, rtpPort_);
+        call_.emplace(ctx_, rng_, uni, imsd::engine::IncomingInvite{msg}, rtpPort_, codecs_);
         callReply_ = reply_;
         Log(std::format("incoming call {} from {}", uni, call_->Number()));
         // Validate the offer BEFORE the UI hears of the call. A refused

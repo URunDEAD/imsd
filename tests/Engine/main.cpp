@@ -772,6 +772,62 @@ int main() {
         Check(m.Terminated(), "abandoned machine is terminated");
     }
 
+    // ---- CODECS override, terminating side: the transcoding gateway's
+    //      mixed offer (KPN 2026-09-08) answered with G.711 A-law because the
+    //      list says so — the on-air narrowband bench path
+    {
+        imsd::util::Rng rng(51);
+        std::string sdp =
+            "v=0\r\no=LucentPCSF 1 1 IN IP6 2001:db8::309\r\ns=-\r\n"
+            "c=IN IP6 2001:db8::309\r\nt=0 0\r\n"
+            "m=audio 41166 RTP/AVP 8 0 100 96 101 13 106\r\n"
+            "a=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:100 AMR/8000\r\na=fmtp:100 mode-change-period=2\r\n"
+            "a=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 mode-change-period=2\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\n"
+            "a=rtpmap:106 telephone-event/16000\r\na=fmtp:106 0-15\r\n"
+            "a=sendrecv\r\na=ptime:20\r\na=maxptime:60\r\n";
+        CallMachine m(c, rng, "ims-call-20", IncomingInvite{MtInviteSdp("mt-kpn-pcma", sdp)}, 50004, {"PCMA"});
+        auto ai = m.OnInvite();
+        Check(Responded(ai, "SIP/2.0 180 Ringing") != nullptr, "CODECS=PCMA: mixed offer rings");
+        auto aa = m.OnAccept();
+        const Action* ok = Responded(aa, "SIP/2.0 200 OK");
+        Check(ok && ok->text.contains("m=audio 50004 RTP/AVP 8 101\r\n"), "CODECS=PCMA: answer is PCMA + narrowband DTMF at the offer's pts");
+        Check(ok && ok->text.contains("a=rtpmap:8 PCMA/8000/1\r\n") && !ok->text.contains("AMR"), "CODECS=PCMA: no AMR in the answer");
+        const Action* med = Find(aa, Action::Type::StartMedia);
+        Check(med && med->media.codec == "PCMA" && med->media.payloadType == 8 && !med->media.octetAlign, "CODECS=PCMA: media leg starts G.711 A-law");
+
+        // same offer, CODECS=AMR: narrowband AMR, bandwidth-efficient as offered
+        imsd::util::Rng rng2(52);
+        CallMachine m2(c, rng2, "ims-call-21", IncomingInvite{MtInviteSdp("mt-kpn-amr", sdp)}, 50004, {"AMR"});
+        m2.OnInvite();
+        auto aa2 = m2.OnAccept();
+        const Action* ok2 = Responded(aa2, "SIP/2.0 200 OK");
+        Check(ok2 && ok2->text.contains("m=audio 50004 RTP/AVP 100 101\r\n") && !ok2->text.contains("octet-align"), "CODECS=AMR: answer is AMR-NB BE + narrowband DTMF");
+        const Action* med2 = Find(aa2, Action::Type::StartMedia);
+        Check(med2 && med2->media.codec == "AMR" && med2->media.payloadType == 100 && !med2->media.octetAlign, "CODECS=AMR: media leg starts AMR-NB BE");
+
+        // same offer, no override: unchanged — AMR-WB
+        imsd::util::Rng rng3(53);
+        CallMachine m3(c, rng3, "ims-call-22", IncomingInvite{MtInviteSdp("mt-kpn-default", sdp)}, 50004);
+        m3.OnInvite();
+        auto aa3 = m3.OnAccept();
+        const Action* med3 = Find(aa3, Action::Type::StartMedia);
+        Check(med3 && med3->media.codec == "AMR-WB" && med3->media.payloadType == 96, "no override: the same offer still lands on AMR-WB");
+    }
+
+    // ---- CODECS override, originating side: the INVITE offers only what the
+    //      list names (G.711 = a landline-shaped offer toward the network)
+    {
+        imsd::util::Rng rng(54);
+        CallMachine m(c, rng, "ims-call-23", "0783690354", 50004, false, false, {"PCMA", "PCMU"});
+        auto start = m.Start();
+        const Action* inv = Sent(start, "INVITE ");
+        Check(inv && inv->text.contains("m=audio 50004 RTP/AVP 8 0 100\r\n"), "CODECS=PCMA,PCMU: INVITE offers G.711 only");
+        Check(inv && !inv->text.contains("AMR"), "CODECS=PCMA,PCMU: no AMR in the offer");
+        Check(inv && inv->text.contains("a=rtpmap:100 telephone-event/8000\r\n") && !inv->text.contains("telephone-event/16000"), "CODECS=PCMA,PCMU: narrowband DTMF only");
+    }
+
     if (Failures == 0) std::println("Engine: all tests passed");
     return Failures;
 }

@@ -99,15 +99,20 @@ export namespace imsd::engine {
     public:
         // `emergency`: the shell classified the dialled string as an
         // emergency number — the first attempt targets urn:service:sos.
-        CallMachine(const imsd::msg::Context& ctx, imsd::util::Rng& rng, std::string uni, std::string number, int rtpPort, bool precond, bool emergency = false)
+        // `codecs`: the daemon's CODECS override — the codecs offered on an
+        // outgoing call and accepted from an inbound offer, in preference
+        // order; empty = the sdp module's defaults.
+        CallMachine(const imsd::msg::Context& ctx, imsd::util::Rng& rng, std::string uni, std::string number, int rtpPort, bool precond, bool emergency = false,
+                    std::vector<std::string> codecs = {})
             : ctx_(ctx), rng_(rng), uni_(std::move(uni)), number_(std::move(number)),
-              rtpPort_(rtpPort), precond_(precond), attemptSos_(emergency) {
+              rtpPort_(rtpPort), precond_(precond), codecs_(std::move(codecs)), attemptSos_(emergency) {
             ResetDialog();
         }
 
-        CallMachine(const imsd::msg::Context& ctx, imsd::util::Rng& rng, std::string uni, IncomingInvite in, int rtpPort)
+        CallMachine(const imsd::msg::Context& ctx, imsd::util::Rng& rng, std::string uni, IncomingInvite in, int rtpPort,
+                    std::vector<std::string> codecs = {})
             : ctx_(ctx), rng_(rng), uni_(std::move(uni)), rtpPort_(rtpPort),
-              precond_(false), direction_(Direction::Incoming),
+              precond_(false), codecs_(std::move(codecs)), direction_(Direction::Incoming),
               state_(CallState::Incoming), reason_("incoming"),
               invite_(in.invite) {
             number_ = imsd::sip::CallerId(invite_);
@@ -148,6 +153,7 @@ export namespace imsd::engine {
             offer.rtpPort = rtpPort_;
             offer.sessionId = rng_.UInt(1000000, 9999999);
             offer.precond = precond_;
+            offer.codecs = codecs_;
             std::string sdp = imsd::sdp::BuildOffer(offer);
             std::vector<Action> a;
             a.push_back(Send(imsd::msg::BuildInvite(ctx_, d_, sdp, precond_)));
@@ -158,8 +164,9 @@ export namespace imsd::engine {
         // UAS: answer the inbound INVITE with 100 Trying + 180 Ringing (made
         // reliable only when the caller Requires 100rel) and arm the ring
         // timeout. An offer we cannot serve — no audio line, or none of the
-        // codecs imsd-media plays (AMR-WB, AMR, PCMA, PCMU) — is refused
-        // with 488 up front, before the UI ever rings; the log line names
+        // codecs imsd-media plays (AMR-WB, AMR, PCMA, PCMU; the CODECS
+        // override narrows that set) — is refused with 488 up front, before
+        // the UI ever rings; the log line names
         // what WAS offered, so a field journal answers "which codec did the
         // gateway want" without a raw SIP dump.
         std::vector<Action> OnInvite() {
@@ -318,6 +325,7 @@ export namespace imsd::engine {
                     offer.sessionId = rng_.UInt(1000000, 9999999);
                     offer.precond = precond_;
                     offer.currRemote = "sendrecv";
+                    offer.codecs = codecs_;
                     ans = imsd::sdp::BuildOffer(offer);
                 }
                 // RFC 4028 §9: a 2xx to a refresh MUST echo Session-Expires,
@@ -429,6 +437,7 @@ export namespace imsd::engine {
         std::string uni_, number_;
         int rtpPort_;
         bool precond_;
+        std::vector<std::string> codecs_;   // CODECS override; empty = defaults
         Direction direction_ = Direction::Outgoing;
         CallState state_ = CallState::Dialing;
         std::string reason_ = "outgoing";
@@ -532,7 +541,7 @@ export namespace imsd::engine {
         }
 
         MediaLeg ParseAnswer() const {
-            imsd::sdp::Answer ans = imsd::sdp::ParseAnswer(answerSdp_);
+            imsd::sdp::Answer ans = imsd::sdp::ParseAnswer(answerSdp_, codecs_);
             MediaLeg leg;
             leg.remoteIp = ans.ip;
             leg.remotePort = ans.port < 0 ? 0 : ans.port;

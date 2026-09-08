@@ -294,6 +294,93 @@ int main() {
         Check(sdp.contains("a=rtpmap:0 PCMU/8000/1\r\n") && !sdp.contains("fmtp:0"), "PCMU answer has no fmtp");
     }
 
+    // ---- CODECS override: the offer of a real interconnect gateway that
+    //      transcodes up (KPN, 2026-09-08: a G.711-only caller arrives with
+    //      AMR-WB BE added). Default picks AMR-WB; a preference list picks
+    //      what it names, in its order, and nothing outside it.
+    {
+        std::string kpn =
+            "c=IN IP6 2001:db8::309\r\n"
+            "m=audio 41166 RTP/AVP 8 0 100 96 101 13 106\r\n"
+            "a=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:100 AMR/8000\r\na=fmtp:100 mode-change-period=2\r\n"
+            "a=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 mode-change-period=2\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\n"
+            "a=rtpmap:106 telephone-event/16000\r\na=fmtp:106 0-15\r\n"
+            "a=sendrecv\r\na=ptime:20\r\na=maxptime:60\r\n";
+        Answer d = ParseAnswer(kpn);
+        Check(d.payloadType == 96 && d.codec == "AMR-WB" && !d.octetAlign, "transcoding gateway: default takes AMR-WB BE");
+        std::vector<std::string> pcma{"PCMA"};
+        Answer a = ParseAnswer(kpn, pcma);
+        Check(a.payloadType == 8 && a.codec == "PCMA" && !a.octetAlign, "CODECS=PCMA takes G.711 A-law out of a mixed offer");
+        std::vector<std::string> ulawFirst{"PCMU", "PCMA"};
+        Answer u = ParseAnswer(kpn, ulawFirst);
+        Check(u.payloadType == 0 && u.codec == "PCMU", "CODECS order wins over the offer's order");
+        std::vector<std::string> nb{"AMR"};
+        Answer n = ParseAnswer(kpn, nb);
+        Check(n.payloadType == 100 && n.codec == "AMR" && !n.octetAlign, "CODECS=AMR takes narrowband AMR, BE as offered");
+        std::vector<std::string> wb{"AMR-WB"};
+        Answer w = ParseAnswer(kpn, wb);
+        Check(w.payloadType == 96 && w.codec == "AMR-WB", "CODECS=AMR-WB matches the default here");
+        Answer g = ParseAnswer("c=IN IP4 192.0.2.1\r\n" "m=audio 5000 RTP/AVP 8 0 101\r\n" "a=rtpmap:101 telephone-event/8000\r\n", wb);
+        Check(g.codec.empty() && g.payloadType == 8, "CODECS=AMR-WB refuses a G.711-only offer (codec empty, first pt)");
+        Check(g.port == 5000 && g.ip == "192.0.2.1", "address/port still parsed when no codec is acceptable");
+    }
+
+    // ---- ParseCodecList: case, spaces, AMR-NB alias, unknowns, repeats
+    {
+        auto l = ParseCodecList("pcma, amr-nb ,AMR-WB,g729,PCMA,,PCMU");
+        Check(l.size() == 4 && l[0] == "PCMA" && l[1] == "AMR" && l[2] == "AMR-WB" && l[3] == "PCMU", "codec list normalised: PCMA,AMR,AMR-WB,PCMU");
+        Check(ParseCodecList("").empty(), "empty spec = no override");
+        Check(ParseCodecList("opus, g722").empty(), "only unknown names = no override");
+    }
+
+    // ---- BuildOffer with an explicit codec list: G.711 only (landline
+    //      shape, for MO tests against a transcoding network)
+    {
+        std::string sdp = BuildOffer({
+            .local = "192.0.2.1",
+            .rtpPort = 22222,
+            .sessionId = 1234567,
+            .codecs = {"PCMA", "PCMU"},
+        });
+        std::string expected =
+            "v=0\r\n"
+            "o=- 1234567 1234567 IN IP4 192.0.2.1\r\n"
+            "s=-\r\n"
+            "c=IN IP4 192.0.2.1\r\n"
+            "t=0 0\r\n"
+            "m=audio 22222 RTP/AVP 8 0 100\r\n"
+            "b=AS:80\r\n"
+            "b=RS:512\r\n"
+            "b=RR:1536\r\n"
+            "a=rtpmap:8 PCMA/8000/1\r\n"
+            "a=rtpmap:0 PCMU/8000/1\r\n"
+            "a=rtpmap:100 telephone-event/8000\r\n"
+            "a=fmtp:100 0-15\r\n"
+            "a=ptime:20\r\n"
+            "a=maxptime:240\r\n"
+            "a=sendrecv\r\n";
+        Check(sdp == expected, "G.711-only offer byte-exact");
+    }
+
+    // ---- BuildOffer, AMR narrowband only: pt 99, narrowband DTMF only, AS 30
+    {
+        std::string sdp = BuildOffer({.local = "2001:db8::1", .rtpPort = 50004, .sessionId = 7, .codecs = {"AMR"}});
+        Check(sdp.contains("m=audio 50004 RTP/AVP 99 100\r\n"), "AMR-only offer m-line");
+        Check(sdp.contains("b=AS:30\r\n"), "AMR-only offer bandwidth");
+        Check(sdp.contains("a=rtpmap:99 AMR/8000/1\r\na=fmtp:99 octet-align=1;mode-change-capability=2;max-red=0\r\n"), "AMR-only offer rtpmap+fmtp");
+        Check(!sdp.contains("16000"), "no wideband telephone-event without AMR-WB");
+    }
+
+    // ---- BuildOffer, explicit default order == the pinned default bytes
+    {
+        Offer o{.local = "2001:db8::1", .rtpPort = 50004, .sessionId = 7};
+        Offer e = o;
+        e.codecs = {"AMR-WB", "AMR"};
+        Check(BuildOffer(o) == BuildOffer(e), "explicit AMR-WB,AMR list is byte-identical to the default offer");
+    }
+
     if (Failures == 0) std::println("Sdp: all tests passed");
     return Failures;
 }

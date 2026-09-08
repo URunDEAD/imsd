@@ -210,3 +210,4 @@ GPL-3.0-only — see [LICENSE](LICENSE).
 
 Copyright (C) 2026 Catcrafts®
 catcrafts.net
+| `CODECS` | *(empty — defaults)* | comma-separated codec preference list over `AMR-WB`, `AMR` (or `AMR-NB`), `PCMA`, `PCMU`: restricts and orders both the codecs offered on an outgoing call and those accepted from an inbound offer (default: offer AMR-WB + AMR, accept all four in that order). A bench knob — a network whose gateway transcodes every caller up to AMR-WB otherwise never lets the narrowband path run |
