@@ -164,6 +164,8 @@ int main() {
         CallMachine m(c, rng, "ims-call-1", "1233", 50004, false);
         auto start = m.Start();
         Check(Sent(start, "INVITE ") != nullptr, "Start sends INVITE");
+        Check(Sent(start, "INVITE ")->text.contains("\r\nFrom: <tel:+31611111111>;tag="), "MO INVITE From is our public (tel:) identity, not the IMSI IMPU");
+        Check(!Sent(start, "INVITE ")->text.contains("From: <sip:001010123456789@"), "MO INVITE From never the temporary IMPU once an identity is known");
         Check(Has(start, Action::Type::SetDeadline), "Start arms ring timeout");
         Check(m.State() == CallState::Dialing, "starts dialing");
 
@@ -610,7 +612,8 @@ int main() {
         Check(bye && bye->text.starts_with("BYE sip:origgw@[2001:db8::9]:5060 SIP/2.0"), "BYE targets the caller's Contact");
         Check(bye && bye->text.contains("CSeq: 1 BYE\r\n"), "our UAS CSeq space starts at 1");
         Check(bye && bye->text.contains("To: <sip:+31612345678@ims.mnc001.mcc001.3gppnetwork.org;user=phone>" ";tag=caller1\r\n"), "BYE To is the caller (their tag)");
-        Check(bye && bye->text.contains("From: <sip:001010123456789@ims.mnc001.mcc001." "3gppnetwork.org>;tag="), "BYE From is us (our tag)");
+        Check(bye && bye->text.contains("From: <sip:+31611111111@ims.mnc001.mcc001.3gppnetwork.org;user=phone>;tag="), "UAS BYE From is the INVITE's To URI (our tag), not the IMSI IMPU");
+        Check(bye && !bye->text.contains("001010123456789@ims"), "UAS BYE carries no IMSI-derived identity");
         // UAS route set: Record-Route in RECEIVED order
         Check(bye && bye->text.contains("Route: <sip:[2001:db8::105]:5100;lr>, " "<sip:[2001:db8::9]:5060;lr>\r\n"), "BYE routes via Record-Route in received order");
         const Action* t = Find(ah, Action::Type::State);
@@ -826,6 +829,22 @@ int main() {
         Check(inv && inv->text.contains("m=audio 50004 RTP/AVP 8 0 100\r\n"), "CODECS=PCMA,PCMU: INVITE offers G.711 only");
         Check(inv && !inv->text.contains("AMR"), "CODECS=PCMA,PCMU: no AMR in the offer");
         Check(inv && inv->text.contains("a=rtpmap:100 telephone-event/8000\r\n") && !inv->text.contains("telephone-event/16000"), "CODECS=PCMA,PCMU: narrowband DTMF only");
+    }
+
+    // ---- MO with the registered sip: identity learned (the normal case on a
+    //      live network): From, CANCEL and BYE all carry it, never the IMSI
+    {
+        Context ca = MakeCtx();
+        ca.aor = "sip:+31611111111@ims.mnc001.mcc001.3gppnetwork.org";
+        imsd::util::Rng rng(61);
+        CallMachine m(ca, rng, "ims-call-30", "1233", 50004, false);
+        auto start = m.Start();
+        const Action* inv = Sent(start, "INVITE ");
+        Check(inv && inv->text.contains("\r\nFrom: <sip:+31611111111@ims.mnc001.mcc001.3gppnetwork.org>;tag="), "MO INVITE From is the registered sip: identity");
+        auto cancel = m.OnHangup();
+        const Action* can = Sent(cancel, "CANCEL ");
+        Check(can && can->text.contains("\r\nFrom: <sip:+31611111111@ims.mnc001.mcc001.3gppnetwork.org>;tag="), "CANCEL From is the same identity");
+        Check(can && !can->text.contains("001010123456789@ims"), "CANCEL carries no IMSI");
     }
 
     if (Failures == 0) std::println("Engine: all tests passed");

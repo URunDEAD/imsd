@@ -290,7 +290,27 @@ export namespace imsd::msg {
         std::optional<std::string> dialogTo;     // remote To/From incl. tag, once known
         std::vector<std::string> recordRoute;    // route set, UAC order (see DialogRoute)
         std::optional<std::string> remoteTarget; // remote Contact URI
+        std::string localUri;       // our URI in this dialog: the UAS takes the
+                                    // INVITE's To URI; empty = CallerId(c) (UAC)
     };
+
+    // The identity we sign our own requests with: the registered public
+    // identity (P-Associated-URI sip: entry), else the tel: one, and the
+    // IMSI-derived temporary IMPU only before either is learned. 3GPP allows
+    // the temporary IMPU in REGISTER alone; a P-CSCF that does not overwrite
+    // From shows it to the callee (Telia, 2026-09-01: the reporter's IMSI on
+    // the far phone) and a strict one may reject the request.
+    inline std::string_view CallerId(const Context& c) {
+        if (!c.aor.empty()) return c.aor;
+        if (!c.ppi.empty()) return c.ppi;
+        return c.id.impu;
+    }
+
+    // From URI of a request inside a dialog (RFC 3261 12.2.1.1: the dialog's
+    // local URI — as UAS that is the INVITE's To, as UAC our caller identity).
+    inline std::string_view FromUri(const Context& c, const Dialog& d) {
+        return d.localUri.empty() ? CallerId(c) : std::string_view(d.localUri);
+    }
 
     // Dialog route set: the reversed Record-Route, or the registration Route
     // when none was recorded (imsd._dialog_route).
@@ -314,7 +334,7 @@ export namespace imsd::msg {
             std::format("Via: SIP/2.0/TCP {};branch=z9hG4bK{};rport", imsd::util::HostPort(c.local, c.portUs), d.invBranch),
             "Max-Forwards: 70",
             std::format("Route: {}", c.route),
-            std::format("From: <{}>;tag={}", c.id.impu, d.itag),
+            std::format("From: <{}>;tag={}", FromUri(c, d), d.itag),
             std::format("To: <{}>", d.ruri),
             std::format("Call-ID: {}", d.callid),
             "CSeq: 1 INVITE",
@@ -347,7 +367,7 @@ export namespace imsd::msg {
             ViaLine(c, "TCP", c.portUs, viaBranch),
             "Max-Forwards: 70",
             std::format("Route: {}", DialogRoute(c, d)),
-            std::format("From: <{}>;tag={}", c.id.impu, d.itag),
+            std::format("From: <{}>;tag={}", FromUri(c, d), d.itag),
             std::format("To: {}", to),
             std::format("Call-ID: {}", d.callid),
             std::format("CSeq: {} {}", cseq, method),
@@ -374,7 +394,7 @@ export namespace imsd::msg {
             ViaLine(c, "TCP", c.portUs, viaBranch),
             "Max-Forwards: 70",
             std::format("Route: {}", DialogRoute(c, d)),
-            std::format("From: <{}>;tag={}", c.id.impu, d.itag),
+            std::format("From: <{}>;tag={}", FromUri(c, d), d.itag),
             std::format("To: {}", to),
             std::format("Call-ID: {}", d.callid),
             "CSeq: 1 ACK",
@@ -391,7 +411,7 @@ export namespace imsd::msg {
             std::format("Via: SIP/2.0/TCP {};branch=z9hG4bK{};rport", imsd::util::HostPort(c.local, c.portUs), d.invBranch),
             "Max-Forwards: 70",
             std::format("Route: {}", c.route),
-            std::format("From: <{}>;tag={}", c.id.impu, d.itag),
+            std::format("From: <{}>;tag={}", FromUri(c, d), d.itag),
             std::format("To: {}", toHeader),
             std::format("Call-ID: {}", d.callid),
             "CSeq: 1 ACK",
@@ -407,7 +427,7 @@ export namespace imsd::msg {
             std::format("Via: SIP/2.0/TCP {};branch=z9hG4bK{};rport", imsd::util::HostPort(c.local, c.portUs), d.invBranch),
             "Max-Forwards: 70",
             std::format("Route: {}", c.route),
-            std::format("From: <{}>;tag={}", c.id.impu, d.itag),
+            std::format("From: <{}>;tag={}", FromUri(c, d), d.itag),
             std::format("To: <{}>", d.ruri),
             std::format("Call-ID: {}", d.callid),
             "CSeq: 1 CANCEL",

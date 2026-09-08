@@ -120,6 +120,7 @@ export namespace imsd::engine {
             d_.itag = rng_.Token(10);        // the To tag we mint = our dialog tag
             d_.invBranch = rng_.Token(20);   // unused as UAS; kept initialized
             if (auto from = imsd::sip::Header(invite_, "From")) d_.dialogTo = std::string(*from);
+            if (auto to = imsd::sip::Header(invite_, "To")) d_.localUri = AngleUri(*to).value_or("");
             if (auto ct = imsd::sip::Header(invite_, "Contact")) d_.remoteTarget = AngleUri(*ct);
             d_.ruri = d_.remoteTarget.value_or("");
             // The UAS route set is the Record-Route in RECEIVED order

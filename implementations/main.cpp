@@ -411,12 +411,12 @@ std::string StateDir() {
 // tiny JSON reader/writer for the persisted registration context.
 std::string StatePath() { return EnvOr("STATE_FILE", std::format("{}/imsreg.state", StateDir())); }
 
-void PersistState(const RegState& r, const std::string& route, const std::string& ppi) {
+void PersistState(const RegState& r, const std::string& route, const std::string& ppi, const std::string& aor) {
     std::string j = std::format(
         "{{\"callid\": \"{}\", \"ftag\": \"{}\", \"cseq\": {}, \"spi_uc\": {}, "
         "\"spi_us\": {}, \"expiry\": {}, \"route\": \"{}\", \"ppi\": \"{}\", "
-        "\"contact_user\": \"{}\"}}",
-        r.callid, r.ftag, r.cseq, r.spiUc, r.spiUs, r.expiry, route, ppi,
+        "\"aor\": \"{}\", \"contact_user\": \"{}\"}}",
+        r.callid, r.ftag, r.cseq, r.spiUc, r.spiUs, r.expiry, route, ppi, aor,
         r.contactUser);
     std::string path = StatePath();
     std::error_code ec;
@@ -441,7 +441,7 @@ void DumpRaw(std::string_view name, std::string_view msg) {
 }
 
 struct PersistedState {
-    std::optional<std::string> callid, ftag, route, ppi, contactUser;
+    std::optional<std::string> callid, ftag, route, ppi, aor, contactUser;
     std::optional<long> cseq, spiUc, spiUs, expiry;
 };
 std::optional<PersistedState> LoadState() {
@@ -456,6 +456,7 @@ std::optional<PersistedState> LoadState() {
     ps.ftag = QuotedAfter(s, "\"ftag\": \"");
     ps.route = QuotedAfter(s, "\"route\": \"");
     ps.ppi = QuotedAfter(s, "\"ppi\": \"");
+    ps.aor = QuotedAfter(s, "\"aor\": \"");
     ps.contactUser = QuotedAfter(s, "\"contact_user\": \"");
     ps.cseq = IntAfter(s, "\"cseq\": ");
     ps.spiUc = IntAfter(s, "\"spi_uc\": ");
@@ -809,6 +810,10 @@ private:
         // is re-learned from the next 200's P-Associated-URI.
         ppi_ = ps->ppi.value_or("");
         ss_ = sa->securityServer;
+        // The public identity our requests are signed with (From) — restored
+        // here so a call placed before the refresh 200 re-learns it does not
+        // fall back to the barred temporary IMPU.
+        ctx_.aor = ps->aor.value_or("");
         ctx_.route = route_; ctx_.ppi = ppi_; ctx_.securityServer = ss_;
         ctx_.portUc = PortUc; ctx_.portUs = PortUs;
         Log(std::format("RESUME via existing SA (cseq {})", ps->cseq.value_or(1)));
@@ -834,7 +839,7 @@ private:
         if (auto e = imsd::sip::GrantedExpires(okMsg)) reg_.expiry = *e;
         UpdateRouteAndPpi(okMsg);
         LogBindings(okMsg);
-        PersistState(reg_, route_, ppi_);
+        PersistState(reg_, route_, ppi_, ctx_.aor);
         Log("REGISTERED (resumed + true-refreshed)");
         return true;
     }
@@ -933,7 +938,7 @@ private:
         LogBindings(ok);
         if (route_.empty()) route_ = std::format("<sip:{};lr>", imsd::util::HostPort(pcscf_, portPs));
         ctx_.route = route_; ctx_.ppi = ppi_;
-        PersistState(reg_, route_, ppi_);
+        PersistState(reg_, route_, ppi_, ctx_.aor);
         Log("REGISTERED (fresh)");
     }
 
@@ -1051,7 +1056,7 @@ private:
             auto [msg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1, reg_.spiUc, reg_.spiUs);
             reg_.cseq = used;
             if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
-            PersistState(reg_, route_, ppi_);
+            PersistState(reg_, route_, ppi_, ctx_.aor);
             Log(std::format("keepalive re-REGISTER ok (cseq {})", used));
             SubscribeRegEvent();
             if (!registered_) { registered_ = true; EmitStatus(true); }
@@ -1087,7 +1092,7 @@ private:
                 if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
                 UpdateRouteAndPpi(msg);
                 LogBindings(msg);
-                PersistState(reg_, route_, ppi_);
+                PersistState(reg_, route_, ppi_, ctx_.aor);
                 Log("reconnected + re-registered");
                 SubscribeRegEvent();
                 if (!registered_) { registered_ = true; EmitStatus(true); }
@@ -1242,6 +1247,9 @@ private:
         for (const auto& a : actions) {
             switch (a.type) {
                 case T::SendClient:
+                    // the outgoing INVITE is the one request a field log could
+                    // never show (DUMP_SIP dumped inbound messages only)
+                    if (a.text.starts_with("INVITE ")) DumpRaw("imsd-invite-out.raw", a.text);
                     if (!sip_.Send(a.text)) { sendOk = false; Log("client send failed"); }
                     break;
                 case T::SendResponse:
