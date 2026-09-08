@@ -820,7 +820,7 @@ int main() {
     //      list names (G.711 = a landline-shaped offer toward the network)
     {
         imsd::util::Rng rng(54);
-        CallMachine m(c, rng, "ims-call-23", "0783690354", 50004, false, false, {"PCMA", "PCMU"});
+        CallMachine m(c, rng, "ims-call-23", "0101234567", 50004, false, false, {"PCMA", "PCMU"});
         auto start = m.Start();
         const Action* inv = Sent(start, "INVITE ");
         Check(inv && inv->text.contains("m=audio 50004 RTP/AVP 8 0 100\r\n"), "CODECS=PCMA,PCMU: INVITE offers G.711 only");
