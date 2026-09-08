@@ -410,6 +410,28 @@ std::size_t RtpPayloadOffset(std::span<const std::uint8_t> pkt) {
     return off;
 }
 
+// The desktop user's uid, resolved ONCE and thread-safely. getpwnam() hands
+// out one static buffer, and the mic and playout threads spawn their pw
+// helpers at the same instant — the race sent both into /run/user/0, where
+// no PipeWire session lives, and a call was answered into static (dev phone,
+// 2026-09-08 20:01: tx_mic=0 rx_played=0 qdrop=883). Logged per call so a
+// journal shows which session the helpers were aimed at.
+uid_t AudioUid() {
+    static std::once_flag once;
+    static uid_t uid = 0;
+    std::call_once(once, [] {
+        std::string user = EnvOr("AUDIO_USER", "user");
+        passwd pw{};
+        passwd* res = nullptr;
+        char buf[4096];
+        if (getpwnam_r(user.c_str(), &pw, buf, sizeof buf, &res) == 0 && res) uid = res->pw_uid;
+        else
+            std::println(std::cerr, "imsd-media: AUDIO_USER '{}' not found; no PipeWire session for uid 0", user);
+        std::println(std::cerr, "imsd-media: audio session: {} -> /run/user/{}", user, uid);
+    });
+    return uid;
+}
+
 // Spawn pw-record/pw-play in the desktop user's PipeWire session (sudo -u
 // when run as root). AUDIO_USER names the session owner; the default "user"
 // is postmarketOS's standard account. `toChild` true = we write the child's
@@ -421,10 +443,8 @@ Child SpawnPw(bool play, bool toChild, int rate) {
     std::vector<std::string> argv;
     if (geteuid() == 0) {
         std::string user = EnvOr("AUDIO_USER", "user");
-        uid_t uid = 0;
-        if (passwd* pw = getpwnam(user.c_str())) uid = pw->pw_uid;
         argv = {"sudo", "-u", user, "env",
-                std::format("XDG_RUNTIME_DIR=/run/user/{}", uid)};
+                std::format("XDG_RUNTIME_DIR=/run/user/{}", AudioUid())};
     }
     const char* tool = play ? "pw-play" : "pw-record";
     const char* lat = play ? "40ms" : "20ms";
