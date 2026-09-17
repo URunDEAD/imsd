@@ -37,6 +37,10 @@ export namespace imsd::msg {
         int portUc = imsd::util::PortUc;
         int portUs = imsd::util::PortUs;
         int initPort = 5060;
+        // Transport of the protected leg (REGISTER 2 onwards): the Via token
+        // of every request we send over it. TCP unless the engine fell back
+        // to, or was told to use, UDP.
+        std::string transport = "TCP";
         std::string ealgOffer = "aes-cbc";
         // RFC 7254 IMEI URN for +sip.instance (e.g. urn:gsma:imei:35999999-
         // 000000-1); empty omits the parameter.
@@ -218,7 +222,7 @@ export namespace imsd::msg {
     std::string BuildRegisterProtected(const Context& c, std::string_view callid, std::string_view ftag, std::string_view branch, int cseq, std::uint32_t spiUc, std::uint32_t spiUs, std::string_view authLine) {
         std::vector<std::string> l = {
             std::format("REGISTER {} SIP/2.0", c.id.regUri),
-            ViaLine(c, "TCP", c.portUs, branch),
+            ViaLine(c, c.transport, c.portUs, branch),
             "Max-Forwards: 70",
             std::format("From: <{}>;tag={}", c.id.impu, ftag),
             std::format("To: <{}>", c.id.impu),
@@ -252,7 +256,7 @@ export namespace imsd::msg {
                                              : std::string_view(c.aor);
         std::vector<std::string> l = {
             std::format("SUBSCRIBE {} SIP/2.0", aor),
-            ViaLine(c, "TCP", c.portUs, branch),
+            ViaLine(c, c.transport, c.portUs, branch),
             "Max-Forwards: 70",
             std::format("Route: {}", c.route),
             std::format("From: <{}>;tag={}", aor, ftag),
@@ -331,7 +335,7 @@ export namespace imsd::msg {
                                         : "100rel, timer";
         std::vector<std::string> l = {
             std::format("INVITE {} SIP/2.0", d.ruri),
-            std::format("Via: SIP/2.0/TCP {};branch=z9hG4bK{};rport", imsd::util::HostPort(c.local, c.portUs), d.invBranch),
+            ViaLine(c, c.transport, c.portUs, d.invBranch),
             "Max-Forwards: 70",
             std::format("Route: {}", c.route),
             std::format("From: <{}>;tag={}", FromUri(c, d), d.itag),
@@ -364,7 +368,7 @@ export namespace imsd::msg {
         std::string to = d.dialogTo.value_or(std::format("<{}>", d.ruri));
         std::vector<std::string> l = {
             std::format("{} {} SIP/2.0", method, target),
-            ViaLine(c, "TCP", c.portUs, viaBranch),
+            ViaLine(c, c.transport, c.portUs, viaBranch),
             "Max-Forwards: 70",
             std::format("Route: {}", DialogRoute(c, d)),
             std::format("From: <{}>;tag={}", FromUri(c, d), d.itag),
@@ -391,7 +395,7 @@ export namespace imsd::msg {
         std::string to = d.dialogTo.value_or(std::string(toHeader));
         std::vector<std::string> l = {
             std::format("ACK {} SIP/2.0", target),
-            ViaLine(c, "TCP", c.portUs, viaBranch),
+            ViaLine(c, c.transport, c.portUs, viaBranch),
             "Max-Forwards: 70",
             std::format("Route: {}", DialogRoute(c, d)),
             std::format("From: <{}>;tag={}", FromUri(c, d), d.itag),
@@ -408,7 +412,7 @@ export namespace imsd::msg {
     std::string BuildAckNon2xx(const Context& c, const Dialog& d, std::string_view toHeader) {
         std::vector<std::string> l = {
             std::format("ACK {} SIP/2.0", d.ruri),
-            std::format("Via: SIP/2.0/TCP {};branch=z9hG4bK{};rport", imsd::util::HostPort(c.local, c.portUs), d.invBranch),
+            ViaLine(c, c.transport, c.portUs, d.invBranch),
             "Max-Forwards: 70",
             std::format("Route: {}", c.route),
             std::format("From: <{}>;tag={}", FromUri(c, d), d.itag),
@@ -424,7 +428,7 @@ export namespace imsd::msg {
     std::string BuildCancel(const Context& c, const Dialog& d) {
         std::vector<std::string> l = {
             std::format("CANCEL {} SIP/2.0", d.ruri),
-            std::format("Via: SIP/2.0/TCP {};branch=z9hG4bK{};rport", imsd::util::HostPort(c.local, c.portUs), d.invBranch),
+            ViaLine(c, c.transport, c.portUs, d.invBranch),
             "Max-Forwards: 70",
             std::format("Route: {}", c.route),
             std::format("From: <{}>;tag={}", FromUri(c, d), d.itag),

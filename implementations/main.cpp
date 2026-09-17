@@ -179,10 +179,53 @@ socklen_t MakeAddr(std::string_view ip, int port, sockaddr_storage& ss) {
 }
 
 // ---- SIP over the protected TCP flow --------------------------------------
-class SipTcp {
+enum class Transport { Tcp, Udp };
+constexpr std::string_view TransportName(Transport t) { return t == Transport::Udp ? "UDP" : "TCP"; }
+
+// The protected client flow: our requests to the P-CSCF's protected server
+// port and their responses. TCP is the shape every carrier that works so far
+// serves; UDP is the alternative for a P-CSCF that never answers the TCP
+// connect (O2 UK, 2026-09-17). Both run through the same SA pair — the xfrm
+// policies select on ports only — and the same Via port.
+// A P-CSCF refusing a fresh security association (KPN: Security-Server
+// spi-s=0 to a fresh REGISTER made too soon after another; the window is
+// ~20 min and every fresh attempt re-arms it). Handled in-process: a
+// systemd restart every RestartSec would never clear it.
+struct ThrottledError : std::runtime_error { using std::runtime_error::runtime_error; };
+constexpr int ThrottleWaitMin = 21;
+// Bytes of SIP that fit one ESP-protected IPv6 packet at the ims PDN's
+// 1280-byte MTU (40 IPv6 + 8 ESP + 16 IV + 8 UDP + padding + 12 ICV).
+constexpr std::size_t UdpSinglePacketBudget = 1190;
+
+class SipFlow {
 public:
-    bool Connect(const std::string& local, int lport, const std::string& pcscf, int pport, int tries = 10) {
+    // TCP: connect up to `tries` times (12-s timeout each, 10 s apart). An
+    // attempt the network never answers counts towards `silentLimit` (0 =
+    // unlimited); an attempt refused locally — connect() itself failing:
+    // EADDRNOTAVAIL (the 4-tuple still in TIME_WAIT from the previous flow),
+    // ENETUNREACH (no route yet) — does not, so a restart within 60 s of the
+    // last one keeps retrying instead of concluding the P-CSCF is silent. UDP: bind the same client port and connect() the
+    // datagram socket to the same peer — the kernel then delivers that peer's
+    // datagrams here in preference to the unconnected ServerPorts socket on
+    // the same port. A UDP connect() cannot be refused by the peer, so it is
+    // one attempt.
+    bool Connect(const std::string& local, int lport, const std::string& pcscf, int pport, Transport t, int tries = 10, int silentLimit = 0) {
+        transport_ = t;
         int fam = Is6(local) ? AF_INET6 : AF_INET;
+        if (t == Transport::Udp) {
+            int fd = socket(fam, SOCK_DGRAM, 0);
+            if (fd < 0) return false;
+            int one = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+            sockaddr_storage la; socklen_t ll = MakeAddr(local, lport, la);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&la), ll) != 0) { close(fd); return false; }
+            sockaddr_storage pa; socklen_t pl = MakeAddr(pcscf, pport, pa);
+            if (connect(fd, reinterpret_cast<sockaddr*>(&pa), pl) != 0) { Log(std::format("UDP connect: {}", std::strerror(errno))); close(fd); return false; }
+            fd_ = fd; alive_ = true; fb_ = {}; sizeWarned_ = false;
+            return true;
+        }
+        int silent = 0;
         for (int attempt = 0; attempt < tries; attempt++) {
             int fd = socket(fam, SOCK_STREAM, 0);
             if (fd < 0) return false;
@@ -200,22 +243,33 @@ public:
             fcntl(fd, F_SETFL, O_NONBLOCK);
             int rc = connect(fd, reinterpret_cast<sockaddr*>(&pa), pl);
             bool connected = (rc == 0);
+            bool localRefusal = (rc < 0 && errno != EINPROGRESS);
+            int err = localRefusal ? errno : 0;
             if (rc < 0 && errno == EINPROGRESS) {
                 pollfd p{fd, POLLOUT, 0};
                 if (poll(&p, 1, 12000) > 0) {
-                    int err = 0; socklen_t el = sizeof err;
+                    socklen_t el = sizeof err;
                     getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
                     connected = (err == 0);
-                }
+                } else err = ETIMEDOUT;
             }
             if (connected) {
                 fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
-                fd_ = fd; alive_ = true; fb_ = {};
+                fd_ = fd; alive_ = true; fb_ = {}; sizeWarned_ = false;
                 return true;
             }
             close(fd);
+            if (!localRefusal) silent++;
             if (attempt == tries - 1) return false;
-            Log(std::format("connect failed; retry in 10s (TIME_WAIT?) [{}/{}]", attempt + 1, tries));
+            if (silentLimit > 0 && silent >= silentLimit) {
+                Log(std::format("connect: no answer from the P-CSCF {} times", silent));
+                return false;
+            }
+            // An answer (RST → ECONNREFUSED, ICMP → EHOSTUNREACH/ENETUNREACH)
+            // counts towards the silent limit like a timeout: either way the
+            // P-CSCF does not serve TCP on that port. The log says which.
+            const char* why = err == ETIMEDOUT ? "no answer" : (err == EADDRNOTAVAIL ? "TIME_WAIT?" : std::strerror(err));
+            Log(std::format("connect failed; retry in 10s ({}) [{}/{}]", why, attempt + 1, tries));
             sleep(10);
         }
         return false;
@@ -223,6 +277,10 @@ public:
     // MSG_NOSIGNAL: a flow the network killed (CSFB excursion, P-CSCF idle
     // drop) must surface as a send error, not a SIGPIPE.
     bool Send(std::string_view msg) {
+        if (transport_ == Transport::Udp && msg.size() > UdpSinglePacketBudget && !sizeWarned_) {
+            sizeWarned_ = true;
+            Log(std::format("UDP: {} bytes of SIP exceed the single-packet ESP budget (~{}) at MTU 1280; the kernel sends it as IPv6 fragments — a P-CSCF that cannot reassemble ESP fragments drops it silently", msg.size(), UdpSinglePacketBudget));
+        }
         std::size_t off = 0;
         while (off < msg.size()) {
             ssize_t w = send(fd_, msg.data() + off, msg.size() - off, MSG_NOSIGNAL);
@@ -232,6 +290,7 @@ public:
         return true;
     }
     void SendKeepalive() {
+        if (transport_ == Transport::Udp) return;   // RFC 5626 4.4.1: CRLF keepalives are for connection-oriented transports
         if (send(fd_, "\r\n\r\n", 4, MSG_NOSIGNAL) <= 0) alive_ = false;
     }
 
@@ -248,6 +307,26 @@ public:
             if (r <= 0) { if (r == 0) return std::nullopt; if (errno == EINTR) continue; return std::nullopt; }
             char buf[65535];
             ssize_t n = recv(fd_, buf, sizeof buf, 0);
+            if (transport_ == Transport::Udp) {
+                // One datagram = one message (RFC 3261 18.3): never accumulated
+                // across datagrams. An empty datagram is not EOF. A recv error
+                // is the kernel relaying an ICMP for the inner (decrypted) UDP
+                // — port unreachable → ECONNREFUSED, prohibited/policy → EACCES
+                // — i.e. the peer answering "no"; an ICMP quoting the ESP
+                // packet itself never reaches us (esp6_err ignores all but
+                // PKT_TOOBIG), so UDP has no dead-flow signal beyond these and
+                // the refresh timeouts.
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                    Log(std::format("UDP flow: recv error: {}", std::strerror(errno)));
+                    alive_ = false; return std::nullopt;
+                }
+                if (n == 0) continue;
+                std::string why;
+                if (auto m = imsd::sip::DatagramMessage(std::string_view(buf, static_cast<std::size_t>(n)), &why)) return m;
+                if (!why.empty()) Log(std::format("UDP: {} — ignored", why));
+                continue;
+            }
             // EOF/RST is not a timeout: mark the flow dead so the engine's
             // reconnect path notices within one loop turn instead of at the
             // next (possibly 30-min-away) keepalive refresh.
@@ -257,10 +336,13 @@ public:
     }
     int Fd() const { return fd_; }
     bool Alive() const { return fd_ >= 0 && alive_; }
+    Transport CurrentTransport() const { return transport_; }
     void Close() { if (fd_ >= 0) { close(fd_); fd_ = -1; } alive_ = false; }
 private:
     int fd_ = -1;
     bool alive_ = false;
+    Transport transport_ = Transport::Tcp;
+    bool sizeWarned_ = false;
     imsd::sip::FrameBuffer fb_;
 };
 
@@ -279,7 +361,7 @@ public:
             if (ls >= 0) {
                 int one = 1;
                 setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-                // paired with SipTcp::Connect's REUSEPORT (reconnect binds
+                // paired with SipFlow::Connect's REUSEPORT (reconnect binds
                 // the client port while this listener holds it)
                 setsockopt(ls, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
                 sockaddr_storage a; socklen_t l = MakeAddr(local, port, a);
@@ -323,6 +405,14 @@ public:
                 bool blank = sv.find_first_not_of("\r\n \t") == std::string_view::npos;
                 if (blank) continue;
                 std::string msg(sv);
+                if (imsd::sip::Status(msg).has_value()) {
+                    // A response here means the P-CSCF answered to the Via port
+                    // instead of the source port of our request (rport) — it
+                    // never reaches the client flow. Say so.
+                    int sp = src.ss_family == AF_INET6 ? ntohs(reinterpret_cast<sockaddr_in6*>(&src)->sin6_port) : ntohs(reinterpret_cast<sockaddr_in*>(&src)->sin_port);
+                    Log(std::format("UDP response on server socket {} from port {} ignored: {}", us == udpUc_ ? PortUc : PortUs, sp, sv.substr(0, sv.find("\r\n"))));
+                    continue;
+                }
                 if (!imsd::sip::Status(msg).has_value()) {  // request only
                     sockaddr_storage s = src; socklen_t sll = sl;
                     int rs = us;
@@ -411,13 +501,13 @@ std::string StateDir() {
 // tiny JSON reader/writer for the persisted registration context.
 std::string StatePath() { return EnvOr("STATE_FILE", std::format("{}/imsreg.state", StateDir())); }
 
-void PersistState(const RegState& r, const std::string& route, const std::string& ppi, const std::string& aor) {
+void PersistState(const RegState& r, const std::string& route, const std::string& ppi, const std::string& aor, const std::string& transport) {
     std::string j = std::format(
         "{{\"callid\": \"{}\", \"ftag\": \"{}\", \"cseq\": {}, \"spi_uc\": {}, "
         "\"spi_us\": {}, \"expiry\": {}, \"route\": \"{}\", \"ppi\": \"{}\", "
-        "\"aor\": \"{}\", \"contact_user\": \"{}\"}}",
+        "\"aor\": \"{}\", \"contact_user\": \"{}\", \"transport\": \"{}\"}}",
         r.callid, r.ftag, r.cseq, r.spiUc, r.spiUs, r.expiry, route, ppi, aor,
-        r.contactUser);
+        r.contactUser, transport);
     std::string path = StatePath();
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
@@ -441,7 +531,7 @@ void DumpRaw(std::string_view name, std::string_view msg) {
 }
 
 struct PersistedState {
-    std::optional<std::string> callid, ftag, route, ppi, aor, contactUser;
+    std::optional<std::string> callid, ftag, route, ppi, aor, contactUser, transport;
     std::optional<long> cseq, spiUc, spiUs, expiry;
 };
 std::optional<PersistedState> LoadState() {
@@ -458,6 +548,7 @@ std::optional<PersistedState> LoadState() {
     ps.ppi = QuotedAfter(s, "\"ppi\": \"");
     ps.aor = QuotedAfter(s, "\"aor\": \"");
     ps.contactUser = QuotedAfter(s, "\"contact_user\": \"");
+    ps.transport = QuotedAfter(s, "\"transport\": \"");   // absent in pre-0.3.5 files: TCP
     ps.cseq = IntAfter(s, "\"cseq\": ");
     ps.spiUc = IntAfter(s, "\"spi_uc\": ");
     ps.spiUs = IntAfter(s, "\"spi_us\": ");
@@ -492,6 +583,7 @@ GDBusConnection* DbusConn = nullptr;
 std::map<std::string, CallInfo> Calls;   // main thread only
 StatusSnapshot StatusSnap;                    // main thread only
 GMainLoop* MainLoop = nullptr;
+bool FatalExit = false;   // set by an engine-fatal event: main() exits non-zero so systemd restarts us
 
 std::int64_t NowEpoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -547,6 +639,7 @@ gboolean OnIdleEvent(gpointer data) {
             break;
         case Event::Type::Fatal:
             Log(std::format("engine fatal: {} — exiting for systemd restart", ev->text));
+            FatalExit = true;   // non-zero exit, or Restart=on-failure never fires
             g_main_loop_quit(MainLoop);
             break;
     }
@@ -571,6 +664,16 @@ public:
         rtpPort_ = std::atoi(EnvOr("RTP_PORT", "50004").c_str());
         precond_ = EnvOr("PRECOND", "0") == "1";
         ealgOffer_ = EnvOr("EALG", "aes-cbc");
+        // SIP_TRANSPORT: the protected leg's transport. auto (default) = TCP,
+        // and when the P-CSCF never answers the TCP connect, a fresh
+        // registration over UDP; tcp / udp force one. The challenge (first
+        // REGISTER) is UDP regardless.
+        sipPolicy_ = EnvOr("SIP_TRANSPORT", "auto");
+        if (sipPolicy_ != "auto" && sipPolicy_ != "tcp" && sipPolicy_ != "udp") {
+            Log(std::format("SIP_TRANSPORT={} unknown; using auto", sipPolicy_));
+            sipPolicy_ = "auto";
+        }
+        transport_ = sipPolicy_ == "udp" ? Transport::Udp : Transport::Tcp;
         mediaBin_ = ResolveMediaBin();
         // CODECS: restrict + reorder the codecs we offer and accept (bench
         // knob — a gateway that transcodes every caller up to AMR-WB never
@@ -620,8 +723,29 @@ public:
     }
 
     void Run() {
+        for (;;) {
         try {
             BringUp();
+            break;
+        } catch (const ThrottledError& e) {
+            // The window grows on repeats (a carrier's window may exceed the
+            // first guess and every throttled attempt re-arms it); it resets
+            // after a successful bring-up.
+            int waitMin = throttleWaitMin_;
+            throttleCount_++;
+            Log(std::format("bring-up deferred: {} — attempt {}, next fresh registration in {} min", e.what(), throttleCount_, waitMin));
+            registered_ = false;
+            EmitStatus(true);
+            for (int i = 0; i < waitMin * 60 && !quit_.load(); i++) {
+                // A Dial/Accept/HangUp arriving now must not wait in the
+                // queue and run stale once registration succeeds; with no
+                // flow the call collapses to terminated at once (DevLoop's rule).
+                if (auto cmd = PopCmd()) { HandleCmd(*cmd); MaybeDropCall(); continue; }
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            if (quit_.load()) return;
+            throttleWaitMin_ = std::min(throttleWaitMin_ * 3 / 2, 60);
+            continue;
         } catch (const std::exception& e) {
             if (devMode_) {
                 // dev/session mode (no modem): keep the ABI up, unregistered,
@@ -638,6 +762,8 @@ public:
             PostEvent(std::move(ev));
             return;
         }
+        }
+        throttleWaitMin_ = ThrottleWaitMin; throttleCount_ = 0;
         registered_ = true;
         EmitStatus(true);
         lastRefresh_ = Mono();
@@ -694,6 +820,11 @@ private:
 
     // config
     std::string pcscf_, dev_, outDir_, local_, ealgOffer_, mediaBin_;
+    std::string sipPolicy_;              // SIP_TRANSPORT: auto | tcp | udp
+    int throttleWaitMin_ = ThrottleWaitMin;   // grows on consecutive throttles, resets on success
+    int throttleCount_ = 0;
+    Transport transport_ = Transport::Tcp;   // the protected leg's transport in effect
+    void SetTransport(Transport t) { transport_ = t; ctx_.transport = std::string(TransportName(t)); }
     std::vector<std::string> emergencyExtra_;
     int pcscfPort_ = 5060;
     int rtpPort_ = 50004;
@@ -705,7 +836,7 @@ private:
     RegState reg_;
     std::string route_, ppi_, ss_;
     bool registered_ = false;
-    SipTcp sip_;
+    SipFlow sip_;
     ServerPorts server_;
     std::string subCallid_;   // live reg-event subscription dialog (empty: none)
     int portPs_ = 0;          // P-CSCF protected server port (reconnect target)
@@ -781,6 +912,8 @@ private:
         ctx_.id = imsd::aka::MakeIdentity(info->imsi, info->mcc, info->mnc);
         ctx_.local = local_;
         ctx_.ealgOffer = ealgOffer_;
+        SetTransport(transport_);
+        Log(std::format("SIP transport: {} ({})", TransportName(transport_), sipPolicy_));
         // USER_AGENT overrides (some networks fingerprint UAs — setting the
         // stock firmware's build string gives oracle parity, journal/ims.md
         // s53); USER_AGENT= (empty) omits the header.
@@ -793,7 +926,14 @@ private:
         RefreshPani();
 
         std::string resume = EnvOr("RESUME", "auto");
-        if (resume != "0" && TryResume()) return;
+        // A resume that the network refuses (403 after another process
+        // registered fresh for the same IMPI, a stale binding, …) is not
+        // fatal: the fresh registration below replaces its SAs. Only a
+        // failed FRESH registration is.
+        if (resume != "0") {
+            try { if (TryResume()) return; }
+            catch (const std::exception& e) { Log(std::format("resume failed: {} — registering fresh", e.what())); sip_.Close(); }
+        }
         FreshRegister();
     }
 
@@ -804,6 +944,11 @@ private:
         if (!sa) return false;
         auto ps = LoadState();
         if (!ps || !ps->callid) { Log("no reg state file; resume falls back to fresh"); return false; }
+        // The registration's transport is what the P-CSCF knows; a resume
+        // must reuse it. A forced policy that disagrees means a fresh start
+        // — decided before anything from the file is adopted.
+        Transport t = ps->transport.value_or("TCP") == "UDP" ? Transport::Udp : Transport::Tcp;
+        if (sipPolicy_ != "auto" && t != transport_) { Log("state file transport differs from SIP_TRANSPORT; fresh"); return false; }
 
         route_ = ps->route.value_or(std::format("<sip:{};lr>", imsd::util::HostPort(pcscf_, sa->portPs)));
         // No fallback identity: an empty ppi omits P-Preferred-Identity and
@@ -819,7 +964,10 @@ private:
         Log(std::format("RESUME via existing SA (cseq {})", ps->cseq.value_or(1)));
 
         portPs_ = sa->portPs;
-        if (!sip_.Connect(local_, PortUc, pcscf_, sa->portPs)) {
+        SetTransport(t);
+        // Local refusals (TIME_WAIT after a restart) keep retrying; two
+        // silences mean the flow is not coming back — fresh instead.
+        if (!sip_.Connect(local_, PortUc, pcscf_, sa->portPs, transport_, 10, 2)) {
             Log("resume connect failed; falling back to fresh");
             return false;
         }
@@ -839,7 +987,7 @@ private:
         if (auto e = imsd::sip::GrantedExpires(okMsg)) reg_.expiry = *e;
         UpdateRouteAndPpi(okMsg);
         LogBindings(okMsg);
-        PersistState(reg_, route_, ppi_, ctx_.aor);
+        PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
         Log("REGISTERED (resumed + true-refreshed)");
         return true;
     }
@@ -898,7 +1046,7 @@ private:
         std::uint32_t spiPs = static_cast<std::uint32_t>(IntAfter(ss_, "spi-s=").value_or(0));
         std::uint32_t spiPc = static_cast<std::uint32_t>(IntAfter(ss_, "spi-c=").value_or(0));
         std::string ealg = EalgAfter(ss_);
-        if (spiPs == 0) throw std::runtime_error("fresh-SA throttle active (spi-s=0); retry later");
+        if (spiPs == 0) throw ThrottledError("fresh-SA throttle active (spi-s=0)");
 
         auto aka = Authenticate(rand16, autn16);
         if (!aka) throw std::runtime_error("USIM AKA failed");
@@ -915,7 +1063,37 @@ private:
 
         ctx_.securityServer = ss_;
         portPs_ = portPs;
-        if (!sip_.Connect(local_, PortUc, pcscf_, portPs)) throw std::runtime_error("protected TCP connect failed");
+        // The fallback is for a P-CSCF that never served TCP. Once a TCP
+        // registration has succeeded on this phone (the state file records
+        // it), a silent connect is an outage, not a policy — two unanswered
+        // SYNs during a radio gap must not become a second initial REGISTER
+        // (the throttle trigger on KPN).
+        bool tcpKnownGood = false;
+        if (auto ps = LoadState(); ps && ps->callid.has_value()) {
+            std::string t = ps->transport.value_or("TCP");
+            tcpKnownGood = (t == "TCP");
+            // A phone whose last registration was UDP goes straight to UDP:
+            // a TCP probe on every boot would be a second initial REGISTER
+            // per boot on a carrier that never answers it.
+            if (sipPolicy_ == "auto" && t == "UDP" && transport_ == Transport::Tcp) {
+                Log("state file records a UDP registration; skipping the TCP probe");
+                SetTransport(Transport::Udp);
+            }
+        }
+        bool autoTcp = (sipPolicy_ == "auto" && transport_ == Transport::Tcp && !tcpKnownGood);
+        if (!sip_.Connect(local_, PortUc, pcscf_, portPs, transport_, 10, autoTcp ? 2 : 0)) {
+            if (autoTcp) {
+                // Two unanswered TCP connects: treat the P-CSCF as UDP-only
+                // and register again over UDP — a new challenge and a new SA
+                // pair (the SA setup flushes this one), same ports.
+                Log("protected TCP connect unanswered; registering fresh over UDP");
+                SetTransport(Transport::Udp);
+                FreshRegister();
+                return;
+            }
+            throw std::runtime_error(std::format("protected {} connect failed", TransportName(transport_)));
+        }
+        Log(std::format("protected leg over {}", TransportName(transport_)));
 
         std::string cnonce = rng_.Token(16);
         std::string response = imsd::aka::DigestAkav1(*nonceB64, aka->res, cnonce, ctx_.id.regUri, ctx_.id.impi, ctx_.id.domain);
@@ -938,7 +1116,7 @@ private:
         LogBindings(ok);
         if (route_.empty()) route_ = std::format("<sip:{};lr>", imsd::util::HostPort(pcscf_, portPs));
         ctx_.route = route_; ctx_.ppi = ppi_;
-        PersistState(reg_, route_, ppi_, ctx_.aor);
+        PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
         Log("REGISTERED (fresh)");
     }
 
@@ -1056,7 +1234,7 @@ private:
             auto [msg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1, reg_.spiUc, reg_.spiUs);
             reg_.cseq = used;
             if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
-            PersistState(reg_, route_, ppi_, ctx_.aor);
+            PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
             Log(std::format("keepalive re-REGISTER ok (cseq {})", used));
             SubscribeRegEvent();
             if (!registered_) { registered_ = true; EmitStatus(true); }
@@ -1083,7 +1261,7 @@ private:
         if (Mono() < nextReconnect_) return;
         Log("client flow dead; reconnecting");
         sip_.Close();
-        bool ok = sip_.Connect(local_, PortUc, pcscf_, portPs_, /*tries=*/2);
+        bool ok = sip_.Connect(local_, PortUc, pcscf_, portPs_, transport_, /*tries=*/2);
         if (ok) {
             try {
                 RefreshPani();
@@ -1092,7 +1270,7 @@ private:
                 if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
                 UpdateRouteAndPpi(msg);
                 LogBindings(msg);
-                PersistState(reg_, route_, ppi_, ctx_.aor);
+                PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
                 Log("reconnected + re-registered");
                 SubscribeRegEvent();
                 if (!registered_) { registered_ = true; EmitStatus(true); }
@@ -1514,5 +1692,5 @@ int main(int argc, char** argv) {
     pthread_join(engineTid, nullptr);
     g_bus_unown_name(owner);
     g_main_loop_unref(MainLoop);
-    return 0;
+    return FatalExit ? 1 : 0;
 }

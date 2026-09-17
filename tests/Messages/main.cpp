@@ -192,6 +192,21 @@ int main() {
            Reg2, "protected REGISTER");
     }
 
+    // ---- protected-leg transport follows Context.transport (SIP_TRANSPORT=udp,
+    // or the auto fallback): every protected request's Via says UDP, the
+    // challenge's Via stays UDP either way, and TCP is the untouched default.
+    {
+        Context cu = c;
+        cu.transport = "UDP";
+        std::string auth = AuthAka(cu, "NONCEXYZ", "CNONCE0123456789", "RESP0000");
+        std::string r2u = BuildRegisterProtected(cu, "REGCALLID@2001:db8::db43", "FTAG5678", "REGBRANCH123456", 2, 7449812u, 176466735u, auth);
+        Check(r2u.contains("\r\nVia: SIP/2.0/UDP [2001:db8::db43]:45062;branch=z9hG4bKREGBRANCH123456;rport\r\n"), "protected REGISTER Via follows transport=UDP");
+        Check(!r2u.contains("SIP/2.0/TCP"), "no TCP token left in a UDP protected REGISTER");
+        Check(BuildSubscribeReg(cu, "SUBCALLID@2001:db8::db43", "STAG1234", "SUBBRANCH0000000000").contains("\r\nVia: SIP/2.0/UDP [2001:db8::db43]:45062;"), "SUBSCRIBE Via follows transport=UDP");
+        Check(BuildRegisterInitial(cu, "REGCALLID@2001:db8::db43", "FTAG5678", "REGBRANCH123456", 7449812u, 176466735u).contains("\r\nVia: SIP/2.0/UDP [2001:db8::db43]:5060;"), "initial REGISTER Via is UDP regardless");
+        Check(BuildRegisterProtected(c, "REGCALLID@2001:db8::db43", "FTAG5678", "REGBRANCH123456", 2, 7449812u, 176466735u, auth).contains("\r\nVia: SIP/2.0/TCP [2001:db8::db43]:45062;"), "default transport stays TCP");
+    }
+
     // ---- RuriFor variants
     Eq(RuriFor("1233", c.id.domain), "sip:1233;phone-context=ims.mnc001.mcc001.3gppnetwork.org@ims.mnc001.mcc001.3gppnetwork.org;user=phone", "ruri short code");
     Eq(RuriFor("+31612345678", c.id.domain), "sip:+31612345678@ims.mnc001.mcc001.3gppnetwork.org;user=phone", "ruri E.164");

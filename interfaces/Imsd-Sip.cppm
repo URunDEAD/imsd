@@ -233,4 +233,36 @@ export namespace imsd::sip {
     private:
         std::string buf_;
     };
+
+    // The SIP message carried by one UDP datagram (RFC 3261 18.3): a
+    // datagram is never accumulated with the next. Leading CRLFs (an RFC
+    // 5626 keepalive pong) are not a message → nullopt, no problem. A
+    // Content-Length that fits truncates the body to it; one that does not
+    // fit is a truncated datagram → nullopt with `problem` set; no
+    // Content-Length means the body is the rest of the datagram. A datagram
+    // without a header terminator is malformed → nullopt with `problem`.
+    std::optional<std::string> DatagramMessage(std::string_view d, std::string* problem = nullptr) {
+        std::size_t start = d.find_first_not_of("\r\n");
+        if (start == std::string_view::npos) return std::nullopt;
+        d.remove_prefix(start);
+        std::size_t idx = d.find("\r\n\r\n");
+        if (idx == std::string_view::npos) {
+            if (problem) *problem = std::format("datagram without a header terminator ({} bytes)", d.size());
+            return std::nullopt;
+        }
+        std::size_t bodyStart = idx + 4;
+        std::size_t body = d.size() - bodyStart;
+        if (auto v = Header(d.substr(0, idx), "Content-Length")) {
+            std::size_t clen = 0; int digits = 0;
+            for (char c : *v) { if (c < '0' || c > '9' || digits == 9) break; clen = clen * 10 + static_cast<std::size_t>(c - '0'); digits++; }
+            if (digits) {
+                if (clen > body) {
+                    if (problem) *problem = std::format("datagram truncated (Content-Length {} > {} body bytes)", clen, body);
+                    return std::nullopt;
+                }
+                return std::string(d.substr(0, bodyStart + clen));
+            }
+        }
+        return std::string(d);
+    }
 }

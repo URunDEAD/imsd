@@ -208,6 +208,13 @@ int main() {
         Check(active && active->state == "active" && active->reason == "accepted", "200 emits active/accepted");
         Check(m.State() == CallState::Active, "state active");
 
+        // a retransmitted 200 (RFC 3261 13.3.1.4: the UAS repeats it until our
+        // ACK arrives) is ACKed again and nothing else — no second media leg
+        auto a200b = m.OnInviteResponse(R200(m.CallId()));
+        Check(Sent(a200b, "ACK ") != nullptr, "retransmitted 200 -> ACK again");
+        Check(!Has(a200b, Action::Type::StartMedia) && !Has(a200b, Action::Type::State), "retransmitted 200: no second media start, no state action");
+        Check(m.State() == CallState::Active, "state still active after the retransmit");
+
         // media leg exits code 3 (downlink dried up) -> BYE + terminated
         auto amx = m.OnMediaExit(3);
         Check(Sent(amx, "BYE ") != nullptr, "media far-end hangup sends BYE");

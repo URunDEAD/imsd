@@ -161,6 +161,7 @@ PCSCF=2001:db8::105
 | `RESUME` | `auto` | `0` forces a fresh registration (ignores a warm SA) |
 | `REFRESH_INTERVAL` | *(auto)* | keepalive re-REGISTER period in s; default = half the granted expiry, clamped to [120, 1800] |
 | `EALG` | `aes-cbc` | offered ESP cipher (`aes-cbc`, `des-ede3-cbc`, `null`) |
+| `SIP_TRANSPORT` | `auto` | transport of the protected leg (the second REGISTER and everything after it): `tcp`, `udp`, or `auto` = TCP, falling back to a fresh registration over UDP when the P-CSCF leaves two TCP connects unanswered — but only on a phone that has never registered over TCP: once the state file (`/var/lib/imsd/imsreg.state`) records a TCP registration, a silent connect is treated as an outage, not a policy (delete the file or set `udp` to override, e.g. after a SIM change). The challenge (first REGISTER) is always UDP. Over UDP a REGISTER or INVITE larger than ~1.2 KB leaves as IPv6 fragments at the ims PDN's 1280-byte MTU (the journal says so once per flow); there are no SIP retransmission timers over UDP yet, so a lost datagram costs a timeout. The SAs, the listener and the firewall rule cover both transports |
 | `EMERGENCY_NUMBERS` | *(empty)* | comma-separated additions to the builtin 112/911 emergency numbers (e.g. a private test core's short code). SIM `EF_ECC` is not read yet |
 | `RTP_PORT` | `50004` | local RTP port advertised in SDP |
 | `PRECOND` | `0` | `1` offers SDP QoS preconditions |

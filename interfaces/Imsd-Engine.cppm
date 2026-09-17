@@ -257,6 +257,10 @@ export namespace imsd::engine {
                 return a;  // 1xx other than 100<code<200 (only 100): nothing
             if (code == 200) {
                 a.push_back(Send(imsd::msg::BuildAck2xx(ctx_, d_, rng_.Token(20), std::string(imsd::sip::Header(msg, "To").value_or("")))));
+                // A 2xx retransmission (RFC 3261 13.3.1.4: the UAS repeats
+                // it until our ACK arrives) is ACKed again and nothing else —
+                // media is already running, or the call is already over.
+                if (state_ != CallState::Ringing && state_ != CallState::Dialing) return a;
                 if (cancelled_ && userCancelled_) {
                     // answered in the user's CANCEL race — we no longer want it
                     nextCseq_++;

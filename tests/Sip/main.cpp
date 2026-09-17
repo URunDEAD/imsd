@@ -174,6 +174,28 @@ int main() {
         Check(!ViaResponsePort("UPDATE sip:me SIP/2.0\r\n\r\n").has_value(), "no Via -> nullopt");
     }
 
+    // ---- DatagramMessage (one UDP datagram = one message, RFC 3261 18.3)
+    {
+        std::string why;
+        Check(!DatagramMessage("\r\n", &why).has_value() && why.empty(), "CRLF-only datagram is a pong, not a message, no problem");
+        Check(!DatagramMessage("\r\n\r\n\r\n").has_value(), "CRLFCRLF-only datagram is a pong");
+        std::string hdr = "SIP/2.0 200 OK\r\nCall-ID: a\r\n";
+        auto m0 = DatagramMessage(hdr + "Content-Length: 0\r\n\r\n");
+        Check(m0 && *m0 == hdr + "Content-Length: 0\r\n\r\n", "Content-Length 0, no body: whole datagram");
+        auto m1 = DatagramMessage(hdr + "Content-Length: 4\r\n\r\nv=0\nJUNK");
+        Check(m1 && *m1 == hdr + "Content-Length: 4\r\n\r\nv=0\n", "Content-Length that fits truncates the body");
+        why.clear();
+        Check(!DatagramMessage(hdr + "Content-Length: 40\r\n\r\nv=0\n", &why).has_value() && why.contains("truncated"), "Content-Length larger than the datagram: discarded, problem set");
+        auto m2 = DatagramMessage("\r\n" + hdr + "\r\nv=0\n");
+        Check(m2 && *m2 == hdr + "\r\nv=0\n", "no Content-Length: body is the rest of the datagram, leading CRLF stripped");
+        why.clear();
+        Check(!DatagramMessage("SIP/2.0 200 OK\r\nCall-ID: a\r\n", &why).has_value() && why.contains("terminator"), "no header terminator: discarded, problem set");
+        auto m3 = DatagramMessage(hdr + "X-Note: Content-Length: 99\r\n\r\nv=0\n");
+        Check(m3 && *m3 == hdr + "X-Note: Content-Length: 99\r\n\r\nv=0\n", "a header name inside a value does not match");
+        auto m4 = DatagramMessage(hdr + "Content-Length: 99999999999999999999\r\n\r\nv=0\n", &why);
+        Check(!m4.has_value(), "absurd Content-Length: discarded, no overflow");
+    }
+
     if (Failures == 0) std::println("Sip: all tests passed");
     return Failures;
 }
