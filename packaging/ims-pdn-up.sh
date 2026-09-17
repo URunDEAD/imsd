@@ -11,7 +11,14 @@
 #
 # Configuration, via the unit's EnvironmentFile /etc/imsd.env (also read
 # directly so manual runs behave the same):
+#   IMS_APN          ims APN name (default ims)
 #   IMS_IP_TYPE      bearer ip-type (default ipv6)
+#   IMS_PROFILE_ID   3GPP profile index to connect through (default: looked up
+#                    by APN in the modem's profile list; empty/none = connect by
+#                    APN string). A profile-indexed call is exempt from the
+#                    modem's attach-family forcing that refuses an APN-string
+#                    IPv6 request when the attach PDN was granted IPv4-only
+#                    (journal/ims 2026-09-16/17 bench: Odido, O2 UK, Swisscom).
 #   IMS_REG_TIMEOUT  max seconds to wait for network registration before
 #                    connect attempts start counting anyway (default 300)
 
@@ -34,6 +41,9 @@ envval() {  # $1 = key — for manual runs; under systemd the vars are inherited
 }
 IP_TYPE=${IMS_IP_TYPE:-$(envval IMS_IP_TYPE)}
 IP_TYPE=${IP_TYPE:-ipv6}
+IMS_APN=${IMS_APN:-$(envval IMS_APN)}
+IMS_APN=${IMS_APN:-ims}
+PROFILE_ID=${IMS_PROFILE_ID:-$(envval IMS_PROFILE_ID)}
 REG_TIMEOUT=${IMS_REG_TIMEOUT:-$(envval IMS_REG_TIMEOUT)}
 REG_TIMEOUT=${REG_TIMEOUT:-300}
 
@@ -48,11 +58,30 @@ while :; do
 done
 log "modem $MODEM"
 
+# ---- the ims profile index (WDS profile list), unless configured
+ims_profile_index() {  # $1 = apn
+    qmicli -d qrtr://0 --wds-get-profile-list=3gpp 2>/dev/null | awk -v apn="$1" '
+        /^[ \t]*\[[0-9]+\] 3gpp/ { idx = $1; gsub(/[^0-9]/, "", idx) }
+        /APN:/ { a = $0; sub(/.*APN: '"'"'/, "", a); sub(/'"'"'.*/, "", a);
+                 if (tolower(a) == tolower(apn) && idx != "") { print idx; exit } }'
+}
+if [ -z "$PROFILE_ID" ]; then
+    PROFILE_ID=$(ims_profile_index "$IMS_APN")
+    [ -n "$PROFILE_ID" ] && log "ims profile: index $PROFILE_ID (apn $IMS_APN)" || log "ims profile: none for apn $IMS_APN, connecting by APN string"
+elif [ "$PROFILE_ID" = none ]; then
+    PROFILE_ID=
+fi
+
 # ---- find a connected ims bearer; else find-or-create one and connect it
 find_ims_bearer() {  # $1 = required bearer.status.connected value
     for B in $(bearer_paths); do
         INFO=$(kv -b "$B") || continue
-        echo "$INFO" | grep -q '^bearer\.properties\.apn  *: *ims$' || continue
+        if [ -n "$PROFILE_ID" ]; then
+            echo "$INFO" | grep -q "^bearer\.properties\.profile-id  *: *$PROFILE_ID\$" ||
+            echo "$INFO" | grep -q "^bearer\.properties\.apn  *: *$IMS_APN\$" || continue
+        else
+            echo "$INFO" | grep -q "^bearer\.properties\.apn  *: *$IMS_APN\$" || continue
+        fi
         echo "$INFO" | grep -q "^bearer\.properties\.ip-type  *: *$IP_TYPE\$" || continue
         echo "$INFO" | grep -q "^bearer\.status\.connected  *: *$1\$" || continue
         echo "$B"
@@ -90,10 +119,15 @@ while [ -z "$BEARER" ]; do
     [ "$n" -gt 10 ] && { log "bearer connect failed after 10 attempts"; exit 1; }
     B=$(find_ims_bearer no)   # reuse a stale disconnected ims bearer
     if [ -z "$B" ]; then
-        OUT=$(mmcli -m "$MODEM" --create-bearer="apn=ims,ip-type=$IP_TYPE" 2>&1)
+        if [ -n "$PROFILE_ID" ]; then
+            SPEC="profile-id=$PROFILE_ID,ip-type=$IP_TYPE"
+        else
+            SPEC="apn=$IMS_APN,ip-type=$IP_TYPE"
+        fi
+        OUT=$(mmcli -m "$MODEM" --create-bearer="$SPEC" 2>&1)
         B=$(printf '%s' "$OUT" | sed -n 's,.*\(/org/freedesktop/ModemManager1/Bearer/[0-9]*\).*,\1,p')
         if [ -n "$B" ]; then
-            log "created bearer $B (ip-type=$IP_TYPE)"
+            log "created bearer $B ($SPEC)"
         else
             log "create-bearer attempt $n failed: $(squash "$OUT"); retrying in 10 s"
             sleep 10
