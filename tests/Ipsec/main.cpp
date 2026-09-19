@@ -3,8 +3,10 @@
 
 // lint-disable-file fixed-width-types
 // Imsd:Ipsec unit tests — the `ip xfrm` setup command sequence (byte-exact
-// argv) and the warm-SA reader, fed `ip xfrm state`/`policy` output in the
-// exact shape captured from a registered FP6 (addresses/keys synthetic).
+// argv), the warm-SA reader, fed `ip xfrm state`/`policy` output in the
+// exact shape captured from a registered FP6 (addresses/keys synthetic), and
+// the Security-Server parser, fed the operator lines as captured (O2 UK's
+// six-mechanism Mavenir shape verbatim, KPN's single mechanism).
 import std;
 import Imsd;
 
@@ -117,6 +119,114 @@ int main() {
         auto cmds = BuildSetupCommands(p);
         auto& st = cmds[2];
         Check(st[st.size() - 3] == "enc" && st[st.size() - 2] == "cipher_null" && st[st.size() - 1].empty(), "null cipher: cipher_null + empty key");
+    }
+
+    // md5 integrity as the P-CSCF selected it: hmac(md5), IK as the key
+    {
+        SaParams p;
+        p.local = "::2"; p.pcscf = "::1";
+        p.ik = std::vector<std::uint8_t>(16, 0x01);
+        p.ck = {};
+        p.alg = "hmac-md5-96"; p.ealg = "null";
+        auto cmds = BuildSetupCommands(p);
+        Check(cmds[2][17] == "hmac(md5)" && cmds[2][18] == "0x01010101010101010101010101010101" && cmds[2][19] == "96", "md5: auth-trunc hmac(md5) IK 96");
+        Check(KernelAuth("hmac-sha-1-96") == "hmac(sha1)" && KernelAuth("hmac-md5-96") == "hmac(md5)" && !KernelAuth("hmac-sha-256-128"), "KernelAuth names");
+        Check(KnownEalg("null") && KnownEalg("aes-cbc") && KnownEalg("des-ede3-cbc") && !KnownEalg("aes-gcm") && !KnownEalg("") && !KnownEalg("3des"), "KnownEalg set (canonical names only)");
+    }
+
+    // ---- Security-Server: O2 UK (alyx report 11, 2026-09-17) verbatim —
+    // six mechanisms, the SPIs/ports on the fourth (sha1, no ealg); the
+    // first `ealg=` in the header is the unselected 3DES entry.
+    constexpr std::string_view O2 =
+        "ipsec-3gpp;q=0.88;alg=hmac-md5-96;mod=trans,"
+        "ipsec-3gpp;q=0.9;alg=hmac-md5-96;mod=trans;ealg=des-ede3-cbc,"
+        "ipsec-3gpp;q=0.92;alg=hmac-md5-96;mod=trans;ealg=aes-cbc,"
+        "ipsec-3gpp;q=0.94;alg=hmac-sha-1-96;mod=trans;spi-c=129427852;spi-s=133937015;port-c=6051;port-s=6060,"
+        "ipsec-3gpp;q=0.96;alg=hmac-sha-1-96;mod=trans;ealg=des-ede3-cbc,"
+        "ipsec-3gpp;q=0.98;alg=hmac-sha-1-96;mod=trans;ealg=aes-cbc";
+    {
+        // alyx's offer (EALG=null): the entry O2 marked is also the only one matching the offer
+        auto ss = ParseSecurityServer(O2, "hmac-sha-1-96", "null");
+        Check(ss.has_value() && ss->mechanisms.size() == 6, "O2/null: six mechanisms");
+        Check(ss && ss->selected == 3 && ss->carrier == 3 && ss->offerMatched, "O2/null: the fourth mechanism (sha1, no ealg, the SPIs) selected, offer matched");
+        if (ss) {
+            const auto& m = ss->Selected();
+            Check(m.name == "ipsec-3gpp" && m.mod == "trans" && m.prot.empty(), "O2/null: name, mod=trans, prot absent");
+            Check(m.qMilli == 940, "O2/null: q=0.94");
+            Check(m.alg == "hmac-sha-1-96", "O2/null: alg from the selected mechanism");
+            Check(m.ealg.empty(), "O2/null: ealg absent on the selected mechanism (null), NOT the header's first ealg= (3DES)");
+            Check(m.spiPc == 129427852u && m.spiPs == 133937015u, "O2/null: SPIs");
+            Check(m.portPc == 6051 && m.portPs == 6060, "O2/null: ports");
+            Check(m.text == "ipsec-3gpp;q=0.94;alg=hmac-sha-1-96;mod=trans;spi-c=129427852;spi-s=133937015;port-c=6051;port-s=6060", "O2/null: selected text verbatim");
+            Check(ss->mechanisms[1].ealg == "des-ede3-cbc" && !ss->mechanisms[1].spiPs, "O2/null: the 3DES entry is parsed but carries no SPIs");
+        }
+        // the default offer (EALG=aes-cbc): the spec picks sha1+aes (q=0.98); the SPIs stay with the marked entry
+        auto sa = ParseSecurityServer(O2, "hmac-sha-1-96", "aes-cbc");
+        Check(sa && sa->selected == 5 && sa->offerMatched, "O2/aes: sha1+aes-cbc (q=0.98) selected for the aes offer");
+        Check(sa && sa->carrier == 3 && sa->Carrier().spiPs == 133937015u && sa->Carrier().portPs == 6060, "O2/aes: SPIs/ports from the entry carrying them");
+        Check(sa && sa->Selected().ealg == "aes-cbc" && sa->Selected().alg == "hmac-sha-1-96", "O2/aes: algorithms from the selected entry");
+        // an offer O2 does not list (3des alias -> des-ede3-cbc): sha1+3des (q=0.96)
+        auto s3 = ParseSecurityServer(O2, "hmac-sha-1-96", "3des");
+        Check(s3 && s3->selected == 4 && s3->offerMatched && s3->carrier == 3, "O2/3des: the alias matches des-ede3-cbc (q=0.96), SPIs from the marked entry");
+    }
+    // ---- KPN: one mechanism, spaces after the separators, explicit ealg
+    {
+        auto ss = ParseSecurityServer("ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=aes-cbc; spi-c=49889723; spi-s=49889722; port-c=33142; port-s=6000", "hmac-sha-1-96", "aes-cbc");
+        Check(ss && ss->mechanisms.size() == 1 && ss->selected == 0 && ss->carrier == 0 && ss->offerMatched, "KPN: single mechanism selected, offer matched");
+        Check(ss && ss->Selected().alg == "hmac-sha-1-96" && ss->Selected().ealg == "aes-cbc", "KPN: alg + ealg");
+        Check(ss && ss->Selected().spiPc == 49889723u && ss->Selected().spiPs == 49889722u && ss->Selected().portPc == 33142 && ss->Selected().portPs == 6000, "KPN: SPIs + ports");
+        Check(ss && ss->Selected().qMilli == 100, "KPN: q=0.1");
+        auto nul = ParseSecurityServer("ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=null; spi-c=33998503; spi-s=33998502; port-c=33021; port-s=6000", "hmac-sha-1-96", "null");
+        Check(nul && nul->Selected().ealg == "null" && nul->offerMatched, "KPN: explicit ealg=null matches the null offer");
+        // the P-CSCF answers a cipher we did not offer: still the only entry, installed as answered, flagged
+        auto other = ParseSecurityServer("ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=null; spi-c=33998503; spi-s=33998502; port-c=33021; port-s=6000", "hmac-sha-1-96", "aes-cbc");
+        Check(other && other->selected == 0 && other->carrier == 0 && !other->offerMatched, "single entry not matching the offer: selected via the spi-s fallback, offerMatched=false");
+        // the fresh-SA throttle answer: spi-s present and zero
+        auto thr = ParseSecurityServer("ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=aes-cbc; spi-c=1; spi-s=0; port-c=33102; port-s=6000", "hmac-sha-1-96", "aes-cbc");
+        Check(thr && thr->Carrier().spiPs.has_value() && *thr->Carrier().spiPs == 0, "KPN throttle: spi-s=0 is present, not absent");
+        // no SPIs anywhere: parsed, nothing to build from
+        auto bare = ParseSecurityServer("ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=null;", "hmac-sha-1-96", "null");
+        Check(bare && bare->mechanisms.size() == 1 && bare->offerMatched && !bare->Carrier().spiPs && !bare->Carrier().portPs, "no spi-s: absent, not zero");
+    }
+    // ---- selection rules and syntax corners
+    {
+        // spec-shaped list: every entry carries the SPI set, md5 preferred by q — we offered sha1, so sha1 wins (audit A1)
+        auto a1 = ParseSecurityServer("ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=11;spi-s=12;port-c=13;port-s=14,ipsec-3gpp;q=0.2;alg=hmac-md5-96;ealg=aes-cbc;spi-c=11;spi-s=12;port-c=13;port-s=14", "hmac-sha-1-96", "aes-cbc");
+        Check(a1 && a1->selected == 0 && a1->offerMatched && a1->Selected().alg == "hmac-sha-1-96", "every entry carries SPIs, md5 preferred: the offered sha1 is selected, not the highest q");
+        // two sha1 entries with different ciphers, both carrying SPIs: the offered cipher wins over q (audit A3)
+        auto a3 = ParseSecurityServer("ipsec-3gpp;q=0.9;alg=hmac-sha-1-96;ealg=des-ede3-cbc;spi-c=1;spi-s=2;port-c=3;port-s=4,ipsec-3gpp;q=0.8;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=5;spi-s=6;port-c=7;port-s=8", "hmac-sha-1-96", "aes-cbc");
+        Check(a3 && a3->selected == 1 && a3->Carrier().spiPs == 6u, "offered cipher wins over a higher-q cipher we did not offer");
+        // two matching entries: the higher q
+        auto two = ParseSecurityServer("ipsec-3gpp;q=0.5;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=3;port-s=4,ipsec-3gpp;q=0.9;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=5;spi-s=6;port-c=7;port-s=8", "hmac-sha-1-96", "aes-cbc");
+        Check(two && two->selected == 1 && two->Selected().spiPs == 6u, "two matching entries: highest q selected");
+        // nothing matches the offer (md5-only list): fallback = the highest-q carrier, flagged
+        auto md5 = ParseSecurityServer("ipsec-3gpp;q=0.5;alg=hmac-md5-96;spi-c=1;spi-s=2;port-c=3;port-s=4,ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=aes-cbc;spi-c=5;spi-s=6;port-c=7;port-s=8", "hmac-sha-1-96", "aes-cbc");
+        Check(md5 && md5->selected == 1 && !md5->offerMatched && md5->carrier == 1, "no match: highest-q carrier, offerMatched=false");
+        // no q at all, nothing matching: the first carrier
+        auto noq = ParseSecurityServer("ipsec-3gpp;alg=hmac-md5-96;spi-c=1;spi-s=2;port-c=3;port-s=4,ipsec-3gpp;alg=hmac-md5-96;ealg=aes-cbc;spi-c=5;spi-s=6;port-c=7;port-s=8", "hmac-sha-1-96", "aes-cbc");
+        Check(noq && noq->selected == 0 && !noq->offerMatched, "no q, no match: first carrier");
+        // absent alg on the entry counts as the offered one
+        auto noalg = ParseSecurityServer("ipsec-3gpp;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=3;port-s=4", "hmac-sha-1-96", "aes-cbc");
+        Check(noalg && noalg->offerMatched, "absent alg matches the offer");
+        // only non-ipsec mechanisms: nothing for us
+        Check(!ParseSecurityServer("tls;q=0.2,digest;d-alg=MD5", "hmac-sha-1-96", "aes-cbc").has_value(), "tls/digest only -> nullopt");
+        // a quoted comma must not split the list; tokens are case-insensitive
+        auto q = ParseSecurityServer("digest;d-alg=MD5;d-qop=\"auth,auth-int\",IPSEC-3GPP; ALG=HMAC-SHA-1-96; EALG=AES-CBC; SPI-C=11; SPI-S=12; PORT-C=13; PORT-S=14", "HMAC-SHA-1-96", "AES-CBC");
+        Check(q && q->mechanisms.size() == 2 && q->mechanisms[0].name == "digest", "quoted comma stays inside the digest mechanism");
+        Check(q && q->selected == 1 && q->offerMatched && q->Selected().name == "ipsec-3gpp" && q->Selected().alg == "hmac-sha-1-96" && q->Selected().ealg == "aes-cbc" && q->Selected().spiPs == 12u && q->Selected().portPs == 14, "case-insensitive names and values, lower-cased; offer compared case-insensitively");
+        // prot/mod parsed for the caller to refuse
+        auto tun = ParseSecurityServer("ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;prot=ah;mod=tun;spi-c=1;spi-s=2;port-c=3;port-s=4", "hmac-sha-1-96", "aes-cbc");
+        Check(tun && tun->Selected().prot == "ah" && tun->Selected().mod == "tun", "prot/mod parsed");
+        // spi-s beyond 32 bits, a port beyond 16 bits or zero: absent, not garbage
+        auto bad = ParseSecurityServer("ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=4294967296;port-c=0;port-s=70000", "hmac-sha-1-96", "aes-cbc");
+        Check(bad && !bad->Selected().spiPs && !bad->Selected().portPs && !bad->Selected().portPc && bad->Selected().spiPc == 1u, "out-of-range spi-s/port-s and port 0 are absent");
+        // q syntax
+        auto q1 = ParseSecurityServer("ipsec-3gpp;q=1;spi-s=1", "hmac-sha-1-96", "null");
+        Check(q1 && q1->Selected().qMilli == 1000, "q=1 -> 1000");
+        auto qx = ParseSecurityServer("ipsec-3gpp;q=x;spi-s=1", "hmac-sha-1-96", "null");
+        Check(qx && !qx->Selected().qMilli, "q=x -> no q");
+        Check(!ParseSecurityServer("", "hmac-sha-1-96", "null").has_value() && !ParseSecurityServer(" , ", "hmac-sha-1-96", "null").has_value(), "empty value -> nullopt");
+        Check(NormalizeEalg("") == "null" && NormalizeEalg("3des") == "des-ede3-cbc" && NormalizeEalg("aes-cbc") == "aes-cbc", "NormalizeEalg");
     }
 
     if (Failures == 0) std::println("Ipsec: all tests passed");

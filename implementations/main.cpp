@@ -96,6 +96,16 @@ ProcResult RunCapture(const std::vector<std::string>& argv) {
 // Run argv, discard output, return exit code.
 int RunCmd(const std::vector<std::string>& argv) { return RunCapture(argv).rc; }
 
+// argv as one journal line with key material (the "0x…" tokens) masked.
+std::string RedactKeys(const std::vector<std::string>& argv) {
+    std::string s;
+    for (const auto& a : argv) {
+        if (!s.empty()) s += ' ';
+        s += a.starts_with("0x") ? "<key>" : a;
+    }
+    return s;
+}
+
 // ---- small text extractors (401 header params, qmicli "completed:") -------
 
 std::optional<std::string> QuotedAfter(std::string_view text, std::string_view key) {
@@ -117,16 +127,6 @@ std::optional<long> IntAfter(std::string_view text, std::string_view key) {
     long v = 0;
     std::from_chars(text.data() + start, text.data() + i, v);
     return v;
-}
-
-std::string EalgAfter(std::string_view ss) {
-    std::size_t at = ss.find("ealg=");
-    if (at == std::string_view::npos) return "null";
-    std::size_t i = at + 5;
-    std::size_t start = i;
-    auto ok = [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'; };
-    while (i < ss.size() && ok(ss[i])) i++;
-    return std::string(ss.substr(start, i - start));
 }
 
 // value after "completed:" — integer or the hex ("AB:CD:..") token
@@ -1038,15 +1038,41 @@ private:
         if (!raw || raw->size() < 32) throw std::runtime_error("bad nonce");
         std::vector<std::uint8_t> rand16(raw->begin(), raw->begin() + 16);
         std::vector<std::uint8_t> autn16(raw->begin() + 16, raw->begin() + 32);
-        auto ssv = imsd::sip::Header(resp, "Security-Server");
-        if (!ssv) throw std::runtime_error("no Security-Server");
-        ss_ = std::string(*ssv);
-        int portPs = static_cast<int>(IntAfter(ss_, "port-s=").value_or(0));
-        int portPc = static_cast<int>(IntAfter(ss_, "port-c=").value_or(0));
-        std::uint32_t spiPs = static_cast<std::uint32_t>(IntAfter(ss_, "spi-s=").value_or(0));
-        std::uint32_t spiPc = static_cast<std::uint32_t>(IntAfter(ss_, "spi-c=").value_or(0));
-        std::string ealg = EalgAfter(ss_);
-        if (spiPs == 0) throw ThrottledError("fresh-SA throttle active (spi-s=0)");
+        // Every Security-Server instance is one comma-list (RFC 3261
+        // §7.3.1); the joined value is what Security-Verify echoes — RFC
+        // 3329 §2.2 wants the whole list back, not the chosen entry.
+        auto ssLines = imsd::sip::Headers(resp, "Security-Server");
+        if (ssLines.empty()) throw std::runtime_error("no Security-Server");
+        ss_.clear();
+        for (std::string_view line : ssLines) {
+            if (!ss_.empty()) ss_ += ',';
+            ss_ += line;
+        }
+        Log(std::format("Security-Server: {}", ss_));
+        // Algorithms from the mechanism we select against our offer (RFC
+        // 3329 §2.3.1), SPIs/ports from the entry carrying them (O2 lists
+        // six and marks one; ims ledger F11). An answer we cannot use is a
+        // deferral on the throttle schedule, not a fatal: a fatal restarts
+        // imsd every RestartSec, an initial REGISTER each time.
+        auto ss = imsd::ipsec::ParseSecurityServer(ss_, "hmac-sha-1-96", ealgOffer_);
+        if (!ss) throw ThrottledError("Security-Server has no ipsec-3gpp mechanism");
+        const imsd::ipsec::SecurityMechanism& mech = ss->Selected();
+        const imsd::ipsec::SecurityMechanism& carrier = ss->Carrier();
+        Log(std::format("selected mechanism {} of {}{}: {}", ss->selected + 1, ss->mechanisms.size(), ss->offerMatched ? "" : " (none matches our offer; taking the P-CSCF's)", mech.text));
+        if (ss->carrier != ss->selected) Log(std::format("SPIs/ports from mechanism {}: {}", ss->carrier + 1, carrier.text));
+        if (carrier.spiPs == 0u) throw ThrottledError("fresh-SA throttle active (spi-s=0)");
+        if (!carrier.spiPs || !carrier.spiPc || !carrier.portPs || !carrier.portPc) throw ThrottledError("Security-Server carries no spi-c/spi-s/port-c/port-s");
+        std::string alg = mech.alg.empty() ? "hmac-sha-1-96" : mech.alg;   // absent: what we offered
+        std::string ealg = imsd::ipsec::NormalizeEalg(mech.ealg);          // absent: the null cipher (RFC 3329)
+        if (!imsd::ipsec::KernelAuth(alg)) throw ThrottledError(std::format("Security-Server alg={} unsupported", alg));
+        if (!imsd::ipsec::KnownEalg(ealg)) throw ThrottledError(std::format("Security-Server ealg={} unsupported", ealg));
+        if (!mech.prot.empty() && mech.prot != "esp") throw ThrottledError(std::format("Security-Server prot={} unsupported", mech.prot));
+        if (!mech.mod.empty() && mech.mod != "trans") throw ThrottledError(std::format("Security-Server mod={} unsupported", mech.mod));
+        std::uint32_t spiPs = *carrier.spiPs;
+        std::uint32_t spiPc = *carrier.spiPc;
+        int portPs = *carrier.portPs;
+        int portPc = *carrier.portPc;
+        Log(std::format("SA: alg={} ealg={}{} spi-c={} spi-s={} port-c={} port-s={}", alg, ealg, mech.ealg.empty() ? " (absent)" : "", spiPc, spiPs, portPc, portPs));
 
         auto aka = Authenticate(rand16, autn16);
         if (!aka) throw std::runtime_error("USIM AKA failed");
@@ -1057,9 +1083,12 @@ private:
         sp.ik = aka->ik; sp.ck = aka->ck;
         sp.spiUc = spiUc; sp.spiUs = spiUs; sp.spiPc = spiPc; sp.spiPs = spiPs;
         sp.portUc = PortUc; sp.portUs = PortUs; sp.portPs = portPs; sp.portPc = portPc;
+        sp.alg = alg;
         sp.ealg = ealg;
-        for (auto& cmd : imsd::ipsec::BuildSetupCommands(sp))
-            RunCmd(cmd);
+        for (auto& cmd : imsd::ipsec::BuildSetupCommands(sp)) {
+            int rc = RunCmd(cmd);
+            if (rc != 0) Log(std::format("{} -> rc {}", RedactKeys(cmd), rc));
+        }
 
         ctx_.securityServer = ss_;
         portPs_ = portPs;
