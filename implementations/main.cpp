@@ -41,7 +41,7 @@ import Imsd;
 namespace {
 
 // ---- static config (env-overridable, same knobs as imsd.py) ---------------
-constexpr const char* Version = "0.3.5";
+constexpr const char* Version = "0.3.6";
 constexpr const char* BusName = "net.catcrafts.IMS1";
 constexpr const char* ObjPath = "/net/catcrafts/IMS1";
 constexpr const char* Iface = "net.catcrafts.IMS1";
