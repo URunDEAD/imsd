@@ -72,6 +72,13 @@ fi
 lookup_profile() {  # $1 = log suffix; sets PROFILE_ID, LOOKUP=done on a usable list
     [ "$LOOKUP" = done ] && return 0
     if OUT=$(qmicli -d qrtr://0 --wds-get-profile-list=3gpp 2>&1); then
+        # a list with no profiles at all is the modem still coming up, not
+        # a modem without an ims profile (dev phone cold boot 2026-09-20
+        # 16:47: exit 0, no entries, index 2 present a minute later)
+        if ! printf '%s\n' "$OUT" | grep -q -E '^[[:space:]]*\[[0-9]+\] 3gpp'; then
+            log "ims profile lookup returned no profiles$1"
+            return 0
+        fi
         PROFILE_ID=$(printf '%s\n' "$OUT" | awk -v apn="$IMS_APN" '
             /^[ \t]*\[[0-9]+\] 3gpp/ { idx = $1; gsub(/[^0-9]/, "", idx) }
             /APN:/ { a = $0; sub(/.*APN: '"'"'/, "", a); sub(/'"'"'.*/, "", a);
