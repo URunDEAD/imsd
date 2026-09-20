@@ -58,36 +58,72 @@ while :; do
 done
 log "modem $MODEM"
 
-# ---- the ims profile index (WDS profile list), unless configured
-ims_profile_index() {  # $1 = apn
-    qmicli -d qrtr://0 --wds-get-profile-list=3gpp 2>/dev/null | awk -v apn="$1" '
-        /^[ \t]*\[[0-9]+\] 3gpp/ { idx = $1; gsub(/[^0-9]/, "", idx) }
-        /APN:/ { a = $0; sub(/.*APN: '"'"'/, "", a); sub(/'"'"'.*/, "", a);
-                 if (tolower(a) == tolower(apn) && idx != "") { print idx; exit } }'
-}
-if [ -z "$PROFILE_ID" ]; then
-    PROFILE_ID=$(ims_profile_index "$IMS_APN")
-    [ -n "$PROFILE_ID" ] && log "ims profile: index $PROFILE_ID (apn $IMS_APN)" || log "ims profile: none for apn $IMS_APN, connecting by APN string"
-elif [ "$PROFILE_ID" = none ]; then
-    PROFILE_ID=
+# ---- the ims profile index (WDS profile list), unless configured. The
+# lookup itself can fail while ModemManager is still enabling the modem; a
+# failed lookup is not "no profile" (the APN-string request it would fall
+# back to is the one the modem refuses under an IPv4 attach), so it is
+# retried after the registration wait and only a list without the APN
+# falls back to the APN string.
+LOOKUP=pending
+if [ -n "$PROFILE_ID" ]; then
+    [ "$PROFILE_ID" = none ] && PROFILE_ID=
+    LOOKUP=done
 fi
+lookup_profile() {  # $1 = log suffix; sets PROFILE_ID, LOOKUP=done on a usable list
+    [ "$LOOKUP" = done ] && return 0
+    if OUT=$(qmicli -d qrtr://0 --wds-get-profile-list=3gpp 2>&1); then
+        PROFILE_ID=$(printf '%s\n' "$OUT" | awk -v apn="$IMS_APN" '
+            /^[ \t]*\[[0-9]+\] 3gpp/ { idx = $1; gsub(/[^0-9]/, "", idx) }
+            /APN:/ { a = $0; sub(/.*APN: '"'"'/, "", a); sub(/'"'"'.*/, "", a);
+                     if (tolower(a) == tolower(apn) && idx != "") { print idx; exit } }')
+        LOOKUP=done
+        [ -n "$PROFILE_ID" ] && log "ims profile: index $PROFILE_ID (apn $IMS_APN)" || log "ims profile: none for apn $IMS_APN, connecting by APN string"
+    else
+        log "ims profile lookup failed$1: $(squash "$OUT")"
+    fi
+}
+lookup_profile " (modem state: $(modem_state))"
 
-# ---- find a connected ims bearer; else find-or-create one and connect it
-find_ims_bearer() {  # $1 = required bearer.status.connected value
+# ---- find a connected ims bearer; else find-or-create one and connect it.
+# APN names are case-insensitive. A DISCONNECTED bearer is reused only when
+# it is the request this run would make (same profile index, or same APN when
+# connecting by APN string): a leftover APN-string bearer from a run whose
+# lookup failed is the walled request itself, and reconnecting it fails on
+# every restart until the modem is reset (field: O2 UK, 2026-09-20).
+has() { printf '%s\n' "$INFO" | grep -qi "^bearer\.$1  *: *$2\$"; }
+find_ims_bearer() {  # $1 = required bearer.status.connected value; $2 = "relaxed" ignores ip-type
     for B in $(bearer_paths); do
         INFO=$(kv -b "$B") || continue
+        has status.connected "$1" || continue
         if [ -n "$PROFILE_ID" ]; then
-            echo "$INFO" | grep -q "^bearer\.properties\.profile-id  *: *$PROFILE_ID\$" ||
-            echo "$INFO" | grep -q "^bearer\.properties\.apn  *: *$IMS_APN\$" || continue
+            if [ "$1" = yes ]; then
+                has properties.profile-id "$PROFILE_ID" || has properties.apn "$IMS_APN" || continue
+            else
+                has properties.profile-id "$PROFILE_ID" || continue
+            fi
         else
-            echo "$INFO" | grep -q "^bearer\.properties\.apn  *: *$IMS_APN\$" || continue
+            has properties.apn "$IMS_APN" || continue
         fi
-        echo "$INFO" | grep -q "^bearer\.properties\.ip-type  *: *$IP_TYPE\$" || continue
-        echo "$INFO" | grep -q "^bearer\.status\.connected  *: *$1\$" || continue
+        [ "$2" = relaxed ] || has properties.ip-type "$IP_TYPE" || continue
         echo "$B"
         return 0
     done
     return 1
+}
+# leftover disconnected APN-string ims bearers when this run connects by
+# profile index: never reused (above), deleted so a later run without an
+# index cannot pick one up either
+delete_stale_bearers() {
+    [ -n "$PROFILE_ID" ] || return 0
+    for B in $(bearer_paths); do
+        INFO=$(kv -b "$B") || continue
+        has status.connected no || continue
+        has properties.apn "$IMS_APN" || continue
+        has properties.profile-id "$PROFILE_ID" && continue
+        OUT=$(mmcli -m "$MODEM" --delete-bearer="$B" 2>&1) &&
+        log "deleted stale bearer $B (apn $IMS_APN, no profile index)" ||
+        log "could not delete stale bearer $B: $(squash "$OUT")"
+    done
 }
 
 BEARER=$(find_ims_bearer yes)
@@ -111,13 +147,26 @@ if [ -z "$BEARER" ]; then
         waited=$((waited + 5))
     done
     log "modem state: $(modem_state), packet service: $(packet_state)"
+    # a lookup that failed while the modem was still coming up
+    n=0
+    while [ "$LOOKUP" != done ] && [ "$n" -lt 3 ]; do
+        n=$((n + 1))
+        sleep 5
+        lookup_profile " (retry $n)"
+    done
+    if [ "$LOOKUP" != done ]; then
+        PROFILE_ID=
+        log "ims profile: lookup keeps failing, connecting by APN string"
+    fi
+    BEARER=$(find_ims_bearer yes)   # the index may now match a connected profile-indexed PDN
+    [ -n "$BEARER" ] || delete_stale_bearers
 fi
 
 n=0
 while [ -z "$BEARER" ]; do
     n=$((n + 1))
     [ "$n" -gt 10 ] && { log "bearer connect failed after 10 attempts"; exit 1; }
-    B=$(find_ims_bearer no)   # reuse a stale disconnected ims bearer
+    B=$(find_ims_bearer no)   # reuse a stale disconnected ims bearer of this run's shape
     if [ -z "$B" ]; then
         if [ -n "$PROFILE_ID" ]; then
             SPEC="profile-id=$PROFILE_ID,ip-type=$IP_TYPE"
@@ -138,6 +187,15 @@ while [ -z "$BEARER" ]; do
         BEARER=$B
     else
         log "connect attempt $n failed (state: $(modem_state)): $(squash "$OUT"); retrying in 10 s"
+        case "$OUT" in *call-already-present*)
+            # the PDN is up on a bearer this run did not recognise (ip-type or
+            # APN spelling); use it rather than ask the modem for a second one
+            if B=$(find_ims_bearer yes relaxed); then
+                log "adopting the connected bearer $B"
+                BEARER=$B
+                continue
+            fi ;;
+        esac
         sleep 10
     fi
 done
