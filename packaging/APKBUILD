@@ -46,4 +46,9 @@ ofono() {
 	amove usr/lib/systemd/system/imsd-ofonod.service
 	amove usr/share/dbus-1/system.d/imsd-ofono.conf
 	amove usr/share/glib-2.0/schemas/90_imsd-ofono.gschema.override
+	amove usr/lib/systemd/system-preset/80-imsd-ofono.preset
+	# enabled on install, like imsd.service in the main package
+	mkdir -p "$subpkgdir"/etc/systemd/system/multi-user.target.wants
+	ln -s /usr/lib/systemd/system/imsd-ofonod.service \
+		"$subpkgdir"/etc/systemd/system/multi-user.target.wants/imsd-ofonod.service
 }

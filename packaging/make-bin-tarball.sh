@@ -27,6 +27,7 @@ cp "$OFONOD" "$stage/imsd-$VER/imsd-ofonod"
 cp packaging/ims-pdn-up.sh packaging/imsd.service \
    packaging/imsd-dialerd.desktop packaging/imsd-ofonod.service \
    packaging/org.ofono.conf packaging/90_imsd-ofono.gschema.override \
+   packaging/80-imsd-ofono.preset \
    packaging/net.catcrafts.IMS1.conf "$stage/imsd-$VER/"
 tar -C "$stage" -czf "imsd-$VER.tar.gz" "imsd-$VER"
 echo "wrote imsd-$VER.tar.gz ($(du -h "imsd-$VER.tar.gz" | cut -f1))"

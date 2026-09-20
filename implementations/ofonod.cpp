@@ -23,9 +23,15 @@ D-Bus seam a third party can implement.
 Consumer-shaped details, verified against calls 50.0
 plugins/provider/ofono/ — get these wrong and the plugin silently ignores us:
   - the provider watches `org.ofono` on the SYSTEM bus and proxies `/` as
-    org.ofono.Manager. A modem becomes a dialable Origin only while its
-    `Interfaces` property contains "org.ofono.VoiceCallManager", so that list
-    is our registration gate — the analogue of the dialerd's deviceUniList.
+    org.ofono.Manager. A modem is an Origin exactly while its `Interfaces`
+    property lists "org.ofono.VoiceCallManager" — and Calls 50.0 never
+    disconnects a removed Origin's CallAdded handler, so every withdraw/
+    re-add cycle leaves a stale handler behind (calls announced twice, then
+    a crash on freed memory; measured on the FP6). The interface is
+    therefore listed PERMANENTLY; registration is reported through the
+    modem's `Online` property and enforced in Dial, which fails legibly
+    while imsd is down or unregistered. Only this daemon's own restart
+    (org.ofono vanishing) still cycles the Origin.
   - VoiceCall `State` strings are parsed as CallsCallState enum nicks:
     dialing / alerting / incoming / active / held / disconnected. imsd's
     "ringing" (a 180 from the far end) is oFono's "alerting".
@@ -159,12 +165,13 @@ GVariant* PropChanged(const char* name, GVariant* value) {
 // ---- Modem / VoiceCallManager properties ------------------------------------
 bool VoiceUp() { return ImsdUp && Registered; }
 
-// The registration gate: the plugin only builds an Origin while
-// org.ofono.VoiceCallManager is listed here.
+// Listed unconditionally: the plugin builds one Origin per appearance of
+// this interface and cannot survive a re-appearance (header). Whether calls
+// can actually be placed is VoiceUp(), checked in Dial and shown as Online.
 GVariant* InterfacesValue() {
     GVariantBuilder b;
     g_variant_builder_init(&b, G_VARIANT_TYPE("as"));
-    if (VoiceUp()) g_variant_builder_add(&b, "s", VcmIface);
+    g_variant_builder_add(&b, "s", VcmIface);
     return g_variant_builder_end(&b);
 }
 
@@ -534,7 +541,7 @@ void HandleVcmMethod(GDBusConnection*, const gchar*, const gchar*, const gchar*,
             return;
         }
         if (!VoiceUp()) {
-            g_dbus_method_invocation_return_dbus_error(inv, ErrFailed, "imsd is not registered");
+            g_dbus_method_invocation_return_dbus_error(inv, ErrFailed, ImsdUp ? "imsd is not registered" : "imsd is not running");
             return;
         }
         Log(std::format("Dial({})", number));
@@ -594,11 +601,10 @@ const GDBusInterfaceVTable VcmVtable = { HandleVcmMethod, nullptr, nullptr, {} }
 const GDBusInterfaceVTable SsVtable = { HandleSsMethod, nullptr, nullptr, {} };
 
 // ---- imsd events ------------------------------------------------------------
-void PublishInterfaces() {
-    Emit(ModemPath, ModemIface, "PropertyChanged", PropChanged("Interfaces", InterfacesValue()));
+void PublishVoiceState() {
     Emit(ModemPath, ModemIface, "PropertyChanged",
          PropChanged("Online", g_variant_new_boolean(VoiceUp() ? TRUE : FALSE)));
-    Log(std::format("voice interface {}", VoiceUp() ? "available" : "withdrawn"));
+    Log(std::format("voice {}", VoiceUp() ? "registered" : (ImsdUp ? "unregistered" : "unavailable (imsd down)")));
 }
 
 void OnImsdSignal(GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar* signal, GVariant* params, gpointer) {
@@ -640,7 +646,7 @@ void OnImsdSignal(GDBusConnection*, const gchar*, const gchar*, const gchar*, co
         g_variant_get(params, "(b)", &reg);
         if (Registered == static_cast<bool>(reg)) return;
         Registered = reg;
-        PublishInterfaces();
+        PublishVoiceState();
     }
 }
 
@@ -679,7 +685,7 @@ void OnImsdAppeared(GDBusConnection*, const gchar*, const gchar*, gpointer) {
     ImsdUp = true;
     Log("imsd up");
     RefreshFromImsd();
-    PublishInterfaces();
+    PublishVoiceState();
 }
 
 void OnImsdVanished(GDBusConnection*, const gchar*, gpointer) {
@@ -690,7 +696,7 @@ void OnImsdVanished(GDBusConnection*, const gchar*, gpointer) {
     std::vector<std::string> live;
     for (const auto& [uni, rec] : Calls) live.push_back(uni);
     for (const std::string& uni : live) RemoveCall(uni, "network");
-    PublishInterfaces();
+    PublishVoiceState();
 }
 
 gboolean OnTerm(gpointer loop) {

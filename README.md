@@ -173,8 +173,8 @@ private headers that no distro installs.
 Setup:
 
 ```sh
-apk add imsd-ofono                    # or install the files by hand
-systemctl enable --now imsd-ofonod    # system service; org.ofono is a system name
+apk add imsd-ofono                    # enables imsd-ofonod via a systemd preset
+systemctl enable --now imsd-ofonod    # hand installs: system service, org.ofono is a system name
 # point Calls at the ofono provider (the package ships this as a gschema
 # override; this is the per-user equivalent)
 gsettings set org.gnome.Calls autoload-plugins "['ofono']"
@@ -218,13 +218,17 @@ Known gaps, all inherited rather than introduced:
   normal dialpad is unaffected — that reaches imsd's own classifier.
 - DTMF is forwarded to imsd, where `SendDtmf` is still a stub (RFC 4733 is not
   implemented yet) — the same limitation Plasma has.
-- **Restart GNOME Calls after restarting `imsd-ofonod` (or imsd).** When the
+- **Restart GNOME Calls after restarting `imsd-ofonod` itself.** When the
   modem's `VoiceCallManager` interface goes away and comes back, Calls 50.0
   adds a new origin but leaves the old origin's `CallAdded` handler connected:
   after one such cycle every call is added twice, after a few the stale handler
   runs on freed memory and Calls dies with SIGBUS in `g_hash_table_lookup`
   (measured on the FP6). Calls-side; an upstream fix belongs in
-  `plugins/provider/ofono/calls-ofono-provider.c`.
+  `plugins/provider/ofono/calls-ofono-provider.c`. To keep imsd's own
+  restarts and registration drops from triggering it, `imsd-ofonod` lists the
+  interface permanently: `Online` tracks registration, and `Dial` fails with
+  "imsd is not registered" / "imsd is not running" instead. Only `org.ofono`
+  vanishing — this daemon restarting — still cycles the origin.
 
 Development, without a phone or root:
 

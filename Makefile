@@ -145,6 +145,8 @@ install: all
 	    $(DESTDIR)$(PREFIX)/share/dbus-1/system.d/imsd-ofono.conf
 	install -Dm644 packaging/90_imsd-ofono.gschema.override \
 	    $(DESTDIR)$(PREFIX)/share/glib-2.0/schemas/90_imsd-ofono.gschema.override
+	install -Dm644 packaging/80-imsd-ofono.preset \
+	    $(DESTDIR)$(PREFIX)/lib/systemd/system-preset/80-imsd-ofono.preset
 
 $(PCM) $(OBJ) $(O)/tests:
 	mkdir -p $@
