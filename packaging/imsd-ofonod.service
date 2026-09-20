@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileCopyrightText: Copyright (C) 2026 Catcrafts®
+[Unit]
+Description=oFono-compatible GNOME Calls backend for imsd
+Documentation=https://forgejo.catcrafts.net/Catcrafts/imsd
+# org.ofono is a system-bus name, so this is a system service; it needs no
+# privileges beyond owning that name. Only enable it on a GNOME/Phosh session
+# — Plasma Mobile uses imsd-dialerd instead. Both may run at once (different
+# buses, different consumers), but a real ofonod must not.
+Conflicts=ofono.service
+After=imsd.service
+Wants=imsd.service
+
+[Service]
+Type=simple
+# EMERGENCY_NUMBERS only, and only so the oFono EmergencyNumbers property
+# matches imsd's configuration; imsd itself owns emergency classification.
+EnvironmentFile=-/etc/imsd.env
+ExecStart=/usr/bin/imsd-ofonod
+# it holds no call state of its own — imsd is re-queried on every reconnect
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

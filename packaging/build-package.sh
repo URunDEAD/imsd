@@ -83,6 +83,7 @@ XTARGET="--target=aarch64-alpine-linux-musl --sysroot=$SYSROOT --march=armv8.6-a
 crafter-build -- $XTARGET
 crafter-build -- --product=media $XTARGET
 crafter-build -- --product=dialerd $XTARGET
+crafter-build -- --product=ofonod $XTARGET
 crafter-build test
 
 # --- bundle + package

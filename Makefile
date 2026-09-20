@@ -7,10 +7,11 @@
 # flags. Keep the two in sync when products, module partitions or link
 # flags change.
 #
-#   make          -> build/make/{imsd,imsd-media,imsd-dialerd}
+#   make          -> build/make/{imsd,imsd-media,imsd-dialerd,imsd-ofonod}
 #   make check    -> build + run the 7 unit-test suites
 #   make install  -> DESTDIR/PREFIX staged install (binaries + systemd
-#                    unit, D-Bus policy, dialerd autostart, ims-pdn-up.sh)
+#                    units, D-Bus policies, dialerd autostart, the GNOME
+#                    Calls plugin override, ims-pdn-up.sh)
 #
 # Requires clang++ with libc++ and the libc++ std module sources
 # (std.cppm — Alpine: llvm-runtimes, Arch: libc++). Override STD_CPPM if
@@ -54,7 +55,7 @@ CORE_OBJS    = $(CORE_MODULES:%=$(OBJ)/%.o)
 
 TESTS = Util Aka Ipsec Messages Engine Sip Sdp
 
-all: $(O)/imsd $(O)/imsd-media $(O)/imsd-dialerd
+all: $(O)/imsd $(O)/imsd-media $(O)/imsd-dialerd $(O)/imsd-ofonod
 
 # ---- module BMIs ----------------------------------------------------------
 
@@ -103,6 +104,13 @@ $(OBJ)/dialerd.o: implementations/dialerd.cpp $(PCM)/std.pcm | $(OBJ)
 $(O)/imsd-dialerd: $(OBJ)/dialerd.o
 	$(CXX) $(ALL_CXXFLAGS) $(ALL_LDFLAGS) $^ $(GIO_LIBS) -o $@
 
+$(OBJ)/ofonod.o: implementations/ofonod.cpp $(PCM)/std.pcm | $(OBJ)
+	$(CXX) $(ALL_CXXFLAGS) $(GIO_CFLAGS) -fprebuilt-module-path=$(PCM) \
+	    -c $< -o $@
+
+$(O)/imsd-ofonod: $(OBJ)/ofonod.o
+	$(CXX) $(ALL_CXXFLAGS) $(ALL_LDFLAGS) $^ $(GIO_LIBS) -o $@
+
 # ---- tests -----------------------------------------------------------------
 
 $(O)/tests/%: tests/%/main.cpp $(PCM)/Imsd.pcm $(O)/libimsd-core.a | $(O)/tests
@@ -121,6 +129,7 @@ PREFIX ?= /usr
 install: all
 	install -Dm755 $(O)/imsd $(DESTDIR)$(PREFIX)/bin/imsd
 	install -Dm755 $(O)/imsd-dialerd $(DESTDIR)$(PREFIX)/bin/imsd-dialerd
+	install -Dm755 $(O)/imsd-ofonod $(DESTDIR)$(PREFIX)/bin/imsd-ofonod
 	install -Dm755 $(O)/imsd-media $(DESTDIR)$(PREFIX)/libexec/imsd-media
 	install -Dm755 packaging/ims-pdn-up.sh \
 	    $(DESTDIR)$(PREFIX)/libexec/ims-pdn-up.sh
@@ -130,6 +139,12 @@ install: all
 	    $(DESTDIR)/etc/xdg/autostart/imsd-dialerd.desktop
 	install -Dm644 packaging/net.catcrafts.IMS1.conf \
 	    $(DESTDIR)$(PREFIX)/share/dbus-1/system.d/net.catcrafts.IMS1.conf
+	install -Dm644 packaging/imsd-ofonod.service \
+	    $(DESTDIR)$(PREFIX)/lib/systemd/system/imsd-ofonod.service
+	install -Dm644 packaging/org.ofono.conf \
+	    $(DESTDIR)$(PREFIX)/share/dbus-1/system.d/imsd-ofono.conf
+	install -Dm644 packaging/90_imsd-ofono.gschema.override \
+	    $(DESTDIR)$(PREFIX)/share/glib-2.0/schemas/90_imsd-ofono.gschema.override
 
 $(PCM) $(OBJ) $(O)/tests:
 	mkdir -p $@

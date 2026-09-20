@@ -58,7 +58,7 @@ static void ApplyGioFlags(Configuration& cfg) {
 }
 
 extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> args) {
-    // Three executables come out of this repo; which one a build produces is
+    // Four executables come out of this repo; which one a build produces is
     // chosen by `--product=`:
     //   daemon (default) — imsd, the control-plane daemon (GDBus + engine),
     //                      and the unit tests, which link imsd-core.
@@ -68,11 +68,32 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
     //   dialerd          — imsd-dialerd, the session-bus Plasma Dialer
     //                      backend (org.kde.telephony.*) bridging to imsd
     //                      (pure GDBus translation, no core).
+    //   ofonod           — imsd-ofonod, the system-bus GNOME Calls backend
+    //                      (org.ofono.*) bridging to imsd, for Phosh and
+    //                      GNOME Mobile (pure GDBus translation, no core).
     bool wantMedia = false;
     bool wantDialerd = false;
+    bool wantOfonod = false;
     for (std::string_view a : args) {
         if (a == "--product=media") wantMedia = true;
         if (a == "--product=dialerd") wantDialerd = true;
+        if (a == "--product=ofonod") wantOfonod = true;
+    }
+    if (wantOfonod) {
+        Configuration ofonod;
+        ofonod.path = "./";
+        ofonod.name = "imsd-ofonod";
+        ofonod.outputName = "imsd-ofonod";
+        ApplyStandardArgs(ofonod, args);
+        ofonod.type = ConfigurationType::Executable;
+        {
+            std::array<fs::path, 0> ifaces = {};
+            std::array<fs::path, 1> impls = { "implementations/ofonod" };
+            ofonod.GetInterfacesAndImplementations(ifaces, impls);
+        }
+        ApplyGioFlags(ofonod);
+        ProjectLint::AddProjectLintRules(ofonod);
+        return ofonod;
     }
     if (wantDialerd) {
         Configuration dialerd;

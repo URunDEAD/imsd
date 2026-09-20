@@ -19,6 +19,11 @@ makedepends="clang lld libc++-dev llvm-libunwind-dev llvm-runtimes glib-dev pkgc
 # requests, which races imsd for the PDN and flaps it with a new prefix every
 # ~2.5 min — the two IMS stacks cannot share one PDN
 provides="81voltd=$pkgver-r$pkgrel"
+# imsd-ofono is opt-in: it carries the org.ofono shim that lets GNOME Calls
+# (Phosh, GNOME Mobile) drive imsd, plus the gschema override that repoints
+# Calls at the ofono provider. A Plasma Mobile phone wants imsd-dialerd, which
+# is in the main package, and must NOT get that override.
+subpackages="$pkgname-ofono:ofono"
 source="$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
 builddir="$srcdir/$pkgname"
 
@@ -32,4 +37,13 @@ check() {
 
 package() {
 	make install DESTDIR="$pkgdir"
+}
+
+ofono() {
+	pkgdesc="GNOME Calls (Phosh, GNOME Mobile) backend for imsd"
+	depends="$pkgname=$pkgver-r$pkgrel calls"
+	amove usr/bin/imsd-ofonod
+	amove usr/lib/systemd/system/imsd-ofonod.service
+	amove usr/share/dbus-1/system.d/imsd-ofono.conf
+	amove usr/share/glib-2.0/schemas/90_imsd-ofono.gschema.override
 }

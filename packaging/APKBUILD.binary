@@ -24,8 +24,11 @@ depends="modemmanager libc++ opencore-amr vo-amrwbenc pipewire-tools"
 # (fp6 journal/ims.md s57) — the two IMS stacks cannot share one PDN
 provides="81voltd=$pkgver-r$pkgrel"
 # no OpenRC service yet: the unit's PDN-bring-up/env-file sequencing is only
-# tested under systemd; an initd is welcome once someone can verify one
-subpackages="$pkgname-systemd"
+# tested under systemd; an initd is welcome once someone can verify one.
+# see packaging/APKBUILD: the org.ofono shim for GNOME Calls is opt-in
+# (ofono before systemd: systemd() amoves all of usr/lib/systemd/system,
+# so ofono() must take imsd-ofonod.service first)
+subpackages="$pkgname-ofono:ofono $pkgname-systemd"
 options="!check !tracedeps"
 source="
 	imsd-$pkgver.tar.gz
@@ -60,6 +63,22 @@ package() {
     mkdir -p "$pkgdir"/usr/lib/systemd/system/imsd.service.d
     printf '[Unit]\nConditionPathExists=/etc/imsd.env\n' \
         > "$pkgdir"/usr/lib/systemd/system/imsd.service.d/10-require-config.conf
+    install -Dm755 imsd-ofonod "$pkgdir"/usr/bin/imsd-ofonod
+    install -Dm644 imsd-ofonod.service \
+        "$pkgdir"/usr/lib/systemd/system/imsd-ofonod.service
+    install -Dm644 org.ofono.conf \
+        "$pkgdir"/usr/share/dbus-1/system.d/imsd-ofono.conf
+    install -Dm644 90_imsd-ofono.gschema.override \
+        "$pkgdir"/usr/share/glib-2.0/schemas/90_imsd-ofono.gschema.override
+}
+
+ofono() {
+    pkgdesc="GNOME Calls (Phosh, GNOME Mobile) backend for imsd"
+    depends="$pkgname=$pkgver-r$pkgrel calls"
+    amove usr/bin/imsd-ofonod
+    amove usr/lib/systemd/system/imsd-ofonod.service
+    amove usr/share/dbus-1/system.d/imsd-ofono.conf
+    amove usr/share/glib-2.0/schemas/90_imsd-ofono.gschema.override
 }
 
 systemd() {
