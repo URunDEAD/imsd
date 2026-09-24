@@ -65,34 +65,49 @@ log "modem $MODEM"
 # lookup itself can fail while ModemManager is still enabling the modem; a
 # failed lookup is not "no profile" (the APN-string request it would fall
 # back to is the one the modem refuses under an IPv4 attach), so it is
-# retried after the registration wait and only a list without the APN
-# falls back to the APN string.
+# retried after the registration wait; a list without the APN is final —
+# the APN string is used — only once the modem is registered.
 LOOKUP=pending
 if [ -n "$PROFILE_ID" ]; then
     [ "$PROFILE_ID" = none ] && PROFILE_ID=
     LOOKUP=done
 fi
-lookup_profile() {  # $1 = log suffix; sets PROFILE_ID, LOOKUP=done on a usable list
+lookup_profile() {  # $1 = modem state, $2 = log suffix; sets PROFILE_ID, LOOKUP=done on a final answer
     [ "$LOOKUP" = done ] && return 0
     if OUT=$(qmicli -d qrtr://0 --wds-get-profile-list=3gpp 2>&1); then
         # a list with no profiles at all is the modem still coming up, not
         # a modem without an ims profile (dev phone cold boot 2026-09-20
         # 16:47: exit 0, no entries, index 2 present a minute later)
         if ! printf '%s\n' "$OUT" | grep -q -E '^[[:space:]]*\[[0-9]+\] 3gpp'; then
-            log "ims profile lookup returned no profiles$1"
+            log "ims profile lookup returned no profiles$2"
             return 0
         fi
         PROFILE_ID=$(printf '%s\n' "$OUT" | awk -v apn="$IMS_APN" '
             /^[ \t]*\[[0-9]+\] 3gpp/ { idx = $1; gsub(/[^0-9]/, "", idx) }
             /APN:/ { a = $0; sub(/.*APN: '"'"'/, "", a); sub(/'"'"'.*/, "", a);
                      if (tolower(a) == tolower(apn) && idx != "") { print idx; exit } }')
-        LOOKUP=done
-        [ -n "$PROFILE_ID" ] && log "ims profile: index $PROFILE_ID (apn $IMS_APN)" || log "ims profile: none for apn $IMS_APN, connecting by APN string"
+        if [ -n "$PROFILE_ID" ]; then
+            LOOKUP=done
+            log "ims profile: index $PROFILE_ID (apn $IMS_APN)"
+            return 0
+        fi
+        # a list without the APN is final only once the modem is registered:
+        # while it enables, the list can be partial (dev phone cold boot
+        # 2026-09-24 18:18: entries but no ims at `enabling`, ims listed when
+        # read minutes later), and on a walled carrier the APN-string fallback
+        # that would follow is the request the modem refuses
+        case "$1" in
+            registered|connecting|connected)
+                LOOKUP=done
+                log "ims profile: none for apn $IMS_APN, connecting by APN string" ;;
+            *)  log "ims profile: not in the list yet$2" ;;
+        esac
     else
-        log "ims profile lookup failed$1: $(squash "$OUT")"
+        log "ims profile lookup failed$2: $(squash "$OUT")"
     fi
 }
-lookup_profile " (modem state: $(modem_state))"
+STATE=$(modem_state)
+lookup_profile "$STATE" " (modem state: $STATE)"
 
 # ---- find a connected ims bearer; else find-or-create one and connect it.
 # APN names are case-insensitive. A DISCONNECTED bearer is reused only when
@@ -157,12 +172,14 @@ if [ -z "$BEARER" ]; then
         waited=$((waited + 5))
     done
     log "modem state: $(modem_state), packet service: $(packet_state)"
-    # a lookup that failed while the modem was still coming up
+    # a lookup with no final answer yet: it failed, or its list lacked the
+    # APN while the modem was still coming up
     n=0
     while [ "$LOOKUP" != done ] && [ "$n" -lt 3 ]; do
         n=$((n + 1))
         sleep 5
-        lookup_profile " (retry $n)"
+        STATE=$(modem_state)
+        lookup_profile "$STATE" " (retry $n, modem state: $STATE)"
     done
     if [ "$LOOKUP" != done ]; then
         PROFILE_ID=
