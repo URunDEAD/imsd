@@ -796,8 +796,13 @@ public:
                 Execute(call_->OnInviteResponse(*msg));
                 MaybeDropCall();
             } else if (!subCallid_.empty() && callid == subCallid_ && cseq.ends_with("SUBSCRIBE")) {
-                Log(std::format("reg-event SUBSCRIBE -> {}", *st));
-                DumpRaw("imsd-subscribe-200.raw", *msg);
+                if (*st >= 300) {
+                    Log(std::format("reg-event SUBSCRIBE refused: {}", imsd::sip::RefusalSummary(*msg)));
+                    DumpRaw("imsd-subscribe-fail.raw", *msg);
+                } else {
+                    Log(std::format("reg-event SUBSCRIBE -> {}", *st));
+                    if (*st >= 200) DumpRaw("imsd-subscribe-200.raw", *msg);
+                }
             }
         }
         // shutdown: release an active call, keep the SA/registration for resume
@@ -932,7 +937,7 @@ private:
         // failed FRESH registration is.
         if (resume != "0") {
             try { if (TryResume()) return; }
-            catch (const std::exception& e) { Log(std::format("resume failed: {} — registering fresh", e.what())); sip_.Close(); }
+            catch (const std::exception& e) { Log(std::format("resume failed: {} — registering fresh", e.what())); CloseFlowAfterWait(); }
         }
         FreshRegister();
     }
@@ -1022,16 +1027,14 @@ private:
         if (bind(us, reinterpret_cast<sockaddr*>(&la), ll) != 0) {
             close(us); throw std::runtime_error("bind init port failed");
         }
-        timeval tv{8, 0}; setsockopt(us, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         std::string reg1 = imsd::msg::BuildRegisterInitial(ctx_, callidReg, ftag, rng_.Token(16), spiUc, spiUs);
         sockaddr_storage pa; socklen_t pl = MakeAddr(pcscf_, pcscfPort_, pa);
         sendto(us, reg1.data(), reg1.size(), 0, reinterpret_cast<sockaddr*>(&pa), pl);
-        char buf[65535];
-        ssize_t n = recv(us, buf, sizeof buf, 0);
-        close(us);
-        if (n <= 0) throw std::runtime_error("no 401 to unprotected REGISTER");
-        std::string resp(buf, static_cast<std::size_t>(n));
-        if (imsd::sip::Status(resp) != 401) throw std::runtime_error("expected 401");
+        std::string resp = AwaitInitialFinal(us, callidReg);
+        if (imsd::sip::Status(resp) != 401) {
+            DumpRaw("imsd-register-fail.raw", resp);
+            throw std::runtime_error(std::format("expected 401, got {}", imsd::sip::RefusalSummary(resp)));
+        }
         auto nonceB64 = QuotedAfter(resp, "nonce=\"");
         if (!nonceB64) throw std::runtime_error("no nonce in 401");
         auto raw = imsd::util::FromBase64(*nonceB64);
@@ -1129,13 +1132,10 @@ private:
         std::string auth = imsd::msg::AuthAka(ctx_, *nonceB64, cnonce, response);
         std::string reg2 = imsd::msg::BuildRegisterProtected(ctx_, callidReg, ftag, rng_.Token(16), 2, spiUc, spiUs, auth);
         if (!sip_.Send(reg2)) throw std::runtime_error("send protected REGISTER failed");
-        std::string ok;
-        for (;;) {
-            auto m = sip_.RecvMsg(12.0);
-            if (!m) throw std::runtime_error("no reply to protected REGISTER");
-            auto st = imsd::sip::Status(*m);
-            if (st == 200) { ok = *m; break; }
-            if (st && *st >= 300) throw std::runtime_error(std::format("REGISTER failed {}", *st));
+        std::string ok = AwaitFinal(callidReg, 2, "protected REGISTER");
+        if (auto st = imsd::sip::Status(ok); st != 200) {
+            DumpRaw("imsd-register-fail.raw", ok);
+            throw std::runtime_error(std::format("REGISTER refused: {}", imsd::sip::RefusalSummary(ok)));
         }
         reg_.callid = callidReg; reg_.ftag = ftag; reg_.cseq = 2;
         reg_.spiUc = spiUc; reg_.spiUs = spiUs;
@@ -1149,6 +1149,85 @@ private:
         Log("REGISTERED (fresh)");
     }
 
+    // Closes the flow of a REGISTER wait that failed. A call that arrived
+    // under the wait (AwaitFinal dispatches requests) ends with it: a 486
+    // while the flow still carries one, and the bus told.
+    void CloseFlowAfterWait() {
+        if (call_) {
+            Log(std::format("call {} arrived under a registration that failed; ending it", call_->Uni()));
+            Execute(call_->OnHangup());
+            MaybeDropCall();
+            if (call_) { Execute(call_->Abandon("registration failed")); MaybeDropCall(); }
+        }
+        sip_.Close();
+    }
+
+    // The final of the REGISTER (callid, cseq) just sent, within 12 s of
+    // the send or of its last provisional. A request arriving on the client
+    // flow meanwhile (a NOTIFY, an OPTIONS) is dispatched and answered, not
+    // read as the reply; a provisional of our own transaction keeps the
+    // wait going; a response to another transaction is ignored. Throws
+    // when nothing answers or the flow dies under a dispatched request.
+    std::string AwaitFinal(const std::string& callid, long cseq, std::string_view what) {
+        std::string want = std::format("{} REGISTER", cseq);
+        double deadline = Mono() + 12.0;
+        for (;;) {
+            double left = deadline - Mono();
+            auto m = left > 0 ? sip_.RecvMsg(left) : std::nullopt;
+            if (!m) throw std::runtime_error(std::format("no reply to {}", what));
+            auto st = imsd::sip::Status(*m);
+            if (!st) {
+                reply_ = [this](const std::string& r) { sip_.Send(r); };
+                DispatchRequest(*m);
+                if (!sip_.Alive()) throw std::runtime_error(std::format("flow closed while awaiting the {} reply", what));
+                continue;
+            }
+            if (!imsd::sip::ResponseOf(*m, callid, want)) {
+                Log(std::format("ignoring a response to another transaction while awaiting the {} reply", what));
+                continue;
+            }
+            if (*st >= 200) return *m;
+            Log(std::format("{} -> {} (provisional); waiting for the final", what, *st));
+            deadline = Mono() + 12.0;
+        }
+    }
+
+    // The final of the unprotected REGISTER (callid, CSeq 1) on the init
+    // socket, within 8 s of the send or of its last provisional. The socket
+    // is bound to the init port, not connected: what else it delivers — a
+    // late final of an earlier attempt, a stray datagram — is logged with
+    // its source port and skipped, never judged as the reply. Closes the
+    // socket; throws when nothing answers.
+    std::string AwaitInitialFinal(int us, const std::string& callid) {
+        double deadline = Mono() + 8.0;
+        char buf[65535];
+        for (;;) {
+            double left = deadline - Mono();
+            if (left <= 0) break;
+            long sec = static_cast<long>(left);
+            long usec = static_cast<long>((left - static_cast<double>(sec)) * 1e6);
+            if (sec == 0 && usec == 0) usec = 1000;
+            timeval tv{sec, usec};
+            setsockopt(us, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            sockaddr_storage src; socklen_t sl = sizeof src;
+            ssize_t n = recvfrom(us, buf, sizeof buf, 0, reinterpret_cast<sockaddr*>(&src), &sl);
+            if (n <= 0) break;
+            std::string m(buf, static_cast<std::size_t>(n));
+            if (!imsd::sip::ResponseOf(m, callid, "1 REGISTER")) {
+                int sp = src.ss_family == AF_INET6 ? ntohs(reinterpret_cast<sockaddr_in6*>(&src)->sin6_port) : ntohs(reinterpret_cast<sockaddr_in*>(&src)->sin_port);
+                std::string_view sv = m;
+                Log(std::format("ignoring a datagram on the init port from port {} that is not the unprotected REGISTER's reply: {}", sp, sv.substr(0, sv.find("\r\n"))));
+                continue;
+            }
+            int st = *imsd::sip::Status(m);
+            if (st >= 200) { close(us); return m; }
+            Log(std::format("unprotected REGISTER -> {} (provisional); waiting for the final", st));
+            deadline = Mono() + 8.0;
+        }
+        close(us);
+        throw std::runtime_error("no 401 to unprotected REGISTER");
+    }
+
     // re-REGISTER over the (resumed or live) SA. Returns (200 msg, used cseq).
     std::pair<std::string, long> Reregister(const std::string& callid, const std::string& ftag, long startCseq, std::uint32_t spiUc, std::uint32_t spiUs) {
         std::string auth = imsd::msg::AuthEmpty(ctx_);
@@ -1157,13 +1236,12 @@ private:
         for (;;) {
             std::string reg = imsd::msg::BuildRegisterProtected(ctx_, callid, ftag, rng_.Token(16), cseq, spiUc, spiUs, auth);
             if (!sip_.Send(reg)) throw std::runtime_error("send re-REGISTER failed");
-            auto m = sip_.RecvMsg(12.0);
-            if (!m) throw std::runtime_error("no reply to re-REGISTER");
-            auto st = imsd::sip::Status(*m);
-            if (st == 200) return {*m, cseq};
+            std::string m = AwaitFinal(callid, cseq, "re-REGISTER");
+            auto st = imsd::sip::Status(m);
+            if (st == 200) return {m, cseq};
             if (st == 401 && !challenged) {
                 challenged = true;
-                auto nonce = QuotedAfter(*m, "nonce=\"");
+                auto nonce = QuotedAfter(m, "nonce=\"");
                 auto raw = nonce ? imsd::util::FromBase64(*nonce) : std::nullopt;
                 if (!raw || raw->size() < 32) throw std::runtime_error("bad 401 nonce on refresh");
                 std::vector<std::uint8_t> rnd(raw->begin(), raw->begin() + 16);
@@ -1176,7 +1254,8 @@ private:
                 cseq++;
                 continue;
             }
-            throw std::runtime_error(std::format("re-REGISTER failed {}", st.value_or(0)));
+            DumpRaw("imsd-register-fail.raw", m);
+            throw std::runtime_error(std::format("re-REGISTER refused: {}", imsd::sip::RefusalSummary(m)));
         }
     }
 
@@ -1273,7 +1352,7 @@ private:
             // recovery is the same as a daemon restart: drop the flow and
             // let MaybeReconnect re-run the connect + true-refresh sequence.
             Log(std::format("keepalive re-REGISTER failed: {}", e.what()));
-            sip_.Close();
+            CloseFlowAfterWait();
         }
         lastRefresh_ = Mono();
         lastKa_ = Mono();
@@ -1310,7 +1389,7 @@ private:
                 return;
             } catch (const std::exception& e) {
                 Log(std::format("reconnect re-REGISTER failed: {}", e.what()));
-                sip_.Close();
+                CloseFlowAfterWait();
             }
         }
         if (registered_) { registered_ = false; EmitStatus(true); }
@@ -1330,31 +1409,41 @@ private:
     }
 
     // ---- command handling -------------------------------------------------
+    // A Dial while a call exists: refused, unless it is an emergency dial,
+    // which preempts whatever exists (TS 22.101) — released, and abandoned
+    // if it lingers awaiting a CANCEL's 487 (the late final is ignored by
+    // Call-ID mismatch). False when the dial was refused.
+    bool ClearForDial(const Cmd& c, bool emergency) {
+        if (!call_) return true;
+        if (!emergency) {
+            Log(std::format("dial({}) refused: call in progress", c.number));
+            CallInfo bad{c.uni, c.number, "terminated", "error", NowEpoch(), 0};
+            PostAdded(bad);
+            PostState(c.uni, "terminated", "error");
+            PostDeleted(c.uni);
+            return false;
+        }
+        Log(std::format("emergency dial: preempting call {}", call_->Uni()));
+        Execute(call_->OnHangup());
+        MaybeDropCall();
+        if (call_) { Execute(call_->Abandon("preempted by emergency dial")); MaybeDropCall(); }
+        return true;
+    }
+
     void HandleCmd(const Cmd& c) {
         if (c.kind == Cmd::Kind::Stop) { quit_.store(true); return; }
         if (c.kind == Cmd::Kind::Dial) {
             bool emergency = imsd::msg::IsEmergency(c.number, emergencyExtra_);
-            if (call_) {
-                if (!emergency) {
-                    Log(std::format("dial({}) refused: call in progress", c.number));
-                    CallInfo bad{c.uni, c.number, "terminated", "error", NowEpoch(), 0};
-                    PostAdded(bad);
-                    PostState(c.uni, "terminated", "error");
-                    PostDeleted(c.uni);
-                    return;
-                }
-                // an emergency dial preempts whatever exists (TS 22.101):
-                // release it; if it lingers awaiting a CANCEL's 487, abandon
-                // it — the late final is ignored by Call-ID mismatch
-                Log(std::format("emergency dial: preempting call {}", call_->Uni()));
-                Execute(call_->OnHangup());
-                MaybeDropCall();
-                if (call_) { Execute(call_->Abandon("preempted by emergency dial")); MaybeDropCall(); }
-            }
+            if (!ClearForDial(c, emergency)) return;
             // a dead client flow fails the INVITE instantly — give the
             // reconnect path one immediate shot first (user action beats
-            // the backoff timer)
-            if (!sip_.Alive()) { nextReconnect_ = 0; MaybeReconnect(); }
+            // the backoff timer). The shot's REGISTER wait dispatches
+            // requests, so an incoming call may have arrived under it: the
+            // same rule again.
+            if (!sip_.Alive()) {
+                nextReconnect_ = 0; MaybeReconnect();
+                if (!ClearForDial(c, emergency)) return;
+            }
             RefreshPani();
             if (emergency)
                 Log(std::format("EMERGENCY dial ({}): urn:service:sos over the live registration, "

@@ -121,6 +121,39 @@ export namespace imsd::sip {
         return v;
     }
 
+    // True for a response of the transaction (callid, cseq) — the reply a
+    // wait for that request may judge. A request, another transaction's
+    // response or anything else a socket delivers is not.
+    bool ResponseOf(std::string_view msg, std::string_view callid, std::string_view cseq) {
+        return Status(msg).has_value() && Header(msg, "Call-ID") == callid && Header(msg, "CSeq") == cseq;
+    }
+
+    // Retry-After of a response (RFC 3261 20.33), in seconds; nullopt when
+    // absent or not a number.
+    std::optional<long> RetryAfter(std::string_view msg) {
+        auto v = Header(msg, "Retry-After");
+        if (!v) return std::nullopt;
+        return LeadingDigits(*v);
+    }
+
+    // A refused final for the journal: its status line, then the headers
+    // that say who refused and for how long — Retry-After (RFC 3261 20.33),
+    // Warning (20.43: the node's own words), Reason (RFC 3326), Server
+    // (20.35). "503 Service Unavailable; Retry-After: 60; Warning: 399
+    // pcscf1.example \"...\"". A bare status code says neither which node
+    // nor why: O2 UK answered a refresh 503 twenty-one times and a
+    // subscription 500 (alyx, 2026-09-24) and the journal could not tell
+    // the P-CSCF from the S-CSCF (ims ledger F17).
+    std::string RefusalSummary(std::string_view msg) {
+        std::string_view line = msg.substr(0, msg.find_first_of("\r\n"));
+        if (line.starts_with("SIP/2.0 ")) line.remove_prefix(8);
+        std::string s(Trim(line));
+        for (std::string_view name : {"Retry-After", "Warning", "Reason", "Server"})
+            for (std::string_view v : Headers(msg, name))
+                s += std::format("; {}: {}", name, v);
+        return s;
+    }
+
     // Where a UDP response to this request must go (RFC 3261 18.2.2): the
     // top Via's sent-by port — unless the Via carries rport, in which case
     // the caller should reply to the request's source port instead

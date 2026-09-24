@@ -196,6 +196,51 @@ int main() {
         Check(!m4.has_value(), "absurd Content-Length: discarded, no overflow");
     }
 
+    // ---- RetryAfter / RefusalSummary (what a refused final is logged as)
+    {
+        std::string r503 =
+            "SIP/2.0 503 Service Unavailable\r\n"
+            "Via: SIP/2.0/TCP [2001:db8::db43]:45062;branch=z9hG4bKx\r\n"
+            "Retry-After: 120\r\n"
+            "Warning: 399 pcscf1.example \"S-CSCF unreachable\"\r\n"
+            "Server: Mavenir-P-CSCF/4.2\r\n"
+            "Content-Length: 0\r\n\r\n";
+        Check(RetryAfter(r503) == 120, "Retry-After parsed");
+        Check(RefusalSummary(r503) == "503 Service Unavailable; Retry-After: 120; Warning: 399 pcscf1.example \"S-CSCF unreachable\"; Server: Mavenir-P-CSCF/4.2", "summary: status line + reason headers in order");
+        std::string r500 =
+            "SIP/2.0 500 Server Internal Error\r\n"
+            "Via: SIP/2.0/TCP [2001:db8::db43]:45062;branch=z9hG4bKx\r\n"
+            "Content-Length: 0\r\n\r\n";
+        Check(!RetryAfter(r500).has_value(), "no Retry-After -> nullopt");
+        Check(RefusalSummary(r500) == "500 Server Internal Error", "summary without reason headers is the status line");
+        std::string two =
+            "SIP/2.0 403 Forbidden\r\n"
+            "Reason: Q.850;cause=21;text=\"Call rejected\"\r\n"
+            "Reason: SIP;cause=403\r\n"
+            "Retry-After: soon\r\n"
+            "Content-Length: 0\r\n\r\n";
+        Check(!RetryAfter(two).has_value(), "non-numeric Retry-After -> nullopt");
+        Check(RefusalSummary(two) == "403 Forbidden; Retry-After: soon; Reason: Q.850;cause=21;text=\"Call rejected\"; Reason: SIP;cause=403", "every instance of a reason header is kept");
+        Check(RefusalSummary("NOTIFY sip:x SIP/2.0\r\nEvent: reg\r\n\r\n") == "NOTIFY sip:x SIP/2.0", "a request summarises to its request line");
+        Check(RefusalSummary("") == "", "empty message -> empty summary");
+    }
+
+    // ---- ResponseOf (which datagram a REGISTER wait may judge)
+    {
+        Check(ResponseOf(Resp200, "12345@host", "2 REGISTER"), "the transaction's own final");
+        Check(!ResponseOf(Resp200, "12345@host", "1 REGISTER"), "another CSeq is not it");
+        std::string stale =
+            "SIP/2.0 408 Request Timeout\r\n"
+            "Via: SIP/2.0/UDP [2001:db8::db43]:5060;branch=z9hG4bKa;rport=5060\r\n"
+            "Call-ID: earlier@[2001:db8::db43]\r\n"
+            "CSeq: 1 REGISTER\r\n"
+            "Content-Length: 0\r\n\r\n";
+        Check(!ResponseOf(stale, "12345@host", "1 REGISTER"), "an earlier attempt's late final is not it");
+        Check(ResponseOf(stale, "earlier@[2001:db8::db43]", "1 REGISTER"), "matched by Call-ID and CSeq");
+        Check(!ResponseOf("NOTIFY sip:x SIP/2.0\r\nCall-ID: 12345@host\r\nCSeq: 2 REGISTER\r\n\r\n", "12345@host", "2 REGISTER"), "a request is never a response");
+        Check(!ResponseOf("", "12345@host", "2 REGISTER"), "nothing is not it");
+    }
+
     if (Failures == 0) std::println("Sip: all tests passed");
     return Failures;
 }
