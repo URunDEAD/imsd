@@ -33,6 +33,7 @@ reach the bus via g_idle_add, where the calls table + status snapshot live
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 import std;
@@ -188,11 +189,19 @@ constexpr std::string_view TransportName(Transport t) { return t == Transport::U
 // connect (O2 UK, 2026-09-17). Both run through the same SA pair — the xfrm
 // policies select on ports only — and the same Via port.
 // A P-CSCF refusing a fresh security association (KPN: Security-Server
-// spi-s=0 to a fresh REGISTER made too soon after another; the window is
-// ~20 min and every fresh attempt re-arms it). Handled in-process: a
+// spi-s=0 to a fresh REGISTER on an address whose registration is still
+// live). Handled in-process: a
 // systemd restart every RestartSec would never clear it.
 struct ThrottledError : std::runtime_error { using std::runtime_error::runtime_error; };
-constexpr int ThrottleWaitMin = 21;
+// A REGISTER the network refused: the protected one, or a refresh, answered
+// with a final other than 200 (a refresh's first 401 is its challenge); the
+// unprotected initial one answered with a final from 300 up (its 401 is the
+// challenge). The status and its Retry-After feed imsd::engine::RegRecovery.
+struct RefusedError : std::runtime_error {
+    int status;
+    long retryAfter;
+    RefusedError(const std::string& what, int st, long ra) : std::runtime_error(what), status(st), retryAfter(ra) {}
+};
 // Bytes of SIP that fit one ESP-protected IPv6 packet at the ims PDN's
 // 1280-byte MTU (40 IPv6 + 8 ESP + 16 IV + 8 UDP + padding + 12 ICV).
 constexpr std::size_t UdpSinglePacketBudget = 1190;
@@ -211,24 +220,30 @@ public:
     // one attempt.
     bool Connect(const std::string& local, int lport, const std::string& pcscf, int pport, Transport t, int tries = 10, int silentLimit = 0) {
         transport_ = t;
+        lastConnectLocal_ = false;
         int fam = Is6(local) ? AF_INET6 : AF_INET;
         if (t == Transport::Udp) {
             int fd = socket(fam, SOCK_DGRAM, 0);
-            if (fd < 0) return false;
+            if (fd < 0) return SocketFailed();
             int one = 1;
             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
             setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
             sockaddr_storage la; socklen_t ll = MakeAddr(local, lport, la);
-            if (bind(fd, reinterpret_cast<sockaddr*>(&la), ll) != 0) { close(fd); return false; }
+            if (!Bind(fd, la, ll, local, lport)) return false;
             sockaddr_storage pa; socklen_t pl = MakeAddr(pcscf, pport, pa);
-            if (connect(fd, reinterpret_cast<sockaddr*>(&pa), pl) != 0) { Log(std::format("UDP connect: {}", std::strerror(errno))); close(fd); return false; }
+            if (connect(fd, reinterpret_cast<sockaddr*>(&pa), pl) != 0) {
+                // a UDP connect() cannot be refused by the peer: no route
+                // yet, and the like — local, like the TCP path's ENETUNREACH
+                Log(std::format("UDP connect: {}", std::strerror(errno)));
+                close(fd); lastConnectLocal_ = true; return false;
+            }
             fd_ = fd; alive_ = true; fb_ = {}; sizeWarned_ = false;
             return true;
         }
         int silent = 0;
         for (int attempt = 0; attempt < tries; attempt++) {
             int fd = socket(fam, SOCK_STREAM, 0);
-            if (fd < 0) return false;
+            if (fd < 0) return SocketFailed();
             int one = 1;
             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
             // REUSEPORT (paired with the listener's): a reconnect must bind
@@ -236,7 +251,7 @@ public:
             // it in LISTEN state — REUSEADDR alone only covers TIME_WAIT.
             setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
             sockaddr_storage la; socklen_t ll = MakeAddr(local, lport, la);
-            if (bind(fd, reinterpret_cast<sockaddr*>(&la), ll) != 0) { close(fd); return false; }
+            if (!Bind(fd, la, ll, local, lport)) return false;
             sockaddr_storage pa; socklen_t pl = MakeAddr(pcscf, pport, pa);
             // non-blocking connect + poll: Linux connect() ignores SO_SNDTIMEO,
             // so bound it ourselves (a silent P-CSCF must not hang the engine).
@@ -259,21 +274,47 @@ public:
                 return true;
             }
             close(fd);
+            lastConnectLocal_ = localRefusal;
             if (!localRefusal) silent++;
-            if (attempt == tries - 1) return false;
-            if (silentLimit > 0 && silent >= silentLimit) {
-                Log(std::format("connect: no answer from the P-CSCF {} times", silent));
-                return false;
-            }
             // An answer (RST → ECONNREFUSED, ICMP → EHOSTUNREACH/ENETUNREACH)
             // counts towards the silent limit like a timeout: either way the
             // P-CSCF does not serve TCP on that port. The log says which.
             const char* why = err == ETIMEDOUT ? "no answer" : (err == EADDRNOTAVAIL ? "TIME_WAIT?" : std::strerror(err));
+            if (attempt == tries - 1) {
+                Log(std::format("connect failed ({}) [{}/{}]", why, attempt + 1, tries));
+                return false;
+            }
+            if (silentLimit > 0 && silent >= silentLimit) {
+                Log(std::format("connect: no answer from the P-CSCF {} times ({})", silent, why));
+                return false;
+            }
             Log(std::format("connect failed; retry in 10s ({}) [{}/{}]", why, attempt + 1, tries));
             sleep(10);
         }
         return false;
     }
+    // socket() failing is ours, not the network's: logged, and a local
+    // refusal like a connect() the kernel turns down.
+    bool SocketFailed() {
+        Log(std::format("connect failed: socket: {}", std::strerror(errno)));
+        lastConnectLocal_ = true;
+        return false;
+    }
+    // A bind the kernel refuses (the address is not on the link:
+    // EADDRNOTAVAIL) is logged and counts like the network's silence — it is
+    // not a transient refusal to retry every 5 s. Closes fd on failure.
+    bool Bind(int fd, const sockaddr_storage& la, socklen_t ll, const std::string& local, int lport) {
+        if (bind(fd, reinterpret_cast<const sockaddr*>(&la), ll) == 0) return true;
+        int err = errno;
+        close(fd);
+        lastConnectLocal_ = false;
+        Log(std::format("connect failed: cannot bind {} ({})", imsd::util::HostPort(local, lport), std::strerror(err)));
+        return false;
+    }
+    // Whether the last failed Connect() ended on a local refusal (our own
+    // 4-tuple still in TIME_WAIT, no route yet) rather than on the network's
+    // silence or answer — the recovery policy counts only the latter.
+    bool LastConnectLocal() const { return lastConnectLocal_; }
     // MSG_NOSIGNAL: a flow the network killed (CSFB excursion, P-CSCF idle
     // drop) must surface as a send error, not a SIGPIPE.
     bool Send(std::string_view msg) {
@@ -337,10 +378,13 @@ public:
     int Fd() const { return fd_; }
     bool Alive() const { return fd_ >= 0 && alive_; }
     Transport CurrentTransport() const { return transport_; }
-    void Close() { if (fd_ >= 0) { close(fd_); fd_ = -1; } alive_ = false; }
+    // What was read and not yet dispatched goes with the flow: nothing
+    // read from it can be answered once it is closed.
+    void Close() { if (fd_ >= 0) { close(fd_); fd_ = -1; } alive_ = false; fb_ = {}; }
 private:
     int fd_ = -1;
     bool alive_ = false;
+    bool lastConnectLocal_ = false;
     Transport transport_ = Transport::Tcp;
     bool sizeWarned_ = false;
     imsd::sip::FrameBuffer fb_;
@@ -589,6 +633,87 @@ std::int64_t NowEpoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// The recovery policy's holds, kept for the next process: the network's
+// word (a Retry-After, the schedule after a refused or throttled fresh
+// attempt) outlives a restart of imsd. They
+// are filed under the daemon's address — another one, or a reboot, starts
+// clean — so the file names that address and the boot, and
+// lives in /run. Seconds left at `written_at`, which is on the boot
+// clock: no clock step moves it, and it runs through a suspend as the
+// network's timers do. Whether the old registration is gone travels with
+// them: a restart inside a hold must not resume over SAs the network has
+// written off.
+std::int64_t BootSeconds() {
+    timespec ts{};
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return ts.tv_sec;
+}
+
+std::string BootId() {
+    std::string id;
+    if (std::FILE* f = std::fopen("/proc/sys/kernel/random/boot_id", "r")) {
+        char buf[64];
+        id.assign(buf, std::fread(buf, 1, sizeof buf, f));
+        std::fclose(f);
+    }
+    while (!id.empty() && std::isspace(static_cast<unsigned char>(id.back()))) id.pop_back();
+    return id;
+}
+
+// The recovery policy runs on the same clock: a hold in the process and
+// its copy in the file age alike, through a suspend as the network's
+// timers do.
+double Boot() {
+    timespec ts{};
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+}
+
+std::string HoldsPath() {
+    if (const char* o = std::getenv("HOLDS_FILE")) return o;
+    if (geteuid() == 0) return "/run/imsd.holds";
+    return std::format("{}/imsd.holds", EnvOr("XDG_RUNTIME_DIR", "/tmp"));
+}
+
+void PersistHolds(const imsd::engine::RegRecovery::Held& h, const std::string& pdn) {
+    std::string path = HoldsPath();
+    if (!h.Any()) {
+        // nothing to keep: the file goes — when it is ours. A device node or a
+        // link the HOLDS_FILE knob points at (/dev/null switches the file off) is
+        // emptied instead, never unlinked.
+        std::error_code ec;
+        auto st = std::filesystem::symlink_status(path, ec);
+        if (std::filesystem::is_regular_file(st)) std::remove(path.c_str());
+        else if (std::filesystem::exists(st)) { if (std::FILE* f = std::fopen(path.c_str(), "w")) std::fclose(f); }
+        return;
+    }
+    std::string j = std::format("{{\"pdn\": \"{}\", \"boot\": \"{}\", \"written_at\": {}, \"hold\": {}, \"fresh_hold\": {}, \"throttle_minutes\": {}, \"old_gone\": {}}}\n",
+                                pdn, BootId(), BootSeconds(), static_cast<long>(std::ceil(h.hold)), static_cast<long>(std::ceil(h.freshHold)), h.throttleMinutes, h.oldGone ? "true" : "false");
+    if (std::FILE* f = std::fopen(path.c_str(), "w")) {
+        std::fwrite(j.data(), 1, j.size(), f);
+        std::fclose(f);
+    }
+}
+
+std::optional<imsd::engine::RegRecovery::Held> LoadHolds(const std::string& pdn) {
+    std::FILE* f = std::fopen(HoldsPath().c_str(), "r");
+    if (!f) return std::nullopt;
+    std::string s;
+    char buf[512]; std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
+    std::fclose(f);
+    if (QuotedAfter(s, "\"pdn\": \"").value_or("") != pdn) return std::nullopt;
+    if (QuotedAfter(s, "\"boot\": \"").value_or("") != BootId()) return std::nullopt;
+    long elapsed = BootSeconds() - IntAfter(s, "\"written_at\": ").value_or(0);
+    imsd::engine::RegRecovery::Held h;
+    h.hold = std::max<long>(0, IntAfter(s, "\"hold\": ").value_or(0) - elapsed);
+    h.freshHold = std::max<long>(0, IntAfter(s, "\"fresh_hold\": ").value_or(0) - elapsed);
+    h.throttleMinutes = static_cast<int>(IntAfter(s, "\"throttle_minutes\": ").value_or(h.throttleMinutes));
+    h.oldGone = s.find("\"old_gone\": true") != std::string::npos;
+    if (!h.Any()) return std::nullopt;
+    return h;
+}
+
 // build an a{sv} from a CallInfo (matches imsd.py _d typing)
 GVariant* CallVariant(const CallInfo& c) {
     GVariantBuilder b;
@@ -723,28 +848,31 @@ public:
     }
 
     void Run() {
+        if (auto h = LoadHolds(local_)) {
+            recovery_.Restore(Boot(), *h);
+            auto kept = recovery_.Holds(Boot());   // what the policy took over: the file's values after the clamp
+            if (kept.hold > 0 || kept.freshHold > 0)
+                Log(std::format("a hold the network set before this start stands ({:.0f} s for any attempt, {:.0f} s for a fresh registration; the refusal schedule at {} min)", kept.hold, kept.freshHold, kept.throttleMinutes));
+            else if (kept.throttleMinutes > imsd::engine::RegRecovery::ThrottleMinutesMin)
+                Log(std::format("the refusal schedule stands at {} min from before this start: a refused or throttled fresh registration waits that long", kept.throttleMinutes));
+            if (kept.oldGone) Log("the old registration was gone before this start: no resume over its SAs, the fresh registration once its wait has run");
+        }
         for (;;) {
         try {
             BringUp();
             break;
+        } catch (const Stopping&) {
+            return;
         } catch (const ThrottledError& e) {
-            // The window grows on repeats (a carrier's window may exceed the
-            // first guess and every throttled attempt re-arms it); it resets
-            // after a successful bring-up.
-            int waitMin = throttleWaitMin_;
-            throttleCount_++;
-            Log(std::format("bring-up deferred: {} — attempt {}, next fresh registration in {} min", e.what(), throttleCount_, waitMin));
-            registered_ = false;
-            EmitStatus(true);
-            for (int i = 0; i < waitMin * 60 && !quit_.load(); i++) {
-                // A Dial/Accept/HangUp arriving now must not wait in the
-                // queue and run stale once registration succeeds; with no
-                // flow the call collapses to terminated at once (DevLoop's rule).
-                if (auto cmd = PopCmd()) { HandleCmd(*cmd); MaybeDropCall(); continue; }
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
+            DeferBringUp(e.what(), imsd::engine::RegRecovery::Failure::Throttled, 0);
             if (quit_.load()) return;
-            throttleWaitMin_ = std::min(throttleWaitMin_ * 3 / 2, 60);
+            continue;
+        } catch (const RefusedError& e) {
+            // A refused initial registration (403, 5xx) waits like a
+            // throttle: a fatal would restart imsd every RestartSec with an
+            // initial REGISTER each time.
+            DeferBringUp(e.what(), imsd::engine::RegRecovery::Failure::Refused, e.retryAfter);
+            if (quit_.load()) return;
             continue;
         } catch (const std::exception& e) {
             if (devMode_) {
@@ -763,14 +891,9 @@ public:
             return;
         }
         }
-        throttleWaitMin_ = ThrottleWaitMin; throttleCount_ = 0;
-        registered_ = true;
-        EmitStatus(true);
-        lastRefresh_ = Mono();
-        lastKa_ = Mono();
         try { server_.Open(local_); }
         catch (...) { Log("server ports unavailable; remote hangup/incoming not seen"); }
-        SubscribeRegEvent();
+        OnRegistered();
 
         while (!quit_.load()) {
             if (auto cmd = PopCmd()) { HandleCmd(*cmd); continue; }
@@ -813,6 +936,41 @@ public:
 
 private:
     struct Cmd { enum class Kind { Dial, HangUp, Accept, Stop } kind; std::string uni, number; };
+    struct Stopping {};   // the engine was told to stop while a bring-up waited
+
+    // A bring-up the network deferred (a fresh-SA throttle) or refused: wait
+    // it out here, in process, on the recovery policy's schedule, then try
+    // the bring-up again. There is nothing to reconnect over meanwhile (the
+    // resume just found the stored SAs unusable, or there are none) and no
+    // recovery step runs from inside the wait — portPs_ says so to
+    // MaybeReconnect, whatever the attempt left in it — so a Dial
+    // meanwhile collapses at once, as in dev mode.
+    void DeferBringUp(std::string_view why, imsd::engine::RegRecovery::Failure f, long retryAfter) {
+        FreshAttemptFailed(f, retryAfter, std::format("bring-up deferred: {}", why));
+        portPs_ = 0;
+        registered_ = false;
+        EmitStatus(true);
+        WaitForPolicy();
+    }
+
+    // Wait until the policy's next step is due. A Dial/Accept/HangUp
+    // arriving meanwhile must not wait in the queue and run stale once
+    // registration succeeds; with no flow the call collapses to terminated
+    // at once (DevLoop's rule). A wait can be long (an hour on the
+    // schedule), so the REGISTER after one names the access network read
+    // after it, not before. False when the engine is stopping.
+    bool WaitForPolicy() {
+        bool waited = false;
+        while (!quit_.load() && recovery_.Next(Boot()).at > Boot()) {
+            waited = true;
+            if (auto cmd = PopCmd()) { HandleCmd(*cmd); MaybeDropCall(); continue; }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (waited && !quit_.load()) RefreshPani();
+        return !quit_.load();
+    }
+
+    void KeepHolds() { PersistHolds(recovery_.Holds(Boot()), local_); }
 
     // dev/session mode without a modem: process commands so the ABI answers,
     // but there is no SIP socket — a Dial collapses to terminated/error.
@@ -826,8 +984,6 @@ private:
     // config
     std::string pcscf_, dev_, outDir_, local_, ealgOffer_, mediaBin_;
     std::string sipPolicy_;              // SIP_TRANSPORT: auto | tcp | udp
-    int throttleWaitMin_ = ThrottleWaitMin;   // grows on consecutive throttles, resets on success
-    int throttleCount_ = 0;
     Transport transport_ = Transport::Tcp;   // the protected leg's transport in effect
     void SetTransport(Transport t) { transport_ = t; ctx_.transport = std::string(TransportName(t)); }
     std::vector<std::string> emergencyExtra_;
@@ -845,8 +1001,8 @@ private:
     ServerPorts server_;
     std::string subCallid_;   // live reg-event subscription dialog (empty: none)
     int portPs_ = 0;          // P-CSCF protected server port (reconnect target)
-    double nextReconnect_ = 0;
-    double reconnectDelay_ = 5;
+    imsd::engine::RegRecovery recovery_;   // what to do when the registration stops working
+    bool saReplaced_ = false;      // the running fresh attempt got past the SA setup (the old registration's SAs are gone)
 
     // call
     imsd::util::Rng rng_;
@@ -935,10 +1091,31 @@ private:
         // registered fresh for the same IMPI, a stale binding, …) is not
         // fatal: the fresh registration below replaces its SAs. Only a
         // failed FRESH registration is.
+        // The network's word holds at bring-up as it does in recovery: a
+        // hold from before this start is waited out before the resume (a
+        // refresh's Retry-After) or the fresh registration (a fresh attempt's
+        // schedule or Retry-After), and so is
+        // one the resume itself earns: a refusal's Retry-After.
         if (resume != "0") {
-            try { if (TryResume()) return; }
-            catch (const std::exception& e) { Log(std::format("resume failed: {} — registering fresh", e.what())); CloseFlowAfterWait(); }
+            if (!WaitForPolicy()) throw Stopping{};
+            // a registration the network wrote off before this start (the
+            // holds carry it) is not resumed: the wait above was the fresh one
+            try { if (recovery_.Reconnectable() && TryResume()) return; }
+            catch (const RefusedError& e) {
+                Log(std::format("resume failed: {} — the next registration is a fresh one", e.what()));
+                CloseFlowAfterWait();
+                if (e.retryAfter > 0) recovery_.OnReconnectFailure(Boot(), imsd::engine::RegRecovery::Failure::Refused, e.retryAfter, e.status);
+            }
+            catch (const std::exception& e) { Log(std::format("resume failed: {} — the next registration is a fresh one", e.what())); CloseFlowAfterWait(); }
         }
+        // a resume that failed found the stored SAs unusable (and after a
+        // reboot there are none): nothing to reconnect over while a deferred
+        // fresh registration waits
+        recovery_.OldGone();
+        portPs_ = 0;
+        KeepHolds();
+        if (recovery_.Next(Boot()).at > Boot()) Log(std::format("the network's hold stands; {}", NextStep()));
+        if (!WaitForPolicy()) throw Stopping{};
         FreshRegister();
     }
 
@@ -1005,14 +1182,24 @@ private:
             Log(std::format("binding: {}", ct));
     }
 
+    // A fresh registration. The attempt mints its own Contact user-part into
+    // ctx_ for its REGISTERs; on any failure the stored binding's comes back,
+    // so requests over the existing SA meanwhile (a reconnect, a refresh)
+    // carry the binding the network knows. reg_ takes the new one on the 200.
     void FreshRegister() {
+        saReplaced_ = false;
+        try { FreshRegisterAttempt(); }
+        catch (...) { ctx_.contactUser = reg_.contactUser; throw; }
+    }
+
+    void FreshRegisterAttempt() {
         Log("FRESH registration");
         // Oracle diff (journal/ims.md s53): stock's Contact user-part is a
         // fresh UUID per registration, not the IMSI. Minted before reg1 so
         // both REGISTERs and the stored binding carry the same URI.
-        reg_.contactUser = imsd::util::Uuid4(rng_);
-        ctx_.contactUser = reg_.contactUser;
-        Log(std::format("contact user-part: {}", reg_.contactUser));
+        std::string contactUser = imsd::util::Uuid4(rng_);
+        ctx_.contactUser = contactUser;
+        Log(std::format("contact user-part: {}", contactUser));
         std::string callidReg = std::format("{}@{}", rng_.Token(16), local_);
         std::string ftag = rng_.Token(8);
         std::uint32_t spiUc = rng_.UInt(0x10000, 0xFFFFFFF);
@@ -1031,9 +1218,11 @@ private:
         sockaddr_storage pa; socklen_t pl = MakeAddr(pcscf_, pcscfPort_, pa);
         sendto(us, reg1.data(), reg1.size(), 0, reinterpret_cast<sockaddr*>(&pa), pl);
         std::string resp = AwaitInitialFinal(us, callidReg);
-        if (imsd::sip::Status(resp) != 401) {
+        if (auto st1 = imsd::sip::Status(resp); st1 != 401) {
             DumpRaw("imsd-register-fail.raw", resp);
-            throw std::runtime_error(std::format("expected 401, got {}", imsd::sip::RefusalSummary(resp)));
+            std::string what = std::format("expected 401, got {}", imsd::sip::RefusalSummary(resp));
+            if (st1 && *st1 >= 300) throw RefusedError(what, *st1, imsd::sip::RetryAfter(resp).value_or(0));
+            throw std::runtime_error(what);
         }
         auto nonceB64 = QuotedAfter(resp, "nonce=\"");
         if (!nonceB64) throw std::runtime_error("no nonce in 401");
@@ -1088,6 +1277,7 @@ private:
         sp.portUc = PortUc; sp.portUs = PortUs; sp.portPs = portPs; sp.portPc = portPc;
         sp.alg = alg;
         sp.ealg = ealg;
+        saReplaced_ = true;   // from here on the old registration's SAs are gone
         for (auto& cmd : imsd::ipsec::BuildSetupCommands(sp)) {
             int rc = RunCmd(cmd);
             if (rc != 0) Log(std::format("{} -> rc {}", RedactKeys(cmd), rc));
@@ -1120,7 +1310,7 @@ private:
                 // pair (the SA setup flushes this one), same ports.
                 Log("protected TCP connect unanswered; registering fresh over UDP");
                 SetTransport(Transport::Udp);
-                FreshRegister();
+                FreshRegisterAttempt();
                 return;
             }
             throw std::runtime_error(std::format("protected {} connect failed", TransportName(transport_)));
@@ -1135,9 +1325,10 @@ private:
         std::string ok = AwaitFinal(callidReg, 2, "protected REGISTER");
         if (auto st = imsd::sip::Status(ok); st != 200) {
             DumpRaw("imsd-register-fail.raw", ok);
-            throw std::runtime_error(std::format("REGISTER refused: {}", imsd::sip::RefusalSummary(ok)));
+            throw RefusedError(std::format("REGISTER refused: {}", imsd::sip::RefusalSummary(ok)), *st, imsd::sip::RetryAfter(ok).value_or(0));
         }
         reg_.callid = callidReg; reg_.ftag = ftag; reg_.cseq = 2;
+        reg_.contactUser = contactUser;
         reg_.spiUc = spiUc; reg_.spiUs = spiUs;
         reg_.expiry = imsd::sip::GrantedExpires(ok).value_or(0);
         DumpRaw("imsd-register-200.raw", ok);
@@ -1255,7 +1446,7 @@ private:
                 continue;
             }
             DumpRaw("imsd-register-fail.raw", m);
-            throw std::runtime_error(std::format("re-REGISTER refused: {}", imsd::sip::RefusalSummary(m)));
+            throw RefusedError(std::format("re-REGISTER refused: {}", imsd::sip::RefusalSummary(m)), *st, imsd::sip::RetryAfter(m).value_or(0));
         }
     }
 
@@ -1344,13 +1535,19 @@ private:
             if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
             PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
             Log(std::format("keepalive re-REGISTER ok (cseq {})", used));
-            SubscribeRegEvent();
-            if (!registered_) { registered_ = true; EmitStatus(true); }
-            else EmitStatus(false);
+            OnRegistered();
+        } catch (const RefusedError& e) {
+            // The network refused the refresh: the recovery policy counts it
+            // (a second refusal means a fresh registration) and the flow is
+            // dropped so the reconnect step retries the refresh after the
+            // wait (Retry-After when given).
+            Log(std::format("keepalive re-REGISTER failed: {}", e.what()));
+            CloseFlowAfterWait();
+            RecoveryFailed(imsd::engine::RegRecovery::Failure::Refused, e.retryAfter, "keepalive refresh refused", e.status);
         } catch (const std::exception& e) {
-            // Whatever failed (dead flow, silent P-CSCF, error status), the
-            // recovery is the same as a daemon restart: drop the flow and
-            // let MaybeReconnect re-run the connect + true-refresh sequence.
+            // A dead flow or a silent P-CSCF: the recovery is the same as a
+            // daemon restart's — drop the flow and let MaybeReconnect re-run
+            // the connect + true-refresh sequence at once.
             Log(std::format("keepalive re-REGISTER failed: {}", e.what()));
             CloseFlowAfterWait();
         }
@@ -1362,39 +1559,165 @@ private:
     // registration stay valid — a CSFB excursion resets it, the P-CSCF drops
     // idle flows — which is exactly the state a daemon restart resumes from
     // (s51: "restart-to-recover"). Do what the restart does, in place:
-    // reconnect the TCP leg over the existing SA and true-refresh. Backoff
-    // doubles 5 s → 5 min so a dead PDN doesn't turn this into a hot loop.
+    // reconnect the TCP leg over the existing SA and true-refresh. When that
+    // keeps failing — the network refuses the refresh, or nothing answers —
+    // do the rest of what a restart does: register fresh. RegRecovery holds
+    // the thresholds and the pacing (a dead PDN must not turn this into a
+    // hot loop; a carrier that refuses fresh SAs must not be hammered).
     void MaybeReconnect() {
         if (call_ || sip_.Alive() || portPs_ == 0 || reg_.callid.empty()) return;
-        if (Mono() < nextReconnect_) return;
+        auto plan = recovery_.Next(Boot());
+        if (plan.at > Boot()) return;
+        if (plan.step == imsd::engine::RegRecovery::Step::Fresh) FreshRecover();
+        else ReconnectCycle();
+    }
+
+    // The policy's next step, as the journal line: what, and when.
+    std::string NextStep() {
+        auto plan = recovery_.Next(Boot());
+        double in = plan.at - Boot();
+        std::string what = plan.step == imsd::engine::RegRecovery::Step::Fresh ? "fresh registration" : "reconnect over the existing SA";
+        if (in <= 0) return std::format("next: {} now", what);
+        if (in >= 60) return std::format("next: {} in {:.0f} min", what, in / 60);
+        return std::format("next: {} in {:.0f} s", what, in);
+    }
+
+    // ModemManager's word on the phone's own service, as ims-pdn-up.sh reads
+    // it (`mmcli -K`). False only when the modem clearly has none: a state
+    // short of registered, or packet service detached. Anything else —
+    // ModemManager not answering, a state or packet-service value this
+    // code does not know — counts as service: the network's silence, not
+    // the phone's, is the default.
+    bool PacketServiceUp() {
+        auto r = RunCapture({"mmcli", "-m", "any", "-K"});
+        auto field = [&](std::string_view key) -> std::string {
+            std::size_t at = r.out.find(key);
+            if (at == std::string::npos) return {};
+            std::size_t end = r.out.find('\n', at);
+            if (end == std::string::npos) end = r.out.size();
+            std::size_t colon = r.out.find(':', at);
+            if (colon == std::string::npos || colon > end) return {};
+            std::string v = r.out.substr(colon + 1, end - colon - 1);
+            while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+            while (!v.empty() && (v.back() == ' ' || v.back() == '\r')) v.pop_back();
+            return v;
+        };
+        std::string state = field("modem.generic.state "), ps = field("modem.3gpp.packet-service-state ");
+        for (const char* down : {"failed", "initializing", "locked", "disabled", "disabling", "enabling", "enabled", "searching"})
+            if (state == down) return false;
+        return ps != "detached";
+    }
+
+    // A cycle that failed while the modem reports no packet service is the
+    // phone's silence, not the network's: not counted, retried on the
+    // local-refusal pace like a connect() the kernel refused — a radio gap
+    // across a refresh must not escalate to a fresh registration, which KPN
+    // refuses while the old one is live, and drops it for.
+    void CoverageGap(std::string_view what) {
+        if (registered_) { registered_ = false; EmitStatus(true); }
+        recovery_.OnLocalRefusal(Boot());
+        Log(std::format("{} while the modem reports no packet service: not counted; {}", what, NextStep()));
+    }
+
+    void ReconnectCycle() {
+        using F = imsd::engine::RegRecovery::Failure;
         Log("client flow dead; reconnecting");
         sip_.Close();
-        bool ok = sip_.Connect(local_, PortUc, pcscf_, portPs_, transport_, /*tries=*/2);
-        if (ok) {
-            try {
-                RefreshPani();
-                auto [msg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1, reg_.spiUc, reg_.spiUs);
-                reg_.cseq = used;
-                if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
-                UpdateRouteAndPpi(msg);
-                LogBindings(msg);
-                PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
-                Log("reconnected + re-registered");
-                SubscribeRegEvent();
-                if (!registered_) { registered_ = true; EmitStatus(true); }
-                else EmitStatus(false);
-                lastRefresh_ = Mono(); lastKa_ = Mono();
-                reconnectDelay_ = 5;
-                nextReconnect_ = 0;
+        if (!sip_.Connect(local_, PortUc, pcscf_, portPs_, transport_, /*tries=*/2)) {
+            if (sip_.LastConnectLocal()) {
+                if (registered_) { registered_ = false; EmitStatus(true); }
+                recovery_.OnLocalRefusal(Boot());
                 return;
-            } catch (const std::exception& e) {
-                Log(std::format("reconnect re-REGISTER failed: {}", e.what()));
-                CloseFlowAfterWait();
             }
+            if (!PacketServiceUp()) { CoverageGap("P-CSCF silent"); return; }
+            RecoveryFailed(F::Silent, 0, "P-CSCF silent");
+            return;
         }
+        try {
+            RefreshPani();
+            auto [msg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1, reg_.spiUc, reg_.spiUs);
+            reg_.cseq = used;
+            if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
+            UpdateRouteAndPpi(msg);
+            LogBindings(msg);
+            PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
+            Log("reconnected + re-registered");
+            OnRegistered();
+        } catch (const RefusedError& e) {
+            Log(std::format("reconnect re-REGISTER failed: {}", e.what()));
+            CloseFlowAfterWait();
+            RecoveryFailed(F::Refused, e.retryAfter, "refresh refused", e.status);
+        } catch (const std::exception& e) {
+            Log(std::format("reconnect re-REGISTER failed: {}", e.what()));
+            CloseFlowAfterWait();
+            if (!PacketServiceUp()) { CoverageGap("refresh unanswered"); return; }
+            RecoveryFailed(F::Silent, 0, "refresh unanswered");
+        }
+    }
+
+    // A failed reconnect + refresh cycle: the status goes unregistered, the
+    // policy decides whether the next step is another cycle or a fresh
+    // registration, and when.
+    void RecoveryFailed(imsd::engine::RegRecovery::Failure f, long retryAfter, std::string_view what, int status = 0) {
         if (registered_) { registered_ = false; EmitStatus(true); }
-        nextReconnect_ = Mono() + reconnectDelay_;
-        reconnectDelay_ = std::min(reconnectDelay_ * 2, 300.0);
+        bool wasReconnectable = recovery_.Reconnectable();
+        recovery_.OnReconnectFailure(Boot(), f, retryAfter, status);
+        KeepHolds();
+        Log(std::format("{} ({} refused, {} silent cycles){}; {}", what, recovery_.refusals, recovery_.silentCycles,
+                        wasReconnectable && !recovery_.Reconnectable() ? std::format(" — the old registration is gone ({})", status) : "", NextStep()));
+    }
+
+    // The rest of what a restart does, in place: a new Call-ID, a new
+    // challenge, a new SA pair (FreshRegister flushes the old ones), then
+    // the post-registration steps. A refused or throttled attempt waits on
+    // the throttle schedule (a wait no Dial cuts short — on KPN a refused
+    // attempt costs the old registration) and a silent one on the
+    // short backoff. The attempt's flow is closed whichever way it failed;
+    // past the SA setup the old registration's SAs are gone with it, so
+    // nothing is retried until the next fresh attempt.
+    void FreshRecover() {
+        using F = imsd::engine::RegRecovery::Failure;
+        Log(std::format("registering fresh (recovery attempt {})", recovery_.freshAttempts + 1));
+        sip_.Close();
+        saReplaced_ = false;   // this attempt's, whatever fails first
+        subCallid_.clear();
+        try {
+            RefreshPani();
+            FreshRegister();
+            OnRegistered();
+            Log("recovered by a fresh registration");
+        } catch (const ThrottledError& e) {
+            FreshAttemptFailed(F::Throttled, 0, std::format("fresh registration deferred: {}", e.what()));
+        } catch (const RefusedError& e) {
+            FreshAttemptFailed(F::Refused, e.retryAfter, std::format("fresh registration refused: {}", e.what()));
+        } catch (const std::exception& e) {
+            FreshAttemptFailed(F::Silent, 0, std::format("fresh registration failed: {}", e.what()));
+        }
+    }
+
+    // After a failed fresh attempt, in recovery or at bring-up: the
+    // attempt's flow closed (a refused protected REGISTER leaves it open),
+    // the policy told, and its next step logged.
+    void FreshAttemptFailed(imsd::engine::RegRecovery::Failure f, long retryAfter, const std::string& what) {
+        CloseFlowAfterWait();
+        bool wasReconnectable = recovery_.Reconnectable();
+        recovery_.OnFreshFailure(Boot(), f, retryAfter, saReplaced_);
+        KeepHolds();
+        Log(std::format("{}{}; {}", what, wasReconnectable && !recovery_.Reconnectable() ? " — the old registration is gone" : "", NextStep()));
+    }
+
+    // After a registration succeeds — bring-up, a keepalive refresh, a
+    // reconnect + refresh, or a fresh recovery: the status (a signal only
+    // when it changes), the timers, the recovery policy, the reg-event
+    // subscription.
+    void OnRegistered() {
+        recovery_.OnSuccess();
+        KeepHolds();
+        bool was = registered_;
+        registered_ = true;
+        EmitStatus(!was);
+        lastRefresh_ = Mono(); lastKa_ = Mono();
+        SubscribeRegEvent();
     }
 
     // (Re-)subscribe to the reg event package (TS 24.229 5.1.1.3): a fresh
@@ -1436,12 +1759,14 @@ private:
             bool emergency = imsd::msg::IsEmergency(c.number, emergencyExtra_);
             if (!ClearForDial(c, emergency)) return;
             // a dead client flow fails the INVITE instantly — give the
-            // reconnect path one immediate shot first (user action beats
-            // the backoff timer). The shot's REGISTER wait dispatches
+            // recovery path one immediate shot first: user action cuts the
+            // backoff short, never a wait the network imposed (a
+            // Retry-After, the schedule after a refused or throttled fresh
+            // attempt — the policy keeps those). The shot's REGISTER wait dispatches
             // requests, so an incoming call may have arrived under it: the
             // same rule again.
             if (!sip_.Alive()) {
-                nextReconnect_ = 0; MaybeReconnect();
+                recovery_.OnDial(); MaybeReconnect();
                 if (!ClearForDial(c, emergency)) return;
             }
             RefreshPani();

@@ -273,6 +273,7 @@ PCSCF=2001:db8::105
 | `LOCAL` | *(auto)* | UE address; default = the global IPv6 on `DEV` |
 | `USER_AGENT` | `imsd/<version>` | REGISTER User-Agent. Some networks fingerprint UAs; setting your device's stock build string reproduces the stock modem's registration exactly. Empty omits the header |
 | `STATE_FILE` | `/var/lib/imsd/imsreg.state` (root) / `$XDG_STATE_HOME/imsd/imsreg.state` | persisted registration context for warm resume |
+| `HOLDS_FILE` | `/run/imsd.holds` (root) / `$XDG_RUNTIME_DIR/imsd.holds` (`/tmp/imsd.holds` without a runtime dir) | the waits the network imposed (a `Retry-After`, the refusal schedule) and where that schedule stands, kept across a restart of imsd for the address they were set on — not across a reboot; `/dev/null` switches the file off (only a regular file is ever removed; anything else is emptied) |
 | `RESUME` | `auto` | `0` forces a fresh registration (ignores a warm SA) |
 | `REFRESH_INTERVAL` | *(auto)* | keepalive re-REGISTER period in s; default = half the granted expiry, clamped to [120, 1800] |
 | `EALG` | `aes-cbc` | offered ESP cipher (`aes-cbc`, `des-ede3-cbc`, `null`). From the 401's `Security-Server` list imsd selects the highest-preference `ipsec-3gpp` mechanism that matches this offer (RFC 3329 §2.3.1) and takes the SPIs/ports from the entry carrying them (some cores list every mechanism they support and put the SPIs on the one they applied); when no entry matches, the P-CSCF's SPI-carrying entry is installed as listed (`hmac-md5-96`, an absent `ealg` = null) and the journal says so. The line, the selection and the SA parameters are logged at every fresh registration |
@@ -288,6 +289,35 @@ PCSCF=2001:db8::105
 The protected client/server ports are fixed at 45061/45062
 (`imsd::util::kPortUc`/`kPortUs`) — changing them in source also requires
 updating the firewall rules `ims-pdn-up.sh` installs.
+
+**When the registration stops working** (the refresh is refused, or the
+protected flow dies and nothing answers the reconnect) imsd does in place
+what a restart does: it reconnects through the existing SA and refreshes;
+after two refused refreshes or two unanswered reconnect cycles (such a
+cycle is not counted while the modem reports no packet service) it
+registers fresh (new Call-ID, new challenge, new SA pair). Reconnects back
+off 5 s → 5 min; a refused or throttled fresh attempt waits on the throttle
+schedule (21 min, growing to 60), a silent one 30 s → 10 min, and a
+network `Retry-After` is honoured, up to an hour (the schedule's longest wait): a longer
+one is cut to it and the refusal heard again then. While a fresh registration is deferred, the existing SA is
+still retried on the reconnect backoff, unless the old registration is known gone: a `403` once a
+fresh registration is due, or an attempt that got past the SA setup. A `Dial`
+that reaches imsd while it is unregistered brings the next recovery step
+forward (the reconnect, or the fresh attempt once it is due), never a wait
+the network imposed (a `Retry-After`, or the schedule after a
+refused or throttled fresh attempt); imsd-ofonod refuses a `Dial` then, and
+imsd-dialerd lists no modem. A bring-up the network deferred waits the same
+schedule out with nothing to reconnect over (the resume just found the
+stored SAs unusable), then tries again. The network's holds outlive a
+restart of imsd: they are kept in
+`/run/imsd.holds` for the address they were set on, with the schedule's place
+(a restart does not start it over at 21 min), and waited out at the next
+start, before the resume (a refresh's `Retry-After`) or before the fresh
+registration (a fresh attempt's schedule or `Retry-After`); a reboot or
+another address starts clean.
+The journal says which (`…; next: fresh registration in N s`, `registering
+fresh (recovery attempt N)`, `fresh registration deferred/refused/failed:
+…`, `bring-up deferred: …`).
 
 ### imsd-media (per-call, set through imsd's environment)
 

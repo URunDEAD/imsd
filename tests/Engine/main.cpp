@@ -11,7 +11,11 @@
 // reject -> 486, remote CANCEL -> 200+487, unusable offer -> 488 (naming
 // what was offered), a landline gateway's G.711-only and AMR-NB offers
 // ring and are answered at the offer's own payload types, ring timeout ->
-// 480, BYE both ways. Pure reducer, no I/O.
+// 480, BYE both ways. Then RegRecovery, the registration recovery policy:
+// the refusal and silence thresholds, local refusals, the reconnect and
+// fresh backoffs, the throttle schedule, Retry-After, which waits a Dial
+// may cut short, when the old registration counts as gone, and the holds
+// a restart takes over (Holds/Restore). Pure reducers, no I/O.
 import std;
 import Imsd;
 
@@ -854,6 +858,189 @@ int main() {
         Check(can && !can->text.contains("001010123456789@ims"), "CANCEL carries no IMSI");
     }
 
+    // ---- RegRecovery: when a registration stops working after bring-up.
+    // The clock is ours: seconds, starting at 1000.
+    {
+        using F = RegRecovery::Failure;
+        using S = RegRecovery::Step;
+        auto reconnectAt = [](const RegRecovery& r, double now, double at) { auto p = r.Next(now); return p.step == S::Reconnect && p.at == at; };
+        auto freshAt = [](const RegRecovery& r, double now, double at) { auto p = r.Next(now); return p.step == S::Fresh && p.at == at; };
+        RegRecovery r;
+        Check(!r.Fresh() && r.Reconnectable() && reconnectAt(r, 1000, 0), "the first step is a reconnect, at once");
+        r.OnLocalRefusal(1000);
+        Check(r.refusals == 0 && r.silentCycles == 0 && r.reconnectDelay == 5 && reconnectAt(r, 1000, 1005), "a local connect refusal: retried in 5 s, not counted, backoff untouched");
+        // O2 2026-09-24, 09:29: the keepalive refresh refused (503), then a
+        // reconnect's refresh refused again -> fresh, not a third refresh
+        r.OnReconnectFailure(1000, F::Refused);
+        Check(!r.Fresh() && reconnectAt(r, 1000, 1005), "first refusal: reconnect after 5 s, not yet an escalation");
+        r.OnReconnectFailure(1005, F::Refused);
+        Check(r.Fresh() && r.refusals == 2 && freshAt(r, 1005, 1015), "second refusal: escalated, the fresh attempt after the doubled backoff");
+        Check(r.Reconnectable(), "…and the old SA is still there");
+        r.OnSuccess();
+        Check(!r.Fresh() && r.refusals == 0 && r.reconnectDelay == 5, "success resets the policy");
+        // Retry-After is the network's word: it holds every attempt for its
+        // own length, next to the backoff, and a Dial cuts only the backoff
+        r.OnReconnectFailure(1000, F::Refused, 90);
+        Check(reconnectAt(r, 1000, 1090), "Retry-After 90 beats the 5-s backoff");
+        r.OnDial();
+        Check(reconnectAt(r, 1000, 1090), "…and a Dial does not cut it");
+        r.OnReconnectFailure(1090, F::Refused, 3);
+        Check(r.Fresh() && freshAt(r, 1090, 1100), "a Retry-After shorter than the backoff does not shorten it");
+        r.OnDial();
+        Check(freshAt(r, 1090, 1093), "…but a Dial cuts the backoff down to it, no further");
+        r.OnSuccess();
+        // a 403 once a fresh registration is due: the old registration is gone
+        {
+            RegRecovery k;
+            k.OnReconnectFailure(1000, F::Refused, 0, 403);
+            Check(!k.Fresh() && k.Reconnectable(), "a first 403 is a refusal like the others");
+            k.OnReconnectFailure(1005, F::Refused, 0, 403);
+            Check(k.Fresh() && !k.Reconnectable() && freshAt(k, 1005, 1015), "a 403 once fresh is due: gone, the fresh attempt after the backoff");
+            k.OnSuccess();
+            Check(k.Reconnectable(), "success forgets it");
+        }
+        // O2 10:43: the flow killed 8 s after the 200, every SYN unanswered
+        r.OnReconnectFailure(1000, F::Silent);
+        Check(!r.Fresh() && reconnectAt(r, 1000, 1005), "first silent cycle: retry in 5 s");
+        r.OnReconnectFailure(1005, F::Silent);
+        Check(r.Fresh() && r.silentCycles == 2, "two silent cycles escalate");
+        // a mix: one refusal + one silence keeps reconnecting (neither
+        // threshold reached)
+        RegRecovery m;
+        m.OnReconnectFailure(1000, F::Refused);
+        m.OnReconnectFailure(1000, F::Silent);
+        Check(!m.Fresh(), "one refusal + one silence: still reconnecting");
+        m.OnReconnectFailure(1000, F::Silent);
+        Check(m.Fresh(), "…until a threshold is reached");
+        // the reconnect backoff caps at 5 min
+        RegRecovery b;
+        for (int i = 0; i < 10; i++) b.OnReconnectFailure(1000, F::Silent);
+        Check(b.reconnectDelay == 300 && b.Next(1000).at == 1300, "reconnect backoff caps at 300 s");
+        // fresh attempts: silence backs off 30 s -> 10 min (a Dial may cut
+        // it); a refusal or a throttle holds on the throttle schedule (21
+        // min growing to 60), the network's word, and the old SA is
+        // reconnected meanwhile
+        RegRecovery f;
+        f.OldGone();
+        Check(f.Fresh() && !f.Reconnectable() && freshAt(f, 1000, 0), "the old registration gone: fresh now, nothing to reconnect to");
+        f.OnFreshFailure(1000, F::Silent);
+        Check(freshAt(f, 1000, 1030), "silent fresh attempt: 30 s");
+        f.OnDial();
+        Check(freshAt(f, 1000, 0), "…which a Dial cuts");
+        f.OnFreshFailure(1030, F::Silent);
+        Check(freshAt(f, 1030, 1090), "…then 60 s");
+        double last = 0;
+        for (int i = 0; i < 8; i++) { f.OnFreshFailure(2000, F::Silent); last = f.Next(2000).at - 2000; }
+        Check(last == 600 && f.freshAttempts == 10, "silent fresh backoff caps at 600 s; attempts counted");
+        RegRecovery g;
+        g.OnReconnectFailure(1000, F::Refused); g.OnReconnectFailure(1000, F::Refused);   // escalated, backoff 5 then 10
+        g.OnFreshFailure(1010, F::Refused);
+        Check(g.Reconnectable() && reconnectAt(g, 1010, 1030) && g.freshHoldUntil == 1010 + 21 * 60, "refused fresh attempt: the old SA is reconnected after the backoff, the next fresh attempt held 21 min");
+        Check(freshAt(g, 1010 + 21 * 60, 1010 + 21 * 60), "…and runs once the hold ends");
+        g.OnDial();
+        Check(g.Next(1010).step == S::Reconnect && g.Next(1010).at <= 1010, "a Dial meanwhile: the reconnect at once, never the held fresh attempt");
+        g.OnFreshFailure(2000, F::Throttled);
+        Check(g.freshHoldUntil == 2000 + 31 * 60, "throttled next: 31 min (×1.5)");
+        g.OnFreshFailure(3000, F::Refused);
+        Check(g.freshHoldUntil == 3000 + 46 * 60, "then 46 min");
+        g.OnFreshFailure(4000, F::Refused);
+        Check(g.freshHoldUntil == 4000 + 60 * 60, "capped at 60 min");
+        g.OnFreshFailure(5000, F::Refused);
+        Check(g.freshHoldUntil == 5000 + 60 * 60, "stays at 60 min");
+        g.OnFreshFailure(6000, F::Refused, 7200);
+        Check(g.freshHoldUntil == 6000 + 3600, "a Retry-After beyond an hour is cut to the hour, the schedule's own ceiling");
+        RegRecovery ra;
+        ra.OnFreshFailure(1000, F::Refused, 2700);
+        Check(ra.freshHoldUntil == 3700, "a Retry-After longer than the schedule's wait holds for its own length");
+        ra.OnFreshFailure(5000, F::Refused, 86400);
+        Check(ra.freshHoldUntil == 5000 + 3600, "…a day's for an hour: the refusal is heard again then");
+        RegRecovery rb;
+        rb.OnReconnectFailure(1000, F::Refused, 86400);
+        Check(reconnectAt(rb, 1000, 1000 + 3600), "a refresh's Retry-After is cut to the hour the same");
+        RegRecovery h;
+        h.OnFreshFailure(1000, F::Refused, 60);
+        Check(h.freshHoldUntil == 1060, "a refused fresh attempt with Retry-After 60 waits 60 s, not the schedule");
+        h.OnFreshFailure(1000, F::Refused, 5);
+        Check(h.freshHoldUntil == 1030, "…but never under the 30-s floor");
+        Check(h.throttleMinutes == 46, "the schedule still advances underneath (21 -> 31 -> 46)");
+        h.OnFreshFailure(1000, F::Silent, 600);
+        Check(h.freshHoldUntil == 1030 && h.Next(1000).at == 1030, "Retry-After is a refusal's word; silence keeps its own backoff");
+        Check(g.Fresh(), "a failed fresh attempt stays on the fresh step");
+        g.OnSuccess();
+        Check(!g.Fresh() && g.throttleMinutes == 21 && g.freshDelay == 30, "success resets the fresh schedule too");
+        // an attempt that got past the SA setup took the old SAs with it
+        {
+            RegRecovery s;
+            s.OnFreshFailure(1000, F::Silent, 0, /*saReplaced=*/true);
+            Check(!s.Reconnectable() && freshAt(s, 1000, 1030), "no reply past the SA setup: the old registration is gone, the next fresh attempt on the short backoff");
+            RegRecovery t;
+            t.OnFreshFailure(1000, F::Refused, 0, /*saReplaced=*/true);
+            Check(!t.Reconnectable() && freshAt(t, 1000, 1000 + 21 * 60), "refused past the SA setup: gone, and on the schedule");
+        }
+        // the network's holds outlive the process
+        {
+            RegRecovery a;
+            a.OnReconnectFailure(1000, F::Refused); a.OnReconnectFailure(1000, F::Refused);
+            a.OnFreshFailure(1010, F::Throttled);
+            auto h = a.Holds(1100);
+            Check(h.Any() && h.hold == 0 && h.freshHold == 1010 + 21 * 60 - 1100 && h.throttleMinutes == 31, "holds: the seconds still to run and the schedule's place");
+            RegRecovery b;
+            b.Restore(50, h);
+            Check(reconnectAt(b, 50, 0) && b.throttleMinutes == 31, "restored fresh hold: the resume (a reconnect) is free at once");
+            b.OldGone();
+            Check(freshAt(b, 50, 50 + h.freshHold), "…and the fresh step waits what was left of it");
+            b.OnDial();
+            Check(freshAt(b, 50, 50 + h.freshHold), "…which a Dial does not cut");
+            RegRecovery c;
+            c.OnReconnectFailure(1000, F::Refused, 600);
+            RegRecovery d;
+            d.Restore(10, c.Holds(1200));
+            Check(reconnectAt(d, 10, 10 + 400), "restored Retry-After: no step before it ends");
+            d.Restore(20, RegRecovery::Held{30, 0, 21});
+            Check(reconnectAt(d, 20, 10 + 400), "a restore never shortens a hold");
+            Check(!RegRecovery{}.Holds(5).Any(), "no hold, nothing to keep");
+            auto k = a.Holds(1010 + 21 * 60 + 5);
+            Check(k.Any() && k.hold == 0 && k.freshHold == 0 && k.throttleMinutes == 31, "the hold run out, the schedule's place is still kept");
+            RegRecovery e;
+            e.Restore(10, k);
+            Check(reconnectAt(e, 10, 0) && e.throttleMinutes == 31, "…and a restart takes it over: no wait, the next refused or throttled fresh attempt on the advanced schedule");
+            e.OldGone(); e.OnFreshFailure(20, F::Throttled);
+            Check(freshAt(e, 20, 20 + 31 * 60), "…31 min, not 21");
+            RegRecovery g;
+            g.OnReconnectFailure(1000, F::Refused); g.OnReconnectFailure(1000, F::Refused, 0, 403);
+            auto hg = g.Holds(1100);
+            Check(hg.Any() && hg.oldGone, "a 403 once fresh is due: the holds carry that the old registration is gone");
+            RegRecovery h2;
+            h2.Restore(50, hg);
+            Check(!h2.Reconnectable() && h2.Fresh() && freshAt(h2, 50, 0), "…and the restart does not reconnect over its SAs: fresh at once");
+            RegRecovery i;
+            i.OnFreshFailure(1000, F::Throttled, 0, true);
+            auto hi = i.Holds(1100);
+            RegRecovery j;
+            j.Restore(50, hi);
+            Check(hi.oldGone && !j.Reconnectable() && freshAt(j, 50, 50 + hi.freshHold), "an attempt past the SA setup: gone travels with the hold, the restart waits it out without resuming");
+            RegRecovery m;
+            m.OldGone();
+            Check(m.Holds(5).Any() && m.Holds(5).oldGone && m.Holds(5).freshHold == 0, "gone with no hold left is still kept");
+            RegRecovery n;
+            n.Restore(5, m.Holds(5));
+            Check(!n.Reconnectable() && freshAt(n, 5, 0), "…so the next start registers fresh at once instead of resuming");
+            Check(!RegRecovery::Held{0, 0, 21, false}.Any(), "nothing gone, nothing held: nothing to keep");
+            RegRecovery x;
+            x.Restore(2000, RegRecovery::Held{86400, 86400, 21});
+            Check(x.holdUntil == 2000 + 3600 && x.freshHoldUntil == 2000 + 3600, "a restored hold is cut to the hour like the Retry-After it came from");
+        }
+        // bring-up: a resume that failed leaves nothing to reconnect over
+        {
+            RegRecovery u;
+            u.OldGone();
+            u.OnFreshFailure(1000, F::Throttled);
+            Check(!u.Reconnectable() && freshAt(u, 1000, 1000 + 21 * 60), "a throttled bring-up: the next fresh attempt in 21 min, nothing meanwhile");
+            u.OnDial();
+            Check(freshAt(u, 1000, 1000 + 21 * 60), "…a Dial changes nothing");
+        }
+    }
+
     if (Failures == 0) std::println("Engine: all tests passed");
-    return Failures;
+    return Failures != 0;   // not the count: an exit status keeps 8 bits, and this suite has more checks than that
 }

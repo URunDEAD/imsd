@@ -3,7 +3,9 @@
 
 // lint-disable-file fixed-width-types
 /*
-Imsd:Engine — the call state machine as a pure reducer.
+Imsd:Engine — the daemon's decisions as pure reducers: the call state
+machine (CallMachine) and the registration recovery policy (RegRecovery,
+its own section below).
 
 A CallMachine owns one call's SIP dialog, outgoing or incoming. It never
 touches a socket, a clock, or a subprocess: each event (the INVITE's
@@ -51,6 +53,181 @@ export namespace imsd::engine {
     inline std::string_view DirectionStr(Direction d) {
         return d == Direction::Incoming ? "incoming" : "outgoing";
     }
+
+    // ---- registration recovery policy ---------------------------------
+    //
+    // What the daemon does when the registration stops working after
+    // bring-up, as a pure reducer: the shell supplies the clock and the
+    // network, this decides the next step and how long to wait for it. Two
+    // kinds of failure reach it. A REFUSAL: the network answered a refresh
+    // (or a fresh REGISTER) with a final other than 200/401. SILENCE: the
+    // flow died and reconnecting through the SA, or the refresh over it,
+    // got no answer. Neither is retried for long on the same registration.
+    // TS 24.229 5.1.1.4.1 has the UE perform an initial registration after
+    // a 408, 500, 504 or 403 on a re-REGISTER (5.1.1.2.1: not before a
+    // Retry-After has passed), and RFC 5626 has it register again when its
+    // flow cannot be recovered. imsd does so after any refusal: the 503s
+    // below are not in that list. Before this reducer the daemon looped
+    // reconnect + re-REGISTER on the same Call-ID and SA forever — O2 UK,
+    // 2026-09-24: 21 × 503 over 70 min, then 33 unanswered reconnect
+    // cycles over 2 h 39 min, each ended only by a manual restart whose
+    // fresh registration the network accepted within two seconds (ims
+    // ledger F16).
+    //
+    // Pacing. Reconnect cycles back off 5 s → 5 min. A refusal escalates
+    // to a fresh registration after two (one 503 may be a momentary
+    // hiccup a retried refresh clears), silence after two reconnect cycles
+    // that end without an answer — a TCP connect series whose last attempt
+    // was not a local refusal, a bind() the kernel refused, or a refresh
+    // that fails short of a refusal: unanswered, an unusable challenge, a
+    // failed send (the resume at start gives up after two unanswered
+    // connects).
+    // A fresh registration is the expensive step: an AKA run, a
+    // new SA pair, and on KPN a refusal (spi-s=0) while the registration on
+    // the address is live, which costs that registration. So a refused or
+    // throttled fresh attempt
+    // waits on the throttle schedule (21 min, growing ×1.5 to 60) and a
+    // silent one backs off 30 s → 10 min. Retry-After (RFC 3261 20.33)
+    // always wins over a shorter wait. A 403 is a refusal like the others:
+    // never hammered (the schedule), never abandoned (a SIM that is
+    // unbarred registers within the hour); once a fresh registration is
+    // due it also says the old registration is gone (KPN drops it the
+    // moment an initial REGISTER arrives, throttled or not), as does a
+    // fresh attempt that got past the SA setup, and a resume that failed at
+    // bring-up (OldGone) — no reconnect over the old SA from then on. Every wait
+    // is either the self-imposed backoff, which a user's Dial cuts short,
+    // or the network's own word (a Retry-After, the schedule after a
+    // refused or throttled fresh attempt), which nothing cuts short — a
+    // restart of the process neither: the shell keeps the holds (Holds)
+    // and hands them to the next one (Restore). The shell supplies the
+    // clock and the network; this holds the deadlines and names the next
+    // step (Next). Success resets everything.
+    struct RegRecovery {
+        enum class Failure { Refused, Silent, Throttled };
+        enum class Step { Reconnect, Fresh };
+        // What comes next: the step, and the earliest time it may run (the
+        // shell's clock; at <= now means now).
+        struct Plan { Step step; double at; };
+
+        static constexpr int RefusalsBeforeFresh = 2;
+        static constexpr int SilentCyclesBeforeFresh = 2;
+        static constexpr double ReconnectDelayMin = 5;
+        static constexpr double ReconnectDelayMax = 300;
+        static constexpr double FreshDelayMin = 30;
+        static constexpr double FreshDelayMax = 600;
+        static constexpr int ThrottleMinutesMin = 21;
+        static constexpr int ThrottleMinutesMax = 60;
+        // The network's word is honoured up to the schedule's own longest
+        // wait: a Retry-After beyond an hour is cut to it, and the refusal
+        // heard again then — one REGISTER an hour at most, never a day
+        // unregistered on one answer.
+        static constexpr long RetryAfterMax = ThrottleMinutesMax * 60;
+        // A connect refused locally — our own 4-tuple still in TIME_WAIT
+        // (up to 60 s after we closed it), no route yet — is not the
+        // network's answer: retried soon, never counted, the backoff
+        // untouched. Dev phone 2026-09-24: four such refusals in 26 s read
+        // as two silent cycles cost a fresh registration into the throttle.
+        static constexpr double LocalRetry = 5;
+
+        int refusals = 0;
+        int silentCycles = 0;
+        int freshAttempts = 0;
+        double reconnectDelay = ReconnectDelayMin;
+        double freshDelay = FreshDelayMin;
+        int throttleMinutes = ThrottleMinutesMin;
+        bool fresh = false;         // the next registration attempt is a fresh one
+        bool oldGone = false;       // the old registration is gone: nothing to reconnect over
+        // the deadlines, on the shell's clock
+        double backoffUntil = 0;    // self-imposed: no step before this; a Dial clears it
+        double holdUntil = 0;       // the network's word for any attempt (a Retry-After on a refresh): nothing clears it
+        double freshHoldUntil = 0;  // no fresh attempt before this (the schedule after a refused or throttled fresh attempt, a fresh Retry-After)
+
+        bool Fresh() const { return fresh; }
+        bool Reconnectable() const { return !oldGone; }
+
+        // The network's holds as seconds still to run, and where the
+        // schedule stands: what a restart of the process must not forget.
+        struct Held {
+            double hold = 0;
+            double freshHold = 0;
+            int throttleMinutes = ThrottleMinutesMin;
+            bool oldGone = false;   // the old registration is gone: the next process has nothing to reconnect over
+            // a schedule that has advanced is kept too, until a success resets it, and so is the gone verdict
+            bool Any() const { return hold > 0 || freshHold > 0 || throttleMinutes > ThrottleMinutesMin || oldGone; }
+        };
+        Held Holds(double now) const { return {std::max(0.0, holdUntil - now), std::max(0.0, freshHoldUntil - now), throttleMinutes, oldGone}; }
+        // A restarted process takes them over; nothing here shortens a
+        // hold it already has, or lengthens one past RetryAfterMax.
+        void Restore(double now, const Held& h) {
+            if (h.hold > 0) holdUntil = std::max(holdUntil, now + std::min(h.hold, static_cast<double>(RetryAfterMax)));
+            if (h.freshHold > 0) freshHoldUntil = std::max(freshHoldUntil, now + std::min(h.freshHold, static_cast<double>(RetryAfterMax)));
+            throttleMinutes = std::clamp(std::max(throttleMinutes, h.throttleMinutes), ThrottleMinutesMin, ThrottleMinutesMax);
+            if (h.oldGone) OldGone();   // no reconnect over SAs the network has written off
+        }
+
+        // The next step and when. Not escalated: a reconnect after the
+        // backoff and any hold. Escalated: the fresh attempt once the
+        // backoff, any hold and the fresh hold have passed — and while a
+        // fresh hold still runs, a reconnect over the old SA meanwhile, the
+        // cheap thing, unless that registration is gone.
+        Plan Next(double now) const {
+            double any = std::max(backoffUntil, holdUntil);
+            double freshAt = std::max(any, freshHoldUntil);
+            if (!fresh) return {Step::Reconnect, any};
+            if (!oldGone && freshHoldUntil > any && now < freshHoldUntil) return {Step::Reconnect, any};
+            return {Step::Fresh, freshAt};
+        }
+
+        void OnLocalRefusal(double now) { backoffUntil = now + LocalRetry; }
+
+        // A refused keepalive refresh, or a failed reconnect + refresh
+        // cycle; `status` is the refusal's. The backoff paces the next step;
+        // a Retry-After holds every attempt for its own length (up to
+        // RetryAfterMax), whichever is longer. A 403 once a fresh
+        // registration is due says the old registration is gone (KPN drops
+        // it the moment an initial REGISTER arrives, throttled or not).
+        void OnReconnectFailure(double now, Failure f, long retryAfter = 0, int status = 0) {
+            if (f == Failure::Refused) refusals++;
+            else silentCycles++;
+            if (refusals >= RefusalsBeforeFresh || silentCycles >= SilentCyclesBeforeFresh) fresh = true;
+            if (status == 403 && fresh) oldGone = true;
+            backoffUntil = now + reconnectDelay;
+            reconnectDelay = std::min(reconnectDelay * 2, ReconnectDelayMax);
+            if (retryAfter > 0) holdUntil = std::max(holdUntil, now + static_cast<double>(std::min(retryAfter, RetryAfterMax)));
+        }
+
+        // A failed fresh registration; `saReplaced`: it got past the SA
+        // setup, so the old registration's SAs went with it. Refusals and
+        // throttles hold the next fresh attempt on the schedule (a Retry-After
+        // replaces it, never below the short backoff's floor nor above
+        // RetryAfterMax); silence backs
+        // it off 30 s → 10 min. A reconnect over the old SA meanwhile waits
+        // at least the reconnect backoff.
+        void OnFreshFailure(double now, Failure f, long retryAfter = 0, bool saReplaced = false) {
+            freshAttempts++;
+            fresh = true;
+            if (saReplaced) oldGone = true;
+            backoffUntil = std::max(backoffUntil, now + reconnectDelay);
+            if (f == Failure::Silent) {
+                backoffUntil = std::max(backoffUntil, now + freshDelay);
+                freshDelay = std::min(freshDelay * 2, FreshDelayMax);
+                return;
+            }
+            double wait = throttleMinutes * 60.0;
+            throttleMinutes = std::min(throttleMinutes * 3 / 2, ThrottleMinutesMax);
+            if (retryAfter > 0) wait = std::max(static_cast<double>(std::min(retryAfter, RetryAfterMax)), FreshDelayMin);
+            freshHoldUntil = now + wait;
+        }
+
+        // The stored registration is not there to reconnect over (a resume
+        // that failed at bring-up found its SAs unusable, or there are none).
+        void OldGone() { oldGone = true; fresh = true; }
+
+        // A user's Dial cuts the backoff short, never the network's word.
+        void OnDial() { backoffUntil = 0; }
+
+        void OnSuccess() { *this = RegRecovery{}; }
+    };
 
     // Parsed SDP answer needed to bring up the media leg. `codec` is one of
     // imsd-media's: "AMR-WB", "AMR", "PCMA", "PCMU" (empty = none we play).
