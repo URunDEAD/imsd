@@ -5,7 +5,8 @@
 #
 # Finds-or-creates the ims bearer via ModemManager, connects it, and
 # configures the muxed netdev with the MM-assigned address (the s34 recipe,
-# automated). Idempotent — safe to run when the PDN is already up. Runs as
+# automated) and a host route to the P-CSCF — never a default route (F15
+# below). Idempotent — safe to run when the PDN is already up. Runs as
 # ExecStartPre of imsd.service, so imsd only starts once the PDN exists; a
 # nonzero exit fails the unit and systemd retries per Restart/RestartSec.
 #
@@ -21,6 +22,8 @@
 #                    (journal/ims 2026-09-16/17 bench: Odido, O2 UK, Swisscom).
 #   IMS_REG_TIMEOUT  max seconds to wait for network registration before
 #                    connect attempts start counting anyway (default 300)
+#   PCSCF            the P-CSCF address imsd registers with (its own
+#                    required setting); gets the host route over the ims PDN
 
 log() { echo "ims-pdn-up: $*"; }
 
@@ -217,6 +220,29 @@ if [ -z "$IFACE" ] || [ -z "$ADDR" ]; then
     log "bearer up but no interface/address in mmcli output"
     exit 1
 fi
+# ---- the ims PDN must never be the phone's IPv6 default route (F15). The
+# PGW's router advertisement offers a default router; on IPv4-only wifi
+# that is the phone's only v6 default, so every AAAA-first client (apk,
+# browsers) sends its SYN into the IMS walled garden, which drops it
+# silently (dev phone 2026-09-20: a 9-min apk hang). imsd only talks to the
+# P-CSCF (host route below) and to media peers (imsd installs those host
+# routes per call); the RA's prefix and MTU are still applied (its hop
+# limit is not — the kernel default 64 stays). Per-netdev, via /proc, and
+# before link-up: the router solicitation goes out once the link-local
+# address passes DAD, ~1–2 s after link-up, and the RA answers at once.
+if ! echo 0 > "/proc/sys/net/ipv6/conf/$IFACE/accept_ra_defrtr" 2>/dev/null; then
+    log "could not set accept_ra_defrtr=0 on $IFACE (continuing)"
+fi
+# the PDN's MTU as the modem reports it (1280 here), on the link itself:
+# the P-CSCF host route makes the P-CSCF reachable before the RA's MTU
+# option has been processed, and a send in that window would otherwise be
+# sized by the link's default MTU. NetworkManager does the same for its
+# bearers. An RA MTU no larger than the link's is still applied.
+MTU=$(echo "$INFO" | sed -n 's/^bearer\.ipv6-config\.mtu  *: *//p')
+case "$MTU" in ''|--|*[!0-9]*) MTU= ;; esac
+if [ -n "$MTU" ] && [ "$MTU" -ge 1280 ]; then
+    ip link set "$IFACE" mtu "$MTU" || log "could not set mtu $MTU on $IFACE (continuing)"
+fi
 ip link set "$IFACE" up || exit 1
 ip -6 addr replace "$ADDR/${PREFIX:-64}" dev "$IFACE" || exit 1
 
@@ -228,7 +254,31 @@ while ip -6 addr show dev "$IFACE" | grep -q tentative; do
     [ "$n" -ge 10 ] && { log "address still tentative after 10 s"; break; }
     sleep 1
 done
-log "$IFACE up, $ADDR/${PREFIX:-64}"
+log "$IFACE up, $ADDR/${PREFIX:-64}, ipv6 mtu $(cat "/proc/sys/net/ipv6/conf/$IFACE/mtu" 2>/dev/null)"
+
+# a default route an earlier RA already installed (the link was up before
+# this run: an imsd restart) — accept_ra_defrtr=0 leaves an existing one in
+# place until its lifetime runs out. Any ::/0 via this netdev goes, by the
+# policy above.
+if [ -n "$(ip -6 route show default dev "$IFACE" 2>/dev/null)" ]; then
+    ip -6 route flush default dev "$IFACE" && log "dropped the RA default route on $IFACE"
+fi
+# the P-CSCF is reachable through the ims PDN only: a host route stands in
+# for the default. `dev` without a gateway — a raw-IP netdev without
+# header_ops, so the kernel resolves no neighbours — the shape imsd uses
+# for media peers. The PDN is brought up IPv6-only (the address above), so
+# the P-CSCF must be an IPv6 address; anything else on the IMS network
+# (its DNS servers, a traceroute target) needs its own host route. Without
+# this route imsd cannot reach the P-CSCF, so a failure is the unit's
+# failure.
+PCSCF=${PCSCF:-$(envval PCSCF)}
+case "$PCSCF" in
+    '')  log "PCSCF not configured: no P-CSCF host route (imsd needs PCSCF= in /etc/imsd.env)" ;;
+    *:*) OUT=$(ip -6 route replace "$PCSCF/128" dev "$IFACE" 2>&1) ||
+             { log "host route to P-CSCF $PCSCF failed: $(squash "$OUT")"; exit 1; }
+         log "host route to P-CSCF $PCSCF dev $IFACE" ;;
+    *)   log "PCSCF '$PCSCF' is not an IPv6 address; the ims PDN is brought up IPv6-only"; exit 1 ;;
+esac
 
 # ---- hand the connected ims netdev to imsd (imsd.service reads
 # /run/imsd.env) so the daemon carries no baked-in interface name

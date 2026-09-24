@@ -149,7 +149,16 @@ On a phone the daemon runs as root on the system bus (policy in
 account `user` access; adjust it alongside `AUDIO_USER` if your session
 account is named differently), started by `packaging/imsd.service`
 after `packaging/ims-pdn-up.sh` has brought up the ims PDN through
-ModemManager. It spawns `/usr/libexec/imsd-media` per call. Registration
+ModemManager. The bring-up never lets the ims PDN become the phone's IPv6
+default route: the PDN's router advertisement is not accepted as a default
+router (`accept_ra_defrtr=0` on the netdev; its prefix and MTU still apply)
+and the P-CSCF gets a host route instead, so on IPv4-only wifi the phone's
+other IPv6 traffic (apk, browsers) is not sent into the IMS walled garden,
+where it would hang. Media peers get a host route per call; anything else
+on the IMS network (its DNS servers, a traceroute target) needs its own
+(`ip -6 route add <addr> dev qmapmux0.0`). The PDN MTU ModemManager reports
+is set on the link. It spawns
+`/usr/libexec/imsd-media` per call. Registration
 resumes an in-kernel IPsec SA when one is present (avoiding the network's
 fresh-SA throttle) and keeps itself alive with a re-REGISTER refresh at half
 the granted lifetime. `packaging/APKBUILD` builds the apk from source via
