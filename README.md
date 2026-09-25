@@ -146,8 +146,8 @@ busctl --user call net.catcrafts.IMS1 /net/catcrafts/IMS1 net.catcrafts.IMS1 Get
 
 On a phone the daemon runs as root on the system bus (policy in
 `packaging/net.catcrafts.IMS1.conf` — it grants the postmarketOS default
-account `user` access; adjust it alongside `AUDIO_USER` if your session
-account is named differently), started by `packaging/imsd.service`
+account `user` access; adjust it if your session account is named
+differently), started by `packaging/imsd.service`
 after `packaging/ims-pdn-up.sh` has brought up the ims PDN through
 ModemManager. The bring-up never lets the ims PDN become the phone's IPv6
 default route: the PDN's router advertisement is not accepted as a default
@@ -354,7 +354,7 @@ its own `retry-after`).
 | Variable | Default | Meaning |
 |---|---|---|
 | `MIC`, `PLAY` | `1`, `1` | uplink mic capture / downlink playout via PipeWire |
-| `AUDIO_USER` | `user` | desktop user whose PipeWire session carries call audio (postmarketOS default account) |
+| `AUDIO_USER` | *(auto)* | account whose PipeWire session carries call audio. imsd sets it for each call from logind: the user session active on seat0 (`loginctl show-seat seat0`, a greeter does not count) when it has a `/run/user/<uid>/pipewire-0` socket. Set in imsd's own environment it pins an account instead. imsd as packaged (root, on the system bus) logs the resolution at start and when a call's media starts (`audio session: …`), imsd-media once per call. imsd-media started without the variable at all (by an imsd older than 0.3.10 while an upgrade replaces it, or by hand) tries the account `user`, its old default. |
 | `GAIN`, `PLAY_GAIN` | `10`, `1.0` | uplink / downlink gain |
 | `AMR_MODE` | `2` | AMR-WB encoder mode (0–8) |
 | `DTX` | `0` | encoder discontinuous transmission |

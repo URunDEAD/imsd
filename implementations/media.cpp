@@ -410,41 +410,56 @@ std::size_t RtpPayloadOffset(std::span<const std::uint8_t> pkt) {
     return off;
 }
 
-// The desktop user's uid, resolved ONCE and thread-safely. getpwnam() hands
-// out one static buffer, and the mic and playout threads spawn their pw
-// helpers at the same instant — the race sent both into /run/user/0, where
-// no PipeWire session lives, and a call was answered into static (dev phone,
-// 2026-09-08 20:01: tx_mic=0 rx_played=0 qdrop=883). Logged per call so a
-// journal shows which session the helpers were aimed at.
-uid_t AudioUid() {
+// The desktop session whose PipeWire instance carries call audio, resolved
+// ONCE and thread-safely: getpwnam() hands out one static buffer, and the
+// mic and playout threads spawn their pw helpers at the same instant — the
+// race sent both into /run/user/0, where no PipeWire session lives, and a
+// call was answered into static (dev phone, 2026-09-08 20:01: tx_mic=0
+// rx_played=0 qdrop=883). AUDIO_USER names the account: imsd sets it per
+// call from logind's seat0 session (or its own AUDIO_USER), and sets it
+// empty when nobody is logged in. The packaged default used to be
+// postmarketOS's account name `user`: a unit whose account was called
+// otherwise got no audio and no message (alyx report 14, 2026-09-20).
+// That default stays for a caller that does not set the variable at all —
+// an imsd older than 0.3.10, still running while an upgrade replaces this
+// binary, or a hand run — so its calls keep their audio.
+// Logged per call so a journal shows which session the helpers were aimed at.
+struct AudioSession { uid_t uid = 0; std::string name; };
+
+const AudioSession& Session() {
     static std::once_flag once;
-    static uid_t uid = 0;
+    static AudioSession s;
     std::call_once(once, [] {
-        std::string user = EnvOr("AUDIO_USER", "user");
         passwd pw{};
         passwd* res = nullptr;
         char buf[4096];
-        if (getpwnam_r(user.c_str(), &pw, buf, sizeof buf, &res) == 0 && res) uid = res->pw_uid;
+        const char* given = std::getenv("AUDIO_USER");
+        std::string want = given ? given : "user";
+        if (!given) std::println(std::cerr, "imsd-media: no AUDIO_USER in the environment (a caller older than 0.3.10, or a hand run); trying the account `user`");
+        if (want.empty())
+            std::println(std::cerr, "imsd-media: AUDIO_USER empty (no session to aim at); the helpers run as uid 0 (no audio)");
+        else if (getpwnam_r(want.c_str(), &pw, buf, sizeof buf, &res) == 0 && res) { s.uid = res->pw_uid; s.name = want; }
         else
-            std::println(std::cerr, "imsd-media: AUDIO_USER '{}' not found; no PipeWire session for uid 0", user);
-        std::println(std::cerr, "imsd-media: audio session: {} -> /run/user/{}", user, uid);
+            std::println(std::cerr, "imsd-media: AUDIO_USER '{}' is not an account; the helpers run as uid 0 (no audio)", want);
+        std::println(std::cerr, "imsd-media: audio session: {} -> /run/user/{}", s.name.empty() ? std::string("(none)") : s.name, s.uid);
     });
-    return uid;
+    return s;
 }
 
-// Spawn pw-record/pw-play in the desktop user's PipeWire session (sudo -u
-// when run as root). AUDIO_USER names the session owner; the default "user"
-// is postmarketOS's standard account. `toChild` true = we write the child's
-// stdin (pw-play); false = we read its stdout (pw-record). Returns {pid, fd}.
+// Spawn pw-record/pw-play in the desktop session's PipeWire instance (sudo -u
+// when run as root; as ourselves when there is no session to aim at).
+// `toChild` true = we write the child's stdin (pw-play); false = we read its
+// stdout (pw-record). Returns {pid, fd}.
 struct Child { pid_t pid = -1; int fd = -1; };
 Child SpawnPw(bool play, bool toChild, int rate) {
     int pipefd[2];
     if (pipe(pipefd) != 0) return {};
     std::vector<std::string> argv;
     if (geteuid() == 0) {
-        std::string user = EnvOr("AUDIO_USER", "user");
-        argv = {"sudo", "-u", user, "env",
-                std::format("XDG_RUNTIME_DIR=/run/user/{}", AudioUid())};
+        const AudioSession& session = Session();
+        if (!session.name.empty())
+            argv = {"sudo", "-u", session.name, "env",
+                    std::format("XDG_RUNTIME_DIR=/run/user/{}", session.uid)};
     }
     const char* tool = play ? "pw-play" : "pw-record";
     const char* lat = play ? "40ms" : "20ms";

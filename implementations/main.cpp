@@ -31,6 +31,7 @@ reach the bus via g_idle_add, where the calls table + status snapshot live
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -201,6 +202,64 @@ bool OnLink(const std::string& dev, const std::string& addr) {
     }
     freeifaddrs(ifs);
     return found;
+}
+
+// The account whose PipeWire session carries call audio: AUDIO_USER when
+// it names an account, else logind's seat0 session (`loginctl show-seat
+// seat0` -> `show-session`) when that is a user session — not phrog's
+// greeter — with a PipeWire socket. imsd-media gets the answer as
+// AUDIO_USER. As packaged (root, on the system bus) imsd resolves it at
+// start, so a wrong name or a missing session is in the journal before the
+// first call rather than after two silent rounds of trial (alyx report 14,
+// 2026-09-20), and again when a call's media starts, because the answer
+// changes when someone logs in.
+struct AudioSession { std::string name; unsigned uid = 0; std::string how; };
+
+std::string LoginctlProp(std::string_view text, std::string_view key) {
+    for (auto line : std::views::split(text, '\n')) {
+        std::string_view l(line);
+        if (l.size() > key.size() && l.starts_with(key) && l[key.size()] == '=') return std::string(l.substr(key.size() + 1));
+    }
+    return {};
+}
+
+AudioSession ResolveAudioSession() {
+    AudioSession s;
+    passwd pw{};
+    passwd* res = nullptr;
+    char buf[4096];
+    std::string want = EnvOr("AUDIO_USER", "");
+    if (!want.empty()) {
+        if (getpwnam_r(want.c_str(), &pw, buf, sizeof buf, &res) == 0 && res) {
+            s.name = want; s.uid = res->pw_uid; s.how = "AUDIO_USER";
+            return s;
+        }
+        Log(std::format("AUDIO_USER '{}' is not an account; using logind's seat0 session instead", want));
+    }
+    auto seat = RunCapture({"loginctl", "show-seat", "seat0", "-p", "ActiveSession", "--value"});
+    std::string id = seat.out;
+    while (!id.empty() && (id.back() == '\n' || id.back() == ' ')) id.pop_back();
+    if (seat.rc != 0 || id.empty()) { s.how = "no session on seat0"; return s; }
+    auto sess = RunCapture({"loginctl", "show-session", id, "-p", "Name", "-p", "Class", "-p", "User"});
+    std::string name = LoginctlProp(sess.out, "Name"), cls = LoginctlProp(sess.out, "Class"), uid = LoginctlProp(sess.out, "User");
+    unsigned u = 0;
+    auto [end, err] = std::from_chars(uid.data(), uid.data() + uid.size(), u);
+    if (sess.rc != 0 || name.empty() || err != std::errc{} || end != uid.data() + uid.size()) { s.how = std::format("seat0 session {} not readable", id); return s; }
+    if (!cls.starts_with("user")) { s.how = std::format("seat0 session {} is {}'s {} session, nobody logged in", id, name, cls); return s; }
+    std::error_code ec;
+    if (!std::filesystem::exists(std::format("/run/user/{}/pipewire-0", u), ec)) { s.how = std::format("seat0 session {} ({}) has no PipeWire socket in /run/user/{}", id, name, u); return s; }
+    s.name = name; s.uid = u; s.how = std::format("logind seat0 session {}", id);
+    return s;
+}
+
+std::string AudioSessionLine(const AudioSession& s) {
+    if (!s.name.empty()) return std::format("audio session: {} (uid {}, {})", s.name, s.uid, s.how);
+    return std::format("audio session: none — {}", s.how);
+}
+
+void LogAudioSession() {
+    AudioSession s = ResolveAudioSession();
+    Log(AudioSessionLine(s) + (s.name.empty() ? "; looked up again at each call, set AUDIO_USER to pin one" : ""));
 }
 
 // ---- sockaddr helper ------------------------------------------------------
@@ -2195,8 +2254,18 @@ private:
             mediaBin_, local_, std::to_string(rtpPort_), leg.remoteIp,
             std::to_string(leg.remotePort), std::to_string(leg.payloadType),
             "86400", outBase};
+        AudioSession session;
+        if (geteuid() == 0) {
+            session = ResolveAudioSession();
+            Log(AudioSessionLine(session) + (session.name.empty() ? "; this call has no audio" : ""));
+        }
         pid_t pid = fork();
         if (pid == 0) {
+            if (geteuid() == 0) {
+                // no session is said with an empty value: imsd-media reads a
+                // missing variable as a caller older than 0.3.10
+                setenv("AUDIO_USER", session.name.c_str(), 1);
+            }
             setenv("MIC", EnvOr("MIC", "1").c_str(), 1);
             setenv("PLAY", EnvOr("PLAY", "1").c_str(), 1);
             setenv("GAIN", EnvOr("GAIN", "10").c_str(), 1);
@@ -2384,6 +2453,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     Log(std::format("LOCAL={} P-CSCF=[{}]:{}", local, EnvOr("PCSCF", "(unset)"), EnvOr("PCSCF_PORT", "5060")));
+    if (!session) LogAudioSession();
 
     Engine engine;
     engine.SetLocal(local);
