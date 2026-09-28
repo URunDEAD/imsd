@@ -14,7 +14,8 @@ Type=simple
 # gate + connect retries), hence TimeoutStartSec
 ExecStartPre=/usr/libexec/ims-pdn-up.sh
 TimeoutStartSec=900
-# /run/imsd.env: written by ims-pdn-up.sh (DEV= the connected ims netdev).
+# /run/imsd.env: written by ims-pdn-up.sh (DEV= the connected ims netdev,
+# LOCAL= the PDN address ModemManager assigned to it).
 # /etc/imsd.env: admin configuration — PCSCF= is REQUIRED (the carrier's
 # P-CSCF address; see the README's Configuration section) and wins over the
 # runtime-derived values.
@@ -24,7 +25,8 @@ EnvironmentFile=-/etc/imsd.env
 StateDirectory=imsd
 ExecStart=/usr/bin/imsd
 # registration: resume an existing SA when possible (avoids fresh-SA
-# throttles); a failed bring-up exits nonzero and systemd retries
+# throttles); a failed bring-up exits nonzero and systemd retries, as does
+# a registered imsd whose PDN address left the netdev
 Restart=on-failure
 RestartSec=120
 # SIGTERM: engine keeps the SA + registration state for the next resume

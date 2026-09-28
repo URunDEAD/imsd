@@ -80,6 +80,14 @@ int main() {
     }
     // incomplete input -> nullopt
     Check(!ParseExistingSa("src a dst b\n\tspi 0x1 reqid 1 mode transport\n", "", "b", "a").has_value(), "missing pieces -> nullopt");
+    {
+        // a registration still on another address of the link, plus an SA to
+        // another P-CSCF that is none of ours
+        std::string two = std::format("{}src 2001:db8:1111:2222:aaaa:bbbb:cccc:dddd dst 2001:db8::105\n\tproto esp spi 0x00000001 reqid 1 mode transport\nsrc 2001:db8:1111:2222:eeee:ffff:0:1 dst 2001:db8::999\n\tproto esp spi 0x00000002 reqid 1 mode transport\n", State);
+        auto locals = SaLocals(two, "2001:db8::105");
+        Check(locals.size() == 2 && locals[0] == "2001:db8:1111:2222:3333:4444:5555:db43" && locals[1] == "2001:db8:1111:2222:aaaa:bbbb:cccc:dddd", "SaLocals: every local address with an SA to the P-CSCF, once each, in kernel order");
+        Check(SaLocals(State, "2001:db8::999").empty(), "SaLocals: no SA to that P-CSCF -> none");
+    }
 
     // ---- fresh setup command sequence
     {

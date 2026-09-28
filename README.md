@@ -252,7 +252,8 @@ IMSD_BUS=session imsd-ofonod
 ## Configuration
 
 Everything is environment variables. The packaged unit reads
-`/run/imsd.env` (written by `ims-pdn-up.sh`: the connected ims netdev) and
+`/run/imsd.env` (written by `ims-pdn-up.sh`: the connected ims netdev and
+the PDN address ModemManager assigned to it) and
 then `/etc/imsd.env` (your configuration, wins on conflict). Minimum viable
 `/etc/imsd.env`:
 
@@ -270,10 +271,10 @@ PCSCF=2001:db8::105
 | `PCSCF` | *(none — required)* | P-CSCF address; without it registration fails with a clear error |
 | `PCSCF_PORT` | `5060` | unprotected SIP port for the initial REGISTER |
 | `DEV` | `qmapmux0.0` | ims-PDN netdev; the packaged service passes the real one via `/run/imsd.env` |
-| `LOCAL` | *(auto)* | UE address; default = the global IPv6 on `DEV` |
+| `LOCAL` | *(auto)* | UE address. The packaged service gets the PDN address ModemManager assigned, via `/run/imsd.env` from `ims-pdn-up.sh`; a manual run prefers a global IPv6 on `DEV` that is neither temporary nor `dynamic` (RA-derived), then any non-temporary one, then the first (the kernel's temporary SLAAC address is listed first, and a registration bound to it is lost when the kernel retires it) |
 | `USER_AGENT` | `imsd/<version>` | REGISTER User-Agent. Some networks fingerprint UAs; setting your device's stock build string reproduces the stock modem's registration exactly. Empty omits the header |
 | `STATE_FILE` | `/var/lib/imsd/imsreg.state` (root) / `$XDG_STATE_HOME/imsd/imsreg.state` | persisted registration context for warm resume |
-| `HOLDS_FILE` | `/run/imsd.holds` (root) / `$XDG_RUNTIME_DIR/imsd.holds` (`/tmp/imsd.holds` without a runtime dir) | the waits the network imposed (a `Retry-After`, the refusal schedule) and where that schedule stands, kept across a restart of imsd for the address they were set on — not across a reboot; `/dev/null` switches the file off (only a regular file is ever removed; anything else is emptied) |
+| `HOLDS_FILE` | `/run/imsd.holds` (root) / `$XDG_RUNTIME_DIR/imsd.holds` (`/tmp/imsd.holds` without a runtime dir) | the waits the network imposed (a `Retry-After`, the refusal schedule) and where that schedule stands, kept across a restart of imsd for the PDN they were set on — not across a reboot; `/dev/null` switches the file off (only a regular file is ever removed; anything else is emptied) |
 | `RESUME` | `auto` | `0` forces a fresh registration (ignores a warm SA) |
 | `REFRESH_INTERVAL` | *(auto)* | keepalive re-REGISTER period in s; default = half the granted expiry, clamped to [120, 1800] |
 | `EALG` | `aes-cbc` | offered ESP cipher (`aes-cbc`, `des-ede3-cbc`, `null`). From the 401's `Security-Server` list imsd selects the highest-preference `ipsec-3gpp` mechanism that matches this offer (RFC 3329 §2.3.1) and takes the SPIs/ports from the entry carrying them (some cores list every mechanism they support and put the SPIs on the one they applied); when no entry matches, the P-CSCF's SPI-carrying entry is installed as listed (`hmac-md5-96`, an absent `ealg` = null) and the journal says so. The line, the selection and the SA parameters are logged at every fresh registration |
@@ -311,14 +312,23 @@ imsd-dialerd lists no modem. A bring-up the network deferred waits the same
 schedule out with nothing to reconnect over (the resume just found the
 stored SAs unusable), then tries again. The network's holds outlive a
 restart of imsd: they are kept in
-`/run/imsd.holds` for the address they were set on, with the schedule's place
+`/run/imsd.holds` for the PDN they were set on, with the schedule's place
 (a restart does not start it over at 21 min), and waited out at the next
 start, before the resume (a refresh's `Retry-After`) or before the fresh
 registration (a fresh attempt's schedule or `Retry-After`, a terminated
-binding's wait); a reboot or another address starts clean.
+binding's wait); a reboot or another PDN address starts clean.
 The journal says which (`…; next: fresh registration in N s`, `registering
 fresh (recovery attempt N)`, `fresh registration deferred/refused/failed:
-…`, `bring-up deferred: …`). The reg-event subscription — the network's own
+…`, `bring-up deferred: …`). One case leaves through a real restart
+instead: when the address imsd is registered on has left the ims netdev
+and the PDN's own address is not there to move to (the PDN went away) —
+the journal shows `engine fatal: … — exiting for systemd restart`,
+and after `RestartSec` (120 s) `ims-pdn-up.sh` runs again and imsd
+registers on the PDN's address. A registration resumed on an older
+address (a pre-0.3.10 temporary one) moves to the PDN's own address in
+place: with its next fresh registration, or when the older address leaves
+the netdev first, which takes that registration with it. The reg-event
+subscription — the network's own
 view of the binding, one live dialog per registration, subscribed anew ahead of
 the lifetime the S-CSCF granted — is retried when refused or unanswered
 (60 s doubling to 10 min, a `Retry-After` honoured up to an hour: a registration refresh

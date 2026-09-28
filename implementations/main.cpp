@@ -27,6 +27,7 @@ reach the bus via g_idle_add, where the calls table + status snapshot live
 #include <fcntl.h>
 #include <gio/gio.h>
 #include <glib-unix.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -152,15 +153,54 @@ std::optional<std::string> CompletedHex(std::string_view out) {
     return h;
 }
 
-// global IPv6 on the ims PDN, from `ip -6 addr show dev <dev> scope global`.
+// The UE address on the ims PDN when LOCAL is not given: a global IPv6 on
+// <dev> that is neither temporary nor RA-derived (`dynamic`) — the one
+// ims-pdn-up.sh assigned from ModemManager — else the first non-temporary
+// one, else the first. The kernel lists the temporary (privacy) address
+// first, and registering on it binds Contact, Via and the SAs to an address
+// that is deprecated after a day and removed after two (ims ledger F18).
 std::optional<std::string> DetectLocal(const std::string& dev) {
     auto r = RunCapture({"ip", "-6", "addr", "show", "dev", dev, "scope", "global"});
-    std::size_t at = r.out.find("inet6 ");
-    if (at == std::string_view::npos) return std::nullopt;
-    std::size_t start = at + 6;
-    std::size_t end = r.out.find('/', start);
-    if (end == std::string_view::npos) return std::nullopt;
-    return r.out.substr(start, end - start);
+    std::optional<std::string> first, nonTemporary, assigned;
+    std::size_t pos = 0;
+    while ((pos = r.out.find("inet6 ", pos)) != std::string::npos) {
+        std::size_t start = pos + 6;
+        pos = start;
+        std::size_t eol = r.out.find('\n', start);
+        if (eol == std::string::npos) eol = r.out.size();
+        std::size_t slash = r.out.find('/', start);
+        if (slash == std::string::npos || slash > eol) continue;
+        std::string addr = r.out.substr(start, slash - start);
+        std::string_view flags = std::string_view(r.out).substr(slash, eol - slash);
+        bool temporary = flags.contains(" temporary");
+        bool dynamic = flags.contains(" dynamic");
+        if (!first) first = addr;
+        if (!temporary && !nonTemporary) nonTemporary = addr;
+        if (!temporary && !dynamic && !assigned) assigned = addr;
+    }
+    if (assigned) return assigned;
+    if (nonTemporary) return nonTemporary;
+    return first;
+}
+
+// Whether `addr` is configured on `dev` now. Compared as bytes, so any
+// spelling of the address matches; when the interface list cannot be read
+// the answer is yes — nothing here acts on a guess that it is gone.
+bool OnLink(const std::string& dev, const std::string& addr) {
+    int fam = Is6(addr) ? AF_INET6 : AF_INET;
+    unsigned char want[16] = {};
+    if (inet_pton(fam, addr.c_str(), want) != 1) return false;
+    ifaddrs* ifs = nullptr;
+    if (getifaddrs(&ifs) != 0) return true;
+    bool found = false;
+    for (ifaddrs* i = ifs; i && !found; i = i->ifa_next) {
+        if (!i->ifa_addr || i->ifa_addr->sa_family != fam || dev != i->ifa_name) continue;
+        const void* have = fam == AF_INET6 ? static_cast<const void*>(&reinterpret_cast<sockaddr_in6*>(i->ifa_addr)->sin6_addr)
+                                           : static_cast<const void*>(&reinterpret_cast<sockaddr_in*>(i->ifa_addr)->sin_addr);
+        found = std::memcmp(have, want, fam == AF_INET6 ? 16 : 4) == 0;
+    }
+    freeifaddrs(ifs);
+    return found;
 }
 
 // ---- sockaddr helper ------------------------------------------------------
@@ -511,6 +551,7 @@ public:
         for (int f : udp_) close(f);
         for (auto& c : conns_) close(c.fd);
         listeners_.clear(); udp_.clear(); conns_.clear();
+        udpUc_ = -1;
     }
 private:
     struct Conn { int fd; imsd::sip::FrameBuffer fb; };
@@ -636,7 +677,7 @@ std::int64_t NowEpoch() {
 // The recovery policy's holds, kept for the next process: the network's
 // word (a Retry-After, the schedule after a refused or throttled fresh
 // attempt, a terminated binding's wait) outlives a restart of imsd. They
-// are filed under the daemon's address — another one, or a reboot, starts
+// are filed under the PDN's address — another one, or a reboot, starts
 // clean — so the file names that address and the boot, and
 // lives in /run. Seconds left at `written_at`, which is on the boot
 // clock: no clock step moves it, and it runs through a suspend as the
@@ -823,7 +864,7 @@ public:
         }
     }
 
-    void SetLocal(std::string l) { local_ = std::move(l); }
+    void SetLocal(std::string l) { local_ = l; pdnLocal_ = std::move(l); }
     void SetDevMode(bool d) { devMode_ = d; }
     const std::string& Local() const { return local_; }
 
@@ -848,7 +889,7 @@ public:
     }
 
     void Run() {
-        if (auto h = LoadHolds(local_)) {
+        if (auto h = LoadHolds(pdnLocal_)) {
             recovery_.Restore(Boot(), *h);
             auto kept = recovery_.Holds(Boot());   // what the policy took over: the file's values after the clamp
             if (kept.hold > 0 || kept.freshHold > 0)
@@ -965,7 +1006,7 @@ private:
         return !quit_.load();
     }
 
-    void KeepHolds() { PersistHolds(recovery_.Holds(Boot()), local_); }
+    void KeepHolds() { PersistHolds(recovery_.Holds(Boot()), pdnLocal_); }
 
     // dev/session mode without a modem: process commands so the ABI answers,
     // but there is no SIP socket — a Dial collapses to terminated/error.
@@ -978,6 +1019,10 @@ private:
 
     // config
     std::string pcscf_, dev_, outDir_, local_, ealgOffer_, mediaBin_;
+    // The PDN's own address (LOCAL, else DetectLocal) — every fresh
+    // registration's. local_ differs from it only while a resume runs on the
+    // address an older registration was made on (TryResume).
+    std::string pdnLocal_;
     std::string sipPolicy_;              // SIP_TRANSPORT: auto | tcp | udp
     Transport transport_ = Transport::Tcp;   // the protected leg's transport in effect
     void SetTransport(Transport t) { transport_ = t; ctx_.transport = std::string(TransportName(t)); }
@@ -1115,6 +1160,7 @@ private:
         // fresh registration waits
         recovery_.OldGone();
         portPs_ = 0;
+        local_ = pdnLocal_; ctx_.local = local_;
         KeepHolds();
         if (recovery_.Next(Boot()).at > Boot()) Log(std::format("the network's hold stands; {}", NextStep()));
         if (!WaitForPolicy()) throw Stopping{};
@@ -1125,6 +1171,25 @@ private:
         auto state = RunCapture({"ip", "xfrm", "state"});
         auto policy = RunCapture({"ip", "xfrm", "policy"});
         auto sa = imsd::ipsec::ParseExistingSa(state.out, policy.out, pcscf_, local_);
+        // The registration may sit on another address of the link: before
+        // 0.3.10 imsd registered on the kernel's temporary one (ims ledger
+        // F18). Resume there while it is still up — a restart keeps the
+        // registration for the price of a re-REGISTER, where a fresh one is
+        // an AKA run, a new SA pair and, when KPN refuses it, the old
+        // registration and a 21-minute wait (KPN refuses a fresh pair on an
+        // address whose registration is live and has accepted one on another
+        // address of the link meanwhile; other carriers' rules are unknown) —
+        // and move at the next fresh registration.
+        if (!sa) {
+            for (const std::string& other : imsd::ipsec::SaLocals(state.out, pcscf_)) {
+                if (other == local_ || !OnLink(dev_, other)) continue;
+                sa = imsd::ipsec::ParseExistingSa(state.out, policy.out, pcscf_, other);
+                if (!sa) continue;
+                Log(std::format("the registration's SAs are on {}, not the PDN's own address {}: resuming there until the next fresh registration", other, local_));
+                local_ = other; ctx_.local = other;
+                break;
+            }
+        }
         if (!sa) return false;
         auto ps = LoadState();
         if (!ps || !ps->callid) { Log("no reg state file; resume falls back to fresh"); return false; }
@@ -1627,6 +1692,7 @@ private:
         Log("client flow dead; reconnecting");
         sip_.Close();
         if (!sip_.Connect(local_, PortUc, pcscf_, portPs_, transport_, /*tries=*/2)) {
+            if (AddressGone()) return;
             if (sip_.LastConnectLocal()) {
                 if (registered_) { registered_ = false; EmitStatus(true); }
                 recovery_.OnLocalRefusal(Boot());
@@ -1693,11 +1759,22 @@ private:
         // fails before the SA setup leaves the old registration and that
         // retry standing
         subCallid_.clear(); subPending_ = false; subRenewAt_ = 0;
+        // a registration resumed on an older address (a pre-0.3.10 temporary
+        // one) moves to the PDN's own address here, server ports included;
+        // an attempt that fails before the SA setup leaves that registration
+        // standing, so it moves back to it
+        std::string from = local_;
+        if (local_ != pdnLocal_) {
+            Log(std::format("the fresh registration moves from {} to the PDN's own address {}", local_, pdnLocal_));
+            MoveTo(pdnLocal_);
+        }
+        bool ok = false;
         try {
             RefreshPani();
             FreshRegister();
             subRetryAt_ = 0;   // a new registration: its subscription starts afresh
             OnRegistered();
+            ok = true;
             Log("recovered by a fresh registration");
         } catch (const ThrottledError& e) {
             FreshAttemptFailed(F::Throttled, 0, std::format("fresh registration deferred: {}", e.what()));
@@ -1706,6 +1783,24 @@ private:
         } catch (const std::exception& e) {
             FreshAttemptFailed(F::Silent, 0, std::format("fresh registration failed: {}", e.what()));
         }
+        if (!ok && !quit_.load() && recovery_.Reconnectable() && local_ != from) {
+            if (OnLink(dev_, from)) {
+                Log(std::format("back on {}: the old registration stands until the next fresh attempt", from));
+                MoveTo(from);
+            } else {
+                recovery_.OldGone();
+                KeepHolds();   // the verdict outlives a restart like the hold it goes with
+                Log(std::format("{} has left {}: the registration on it is gone; staying on {}; {}", from, dev_, local_, NextStep()));
+            }
+        }
+    }
+
+    // Our address for everything from here on: the flow, the server ports,
+    // the requests' Via and Contact, the media leg.
+    void MoveTo(const std::string& addr) {
+        server_.CloseAll();
+        local_ = addr; ctx_.local = addr;
+        server_.Open(local_);
     }
 
     // After a failed fresh attempt, in recovery or at bring-up: the
@@ -1713,10 +1808,43 @@ private:
     // the policy told, and its next step logged.
     void FreshAttemptFailed(imsd::engine::RegRecovery::Failure f, long retryAfter, const std::string& what) {
         CloseFlowAfterWait();
+        if (!OnLink(dev_, local_)) Log(what);   // said before the address's own line: a refusal is always in the journal
+        if (AddressGone()) return;
         bool wasReconnectable = recovery_.Reconnectable();
         recovery_.OnFreshFailure(Boot(), f, retryAfter, saReplaced_);
         KeepHolds();
         Log(std::format("{}{}; {}", what, wasReconnectable && !recovery_.Reconnectable() ? " — the old registration is gone" : "", NextStep()));
+    }
+
+    // After a failed recovery step: has our address left the link? An
+    // older registration's address (a pre-0.3.10 temporary one that
+    // expired) takes that registration with it: imsd moves to the PDN's
+    // own address and the policy's fresh step runs there, every wait it
+    // holds included. The PDN's own address leaving means the PDN went
+    // away — no retry brings it back; a restart runs the PDN bring-up
+    // again. True when the step that failed has nothing left to do.
+    bool AddressGone() {
+        if (OnLink(dev_, local_)) return false;
+        if (local_ != pdnLocal_ && OnLink(dev_, pdnLocal_)) {
+            if (registered_) { registered_ = false; EmitStatus(true); }
+            std::string from = local_;
+            recovery_.OldGone();
+            MoveTo(pdnLocal_);
+            KeepHolds();   // the caller returns before its own write
+            Log(std::format("{} is no longer on {}: the registration on it is gone; on the PDN's own address {} now; {}", from, dev_, local_, NextStep()));
+            return true;
+        }
+        RequestRestart(std::format("{} is no longer on {}", local_, dev_));
+        return true;
+    }
+
+    // Leave through systemd (Restart=on-failure), which runs ims-pdn-up.sh
+    // again and registers on the PDN's own address.
+    void RequestRestart(const std::string& why) {
+        quit_.store(true);
+        auto ev = std::make_unique<Event>();
+        ev->type = Event::Type::Fatal; ev->text = why;
+        PostEvent(std::move(ev));
     }
 
     // After a registration succeeds — bring-up, a keepalive refresh, a

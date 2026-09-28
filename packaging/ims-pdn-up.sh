@@ -297,9 +297,13 @@ case "$PCSCF" in
     *)   log "PCSCF '$PCSCF' is not an IPv6 address; the ims PDN is brought up IPv6-only"; exit 1 ;;
 esac
 
-# ---- hand the connected ims netdev to imsd (imsd.service reads
-# /run/imsd.env) so the daemon carries no baked-in interface name
-echo "DEV=$IFACE" > /run/imsd.env
+# ---- hand the connected ims netdev and the PDN's own address to imsd
+# (imsd.service reads /run/imsd.env): the daemon carries no baked-in
+# interface name and registers on the address the network assigned — not
+# on the kernel's temporary SLAAC address from the RA, which the netdev
+# lists first and which is deprecated after a day and removed after two
+# (ims ledger F18; the SAs and the Contact would go with it)
+printf 'DEV=%s\nLOCAL=%s\n' "$IFACE" "$ADDR" > /run/imsd.env
 
 # ---- open the IMS protected ports in the firewall (rung 5b root cause,
 # journal/ims.md s56): pmOS's default nftables INPUT chain is policy-drop and

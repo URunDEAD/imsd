@@ -400,4 +400,17 @@ export namespace imsd::ipsec {
         sa.securityServer = std::format("ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=aes-cbc; " "spi-c={}; spi-s={}; port-c={}; port-s={}", sa.spiPc, sa.spiPs, sa.portPc, sa.portPs);
         return sa;
     }
+
+    // Every local address holding an SA to the P-CSCF, once each, in kernel
+    // order: where a registration made on another address of the link (the
+    // kernel's temporary one, before 0.3.10 — ims ledger F18) still lives.
+    std::vector<std::string> SaLocals(std::string_view stateText, std::string_view pcscf) {
+        std::vector<std::string> locals;
+        for (std::string_view b : detail::SrcBlocks(stateText)) {
+            std::string_view src = detail::TokenAfter(b, "src ");
+            if (src.empty() || detail::TokenAfter(b, "dst ") != pcscf) continue;
+            if (std::ranges::find(locals, src) == locals.end()) locals.emplace_back(src);
+        }
+        return locals;
+    }
 }
