@@ -15,402 +15,114 @@ network.
 
 ## Status
 
-Call-capable, both directions. Outgoing VoLTE calls place, answer, carry
-full-duplex AMR-WB audio, and tear down; incoming calls ring, answer via
-`Accept`, and carry media the same way — driven end-to-end from a stock
-dialer over the frozen D-Bus ABI. Current state:
+Call-capable, both directions: outgoing calls place, answer, carry full-duplex
+AMR-WB audio and tear down; incoming calls ring, answer and carry media the
+same way, driven end-to-end from a stock dialer over a frozen D-Bus ABI.
+Not there yet: DTMF (`SendDtmf` is a stub), hold/multiparty/call waiting,
+USSD, P-CSCF discovery (the address is configured by hand).
 
-The engine core (`imsd-core`) is a GLib-free, pure-`std` static library whose
-every decision — SIP framing, SDP selection, the AKAv1-MD5 digest, the
-`ip xfrm` command sequence, and the whole call FSM — is unit-tested on a dev
-box with no bus, modem, or phone; several suites pin output byte-for-byte
-against recorded network traffic. GLib/GDBus, sockets, and subprocess control
-live only in the `imsd` daemon shell, apart from imsd-bus, the GLib polkit
-gate it shares with imsd-ofonod.
+Verified by community members to be fully working:
 
-## Architecture
-
-C++26 modules, built with Crafter Build. Six build products:
-
-- **imsd-core** (static library) — the engine, pure `import std` C++ with no
-  GLib and no I/O side effects. Everything here is unit-testable on any dev
-  box without a modem, a bus, or a phone; several suites pin output
-  byte-for-byte against recorded network traffic.
-- **imsd** (executable) — the daemon shell: GLib main loop, GDBus service,
-  sockets, subprocess control (`qmicli`/`mmcli`/`ip`), and the registration
-  sequence + run loop that pumps the core.
-- **imsd-bus** (static library) — the polkit gate in front of call control
-  (`net.catcrafts.IMS1.Voice`), which imsd and imsd-ofonod both link. GLib,
-  so kept outside imsd-core. A translation daemon that runs as root on the
-  system bus reaches imsd as root, which polkit always allows, so it gates
-  its own callers through this or it is a bypass.
-- **imsd-media** (executable) — the RTP/AMR-WB data plane, spawned once per
-  call. Pure `import std` + POSIX, no GLib; links `-ldl` and dlopen's the
-  codecs. A separate process for crash isolation and the far-end-hangup
-  exit-code contract.
-- **imsd-dialerd** (executable) — the Plasma Mobile integration: a session
-  daemon owning `org.kde.telephony.{CallUtils,DeviceUtils,UssdUtils}`,
-  bridging them to imsd on the system bus. GDBus translation only, no core.
-  It is a separate process because those are per-user *session*-bus names
-  that the root system daemon cannot own; built with `-- --product=dialerd`,
-  autostarted from an `.desktop` file in place of plasma-dialer's
-  `modem-daemon` (whose autostart must be disabled).
-- **imsd-ofonod** (executable) — the GNOME Calls integration, for Phosh and
-  GNOME Mobile: a system daemon owning `org.ofono` and presenting imsd as an
-  oFono modem, which is the seam GNOME Calls' bundled `ofono` provider plugin
-  drives. GDBus translation, no core, plus the imsd-bus gate on its own
-  callers; built with `-- --product=ofonod`.
-  See [GNOME Calls (Phosh, GNOME Mobile)](#gnome-calls-phosh-gnome-mobile).
-
-### Desktop integration
-
-imsd itself is desktop-agnostic: everything a dialer needs is on the system
-bus as `net.catcrafts.IMS1`. Each desktop gets a small translation daemon
-speaking whatever backend protocol its dialer already consumes, so the dialer,
-the shell and the call-history/contacts stack all stay unmodified.
-
-| Desktop | Daemon | Owns | Consumed by |
-|---|---|---|---|
-| Plasma Mobile | `imsd-dialerd` | `org.kde.telephony.*` (session bus) | plasma-dialer + kde-telephony-daemon, replacing `modem-daemon` |
-| Phosh / GNOME Mobile | `imsd-ofonod` | `org.ofono` (system bus) | GNOME Calls' `ofono` provider plugin |
-
-Phosh's own call UI needs nothing extra: it consumes `org.gnome.Calls`, which
-GNOME Calls exports once it has a working origin.
-
-### Terminating-network dependency (incoming)
-
-A UE only receives a VoLTE call as a SIP INVITE if the network's Terminating
-Access Domain Selection (T-ADS) routes it to the PS/IMS domain rather than
-paging the modem over CS. That requires the IMS registration to advertise
-voice capability — the MMTEL ICSI (`+g.3gpp.icsi-ref=...mmtel`) and
-`+sip.instance` media-feature tags in the REGISTER Contact, which
-`Imsd:Messages` emits. T-ADS may still select CS for reasons outside the
-client's control (operator policy, the modem's own radio-capability
-signalling, a competing registration). When it does, no INVITE reaches imsd;
-that is a network/modem-integration matter, not a daemon defect.
-
-## Supported hardware & carriers
-
-imsd talks to the modem through ModemManager plus `qmicli` over QRTR (USIM
-AKA via a UIM logical channel), so in practice it currently needs a Qualcomm
-modem on a mainline kernel with working WWAN/MM integration, kernel ESP
-(`ip xfrm`), and PipeWire for audio.
-
-Everything below has been verified by community members to be fully workking:
-
-| Device | OS | Carrier
+| Device | OS | Carrier |
 |---|---|---|
 | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | KPN NL |
 | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Telekom Deutschland GER |
 | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Phonero |
 | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Telia Norge |
 
-## Build
+## What it needs
 
-[Crafter Build](https://forgejo.catcrafts.net/Catcrafts/Crafter.Build) +
-gio-2.0 headers (`glib2` on Arch, `glib-dev` on Alpine).
+imsd talks to the modem through ModemManager plus `qmicli` over QRTR, installs
+its security associations with `ip xfrm` and plays audio through PipeWire, so
+in practice: a Qualcomm modem on a mainline kernel with working
+WWAN/ModemManager integration, kernel ESP, PipeWire, systemd and polkit — and
+your carrier's P-CSCF address.
 
-```sh
-crafter-build                       # bin/imsd-<target>-<march>/imsd (the daemon)
-crafter-build -- --product=media    # bin/imsd-media-.../imsd-media (the media leg)
-crafter-build -- --product=dialerd  # bin/imsd-dialerd-.../imsd-dialerd (Plasma backend)
-crafter-build -- --product=ofonod   # bin/imsd-ofonod-.../imsd-ofonod (GNOME Calls backend)
-crafter-build test                  # unit tests (Util, Aka, Ipsec, Messages, Engine, Sip, Sdp)
-```
+## Install and configure
 
-### Building with make (distro packaging)
+On a Catcrafts Fairphone 6 image imsd is installed from the project's apk
+registry and upgrades with `apk upgrade` (an upgrade restarts the daemon; a
+call in progress ends). Elsewhere, build it (below), `make install`, and
+enable the units yourself — `systemctl enable imsd`, and `systemctl enable
+--now imsd-ofonod` for GNOME Calls: imsd's preset, the
+`multi-user.target.wants` link and the `/etc/imsd.env` condition below come
+with the apk, not with `make install`.
 
-For environments without crafter-build, the Makefile mirrors the same clang
-module pipeline: GNU make, clang++ with libc++ and the libc++ std module
-sources (`std.cppm` — package `llvm-runtimes` on Alpine, `libc++` on Arch),
-lld, and gio-2.0 headers.
-
-```sh
-make            # build/make/{imsd,imsd-media,imsd-dialerd,imsd-ofonod}
-make check      # the same 7 unit-test suites
-make install    # DESTDIR/PREFIX staged install incl. the packaging/ files
-```
-
-`project.cpp` stays the canonical build description; the Makefile tracks it.
-
-### Cross-compiling for a phone (aarch64 Alpine/postmarketOS)
+Configuration is environment variables in `/etc/imsd.env`; the one required
+setting is the P-CSCF:
 
 ```sh
-packaging/make-sysroot.sh                  # one-time: Alpine aarch64 sysroot from the CDN
-crafter-build -- --target=aarch64-alpine-linux-musl \
-    --sysroot=$HOME/.cache/imsd/sysroot-aarch64-alpine \
-    --march=armv8.6-a+fp16fml+aes+sha3+sm4 --mtune=cortex-a720
-# same flags after `crafter-build test --target=aarch64-alpine-linux-musl`
-# run the suite under qemu-aarch64 against the sysroot
-```
-
-## Run (development)
-
-```sh
-./bin/imsd-*/imsd --session   # own net.catcrafts.IMS1 on the session bus
-busctl --user call net.catcrafts.IMS1 /net/catcrafts/IMS1 net.catcrafts.IMS1 GetStatus
-```
-
-On a phone the daemon runs as root on the system bus, where any local
-account may reach it (`packaging/net.catcrafts.IMS1.conf`); placing,
-answering and ending a call is polkit's `net.catcrafts.IMS1.Voice`
-(`packaging/net.catcrafts.IMS1.policy`, checked by imsd and imsd-ofonod
-alike): the active local session — the dialer, whatever the account is
-called — and root, not an ssh login. It is started by `packaging/imsd.service`
-after `packaging/ims-pdn-up.sh` has brought up the ims PDN through
-ModemManager. An apk upgrade restarts `imsd` and `imsd-ofonod` once the
-transaction is done (a call in progress ends), as does adding a package
-again over the daemon an `apk del` left running; the restart resumes the
-registration over its existing SAs, or goes on waiting out a hold the
-network had set. The bring-up never lets the ims PDN become the phone's IPv6
-default route: the PDN's router advertisement is not accepted as a default
-router (`accept_ra_defrtr=0` on the netdev; its prefix and MTU still apply)
-and the P-CSCF gets a host route instead, so on IPv4-only wifi the phone's
-other IPv6 traffic (apk, browsers) is not sent into the IMS walled garden,
-where it would hang. Media peers get a host route per call; anything else
-on the IMS network (its DNS servers, a traceroute target) needs its own
-(`ip -6 route add <addr> dev qmapmux0.0`). The PDN MTU ModemManager reports
-is set on the link. It spawns
-`/usr/libexec/imsd-media` per call. Registration
-resumes an in-kernel IPsec SA when one is present (avoiding the network's
-fresh-SA throttle) and keeps itself alive with a re-REGISTER refresh at half
-the granted lifetime. `packaging/APKBUILD` builds the apk from source via
-the Makefile; `packaging/APKBUILD.binary` + `make-bin-tarball.sh` wrap a
-cross-compiled build into an apk instead.
-
-## GNOME Calls (Phosh, GNOME Mobile)
-
-`imsd-ofonod` presents imsd on the system bus as an oFono modem — a Manager at
-`/`, one Modem + VoiceCallManager at `/imsd`, and a VoiceCall object per live
-call — which is what GNOME Calls' bundled `ofono` provider plugin drives.
-Calls, Phosh and GNOME Shell run unmodified.
-
-`org.ofono` is the seam because it is the only one a third party can
-implement. `org.gnome.Calls.Call` is what Calls *exports* so a shell can
-observe and control a call that already exists (Accept, Hangup, SendDtmf,
-Silence — there is no Dial); Phosh consumes it from Calls. Calls' own backends
-are libpeas provider plugins (`mm`, `ofono`, `sip`, `dummy`) linked against
-private headers that no distro installs.
-
-Setup:
-
-```sh
-apk add imsd-ofono                    # enables imsd-ofonod via a systemd preset
-systemctl enable --now imsd-ofonod    # hand installs: system service, org.ofono is a system name
-# point Calls at the ofono provider (the package ships this as a gschema
-# override; this is the per-user equivalent)
-gsettings set org.gnome.Calls autoload-plugins "['ofono']"
-```
-
-Drop `mm` from `autoload-plugins` rather than adding `ofono` alongside it: the
-ModemManager provider would offer the modem's own CS voice path as a second
-origin, and on a phone whose voice path is imsd that origin carries no audio.
-
-Do not run this alongside a real `ofonod` — there is one `org.ofono` name and
-one owner; the unit declares `Conflicts=ofono.service` and the daemon exits if
-it loses the name. Running `imsd-dialerd` at the same time is fine (different
-bus, different consumer).
-
-Verified on a Fairphone 6 (postmarketOS, dbus-broker) with GNOME Calls 50.0:
-outgoing and incoming calls with audio both ways, answered and hung up through
-`org.gnome.Calls.Call` — the surface Phosh drives. One dbus-broker detail is
-load-bearing and lives in the policy file: dbus-broker checks a broadcast
-against the sender's send policy for every name the receiver owns, so root
-(imsd) must be allowed `send_destination="org.ofono"` or imsd's call signals
-never reach the daemon.
-
-Known gaps, all inherited rather than introduced:
-
-- **USSD is refused** with `org.ofono.Error.NotSupported`; the IMS stack has no
-  USSD path. It is deliberately not advertised in the modem's `Interfaces`.
-- **No hold, multiparty, transfer or call waiting** — imsd is a single-call
-  stack, so those methods return `org.ofono.Error.NotImplemented`.
-- **Per-call caller-ID withholding is refused** rather than silently ignored:
-  imsd cannot honour a CLIR request, and failing is safer than dialling with
-  the caller ID exposed.
-- **Phosh's emergency-call screen lists nothing.** Not for want of the data:
-  `imsd-ofonod` publishes `org.ofono.VoiceCallManager.EmergencyNumbers` (112,
-  911, plus `EMERGENCY_NUMBERS`), which is oFono's standard place for it.
-  Calls' ofono provider simply never reads it — it makes no `GetProperties`
-  call on the VoiceCallManager, and returns NULL for the origin's
-  `emergency-numbers`, which is what
-  `org.gnome.Calls.EmergencyCalls.GetEmergencyContacts` is built from. (The
-  ModemManager provider does read it, via `mm_sim_dup_emergency_numbers()`.)
-  An upstream fix would close this. Dialling an emergency number from the
-  normal dialpad is unaffected — that reaches imsd's own classifier.
-- DTMF is forwarded to imsd, where `SendDtmf` is still a stub (RFC 4733 is not
-  implemented yet) — the same limitation Plasma has.
-- **Restarting `imsd-ofonod` restarts GNOME Calls with it.** When the
-  modem's `VoiceCallManager` interface goes away and comes back, Calls 50.0
-  adds a new origin but leaves the old origin's `CallAdded` handler connected:
-  after one such cycle every call is added twice, after a few the stale handler
-  runs on freed memory and Calls dies with SIGBUS in `g_hash_table_lookup`
-  (measured on the FP6). Calls-side; an upstream fix belongs in
-  `plugins/provider/ofono/calls-ofono-provider.c`. To keep imsd's own
-  restarts and registration drops from triggering it, `imsd-ofonod` lists the
-  interface permanently: `Online` tracks registration, and `Dial` fails with
-  "imsd is not registered" / "imsd is not running" instead. Only `org.ofono`
-  vanishing — this daemon restarting — still cycles the origin, and after
-  that Calls dials nothing until it restarts, so the unit's `ExecStartPost`
-  restarts the Calls daemon of every user running one. Its first start
-  since boot leaves a running Calls alone.
-
-Development, without a phone or root:
-
-```sh
-./bin/imsd-*/imsd --session &          # imsd's ABI on the session bus
-./bin/imsd-ofonod-*/imsd-ofonod --session
-busctl --user call org.ofono / org.ofono.Manager GetModems
-# or keep org.ofono on the system bus and imsd on the session bus:
-IMSD_BUS=session imsd-ofonod
-```
-
-## Configuration
-
-Everything is environment variables. The packaged unit reads
-`/run/imsd.env` (written by `ims-pdn-up.sh`: the connected ims netdev and
-the PDN address ModemManager assigned to it) and
-then `/etc/imsd.env` (your configuration, wins on conflict). Minimum viable
-`/etc/imsd.env`:
-
-```sh
-# REQUIRED until P-CSCF discovery from the PDN's PCO is implemented: your
-# carrier's P-CSCF address. Find it in a stock-firmware capture or your
-# carrier's IMS documentation.
+# your carrier's P-CSCF address — from a stock-firmware capture or the
+# carrier's IMS documentation
 PCSCF=2001:db8::105
 ```
 
-### imsd
+The apk's `imsd.service` is enabled by preset and starts at boot once that
+file exists (the condition is checked when the unit starts, so after writing
+the file run `systemctl start imsd`). It first brings the `ims` PDN up through ModemManager, then registers:
+resuming an existing registration when it can, registering fresh otherwise,
+and waiting out whatever the network tells it to wait out. Check on it with:
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `PCSCF` | *(none — required)* | P-CSCF address; without it registration fails with a clear error |
-| `PCSCF_PORT` | `5060` | unprotected SIP port for the initial REGISTER |
-| `DEV` | `qmapmux0.0` | ims-PDN netdev; the packaged service passes the real one via `/run/imsd.env` |
-| `LOCAL` | *(auto)* | UE address. The packaged service gets the PDN address ModemManager assigned, via `/run/imsd.env` from `ims-pdn-up.sh`; a manual run prefers a global IPv6 on `DEV` that is neither temporary nor `dynamic` (RA-derived), then any non-temporary one, then the first (the kernel's temporary SLAAC address is listed first, and a registration bound to it is lost when the kernel retires it) |
-| `USER_AGENT` | `imsd/<version>` | REGISTER User-Agent. Some networks fingerprint UAs; setting your device's stock build string reproduces the stock modem's registration exactly. Empty omits the header |
-| `STATE_FILE` | `/var/lib/imsd/imsreg.state` (root) / `$XDG_STATE_HOME/imsd/imsreg.state` | persisted registration context for warm resume |
-| `HOLDS_FILE` | `/run/imsd.holds` (root) / `$XDG_RUNTIME_DIR/imsd.holds` (`/tmp/imsd.holds` without a runtime dir) | the waits the network imposed (a `Retry-After`, the refusal schedule) and where that schedule stands, kept across a restart of imsd for the PDN they were set on — not across a reboot; `/dev/null` switches the file off (only a regular file is ever removed; anything else is emptied) |
-| `RESUME` | `auto` | `0` forces a fresh registration (ignores a warm SA) |
-| `REFRESH_INTERVAL` | *(auto)* | keepalive re-REGISTER period in s; default = half the granted expiry, clamped to [120, 1800] |
-| `EALG` | `aes-cbc` | offered ESP cipher (`aes-cbc`, `des-ede3-cbc`, `null`). From the 401's `Security-Server` list imsd selects the highest-preference `ipsec-3gpp` mechanism that matches this offer (RFC 3329 §2.3.1) and takes the SPIs/ports from the entry carrying them (some cores list every mechanism they support and put the SPIs on the one they applied); when no entry matches, the P-CSCF's SPI-carrying entry is installed as listed (`hmac-md5-96`, an absent `ealg` = null) and the journal says so. The line, the selection and the SA parameters are logged at every fresh registration |
-| `SIP_TRANSPORT` | `auto` | transport of the protected leg (the second REGISTER and everything after it): `tcp`, `udp`, or `auto` = TCP, falling back to a fresh registration over UDP when the P-CSCF leaves two TCP connects unanswered — but only on a phone that has never registered over TCP: once the state file (`/var/lib/imsd/imsreg.state`) records a TCP registration, a silent connect is treated as an outage, not a policy (delete the file or set `udp` to override, e.g. after a SIM change). The challenge (first REGISTER) is always UDP. Over UDP a REGISTER or INVITE larger than ~1.2 KB leaves as IPv6 fragments at the ims PDN's 1280-byte MTU (the journal says so once per flow); there are no SIP retransmission timers over UDP yet, so a lost datagram costs a timeout. The SAs, the listener and the firewall rule cover both transports |
-| `EMERGENCY_NUMBERS` | *(empty)* | comma-separated additions to the builtin 112/911 emergency numbers (e.g. a private test core's short code). SIM `EF_ECC` is not read yet |
-| `RTP_PORT` | `50004` | local RTP port advertised in SDP |
-| `PRECOND` | `0` | `1` offers SDP QoS preconditions |
-| `CODECS` | *(empty — defaults)* | comma-separated codec preference list over `AMR-WB`, `AMR` (or `AMR-NB`), `PCMA`, `PCMU`: restricts and orders both the codecs offered on an outgoing call and those accepted from an inbound offer (default: offer AMR-WB + AMR, accept all four in that order). A bench knob — a network whose gateway transcodes every caller up to AMR-WB otherwise never lets the narrowband path run |
-| `DUMP_SIP` | `0` | `1` writes raw REGISTER-200/SUBSCRIBE-200 dumps, the last refused REGISTER or SUBSCRIBE final (`imsd-register-fail.raw`, `imsd-subscribe-fail.raw`), the last inbound INVITE (`imsd-invite-in.raw`) and the last outgoing INVITE (`imsd-invite-out.raw`), mode 0600, for debugging — they contain your IMSI/MSISDN and addresses. A refused REGISTER or SUBSCRIBE is logged with its status line and any Retry-After / Warning / Reason / Server headers |
-| `DUMP_DIR`, `OUT_DIR` | state dir | where dumps / per-call media stats land |
-| `IMSD_MEDIA` | *(auto)* | path to `imsd-media` (default: next to `imsd`, else `/usr/libexec/imsd-media`) |
+```sh
+journalctl -u imsd -f
+busctl --system call net.catcrafts.IMS1 /net/catcrafts/IMS1 net.catcrafts.IMS1 GetStatus
+```
 
-The protected client/server ports are fixed at 45061/45062
-(`imsd::util::kPortUc`/`kPortUs`) — changing them in source also requires
-updating the firewall rules `ims-pdn-up.sh` installs.
+Every variable, what the daemon does when the registration breaks, and
+what the journal lines mean are in [AGENTS.md](AGENTS.md) (§10, §7.4, §7.8).
 
-**When the registration stops working** (the refresh is refused, or the
-protected flow dies and nothing answers the reconnect) imsd does in place
-what a restart does: it reconnects through the existing SA and refreshes;
-after two refused refreshes or two unanswered reconnect cycles (such a
-cycle is not counted while the modem reports no packet service) it
-registers fresh (new Call-ID, new challenge, new SA pair). Reconnects back
-off 5 s → 5 min; a refused or throttled fresh attempt waits on the throttle
-schedule (21 min, growing to 60), a silent one 30 s → 10 min, and a
-network `Retry-After` is honoured, up to an hour (the schedule's longest wait): a longer
-one is cut to it and the refusal heard again then. While a fresh registration is deferred, the existing SA is
-still retried on the reconnect backoff, unless the old registration is known gone: a `403` once a
-fresh registration is due, an attempt that got past the SA setup, or a binding
-the network terminated (reg-event). A `Dial`
-that reaches imsd while it is unregistered brings the next recovery step
-forward (the reconnect, or the fresh attempt once it is due), never a wait
-the network imposed (a `Retry-After`, or the schedule after a
-refused or throttled fresh attempt); imsd-ofonod refuses a `Dial` then, and
-imsd-dialerd lists no modem. A bring-up the network deferred waits the same
-schedule out with nothing to reconnect over (the resume just found the
-stored SAs unusable), then tries again. The network's holds outlive a
-restart of imsd (an upgrade restarts it): they are kept in
-`/run/imsd.holds` for the PDN they were set on, with the schedule's place
-(a restart does not start it over at 21 min), and waited out at the next
-start, before the resume (a refresh's `Retry-After`) or before the fresh
-registration (a fresh attempt's schedule or `Retry-After`, a terminated
-binding's wait); a reboot or another PDN address starts clean. An upgrade from a daemon
-older than 0.3.10, which kept its bring-up throttle wait in memory only,
-hands that wait over the same way when this start registers on the address
-it was earned on (the fresh-SA throttle's wait, `spi-s=0`; the old daemon's
-other deferrals, after a 401 it could not use, are not handed over): the
-upgrade records that daemon's invocation, and the next
-start reads its journal lines once the daemon has stopped — a wait that
-ended meanwhile is read as it ended; on another address (the normal hop:
-0.3.9 sat on the kernel's temporary address) only the verdict that the old
-registration is gone is kept and the start registers fresh at once. When
-the old address cannot be read the wait is handed over anyway; when the wait
-cannot be timed, or this start has no `LOCAL`, the journal says it was not
-handed over.
-The journal says which (`…; next: fresh registration in N s`, `registering
-fresh (recovery attempt N)`, `fresh registration deferred/refused/failed:
-…`, `bring-up deferred: …`). One case leaves through a real restart
-instead: when the address imsd is registered on has left the ims netdev
-and the PDN's own address is not there to move to (the PDN went away) —
-the journal shows `engine fatal: … — exiting for systemd restart`,
-and after `RestartSec` (120 s) `ims-pdn-up.sh` runs again and imsd
-registers on the PDN's address. A registration resumed on an older
-address (a pre-0.3.10 temporary one) moves to the PDN's own address in
-place: with its next fresh registration, or when the older address leaves
-the netdev first, which takes that registration with it. The reg-event
-subscription — the network's own
-view of the binding, one live dialog per registration, subscribed anew ahead of
-the lifetime the S-CSCF granted — is retried when refused or unanswered
-(60 s doubling to 10 min, a `Retry-After` honoured up to an hour: a registration refresh
-neither brings a scheduled retry forward nor starts its back-off over) and renewed when the S-CSCF ends
-it for a reason that allows renewal (RFC 6665; after `noresource`,
-`rejected` or any other reason the renewal does not cover the next
-registration refresh subscribes anew); an earlier
-subscription's NOTIFY is still read for the binding's state, but its end is
-not ours to renew (KPN closes a registration's previous subscription with
-`noresource` when a new one replaces it); a NOTIFY that terminates the binding triggers a fresh
-registration (at once, or after the network's `retry-after`, up to an hour; after the
-call, when one is up; one exception: a REGISTER wait that still gets its 200
-after such a NOTIFY, a call having kept the flow, leaves that registration
-standing); after
-`rejected` and `unregistered` it waits on the refusal schedule (21 min,
-growing to 60), a wait no `Dial` cuts short — the binding is gone, so
-nothing is retried meanwhile. One termination counts once, however many
-NOTIFYs report it (a repeated `probation` report may extend its hold from
-its own `retry-after`).
+## Dialers
 
-### imsd-media (per-call, set through imsd's environment)
+imsd itself is desktop-agnostic: everything a dialer needs is on the system
+bus as `net.catcrafts.IMS1`. A small translation daemon per desktop speaks
+the backend protocol its dialer already consumes, so dialer, shell and the
+call-history/contacts stack run unmodified.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `MIC`, `PLAY` | `1`, `1` | uplink mic capture / downlink playout via PipeWire |
-| `AUDIO_USER` | *(auto)* | account whose PipeWire session carries call audio. imsd sets it for each call from logind: the user session active on seat0 (`loginctl show-seat seat0`, a greeter does not count) when it has a `/run/user/<uid>/pipewire-0` socket. Set in imsd's own environment it pins an account instead. imsd as packaged (root, on the system bus) logs the resolution at start and when a call's media starts (`audio session: …`), imsd-media once per call. imsd-media started without the variable at all (by an imsd older than 0.3.10 while an upgrade replaces it, or by hand) tries the account `user`, its old default. |
-| `GAIN`, `PLAY_GAIN` | `10`, `1.0` | uplink / downlink gain |
-| `AMR_MODE` | `2` | AMR-WB encoder mode (0–8) |
-| `DTX` | `0` | encoder discontinuous transmission |
-| `MEDIA_TIMEOUT` | `6.0` | seconds of downlink silence before exit 3 (far-end-hangup signal) |
-| `RTP_DUMP` | `0` | `1` captures raw downlink RTP next to the stats file |
+| Desktop | Daemon | Package | Owns | Consumed by |
+|---|---|---|---|---|
+| Plasma Mobile | `imsd-dialerd` | `imsd` | `org.kde.telephony.*` (session bus) | plasma-dialer + kde-telephony-daemon, replacing `modem-daemon` |
+| Phosh / GNOME Mobile | `imsd-ofonod` | `imsd-ofono` | `org.ofono` (system bus) | GNOME Calls' `ofono` provider plugin |
 
-## D-Bus ABI
+Plasma Mobile needs nothing beyond the `imsd` package: `imsd-dialerd` is
+autostarted in the session in place of plasma-dialer's `modem-daemon`, whose
+own autostart must be off — the package hides it for accounts created after
+the install (`/etc/skel`); an existing account hides it itself with a
+`Hidden=true` copy of `org.kde.modem.daemon.desktop` in `~/.config/autostart`.
 
-`net.catcrafts.IMS1` at `/net/catcrafts/IMS1`. The ABI is frozen — dialer
-integrations depend on it:
+For Phosh and GNOME Mobile, `apk add imsd-ofono` enables `imsd-ofonod` and
+points GNOME Calls at its `ofono` provider (a gschema override; the per-user
+equivalent is `gsettings set org.gnome.Calls autoload-plugins "['ofono']"`).
+Do not run it alongside a real `ofonod`. Known gaps — USSD, hold and
+multiparty, caller-ID withholding, the empty emergency-call screen, and why a
+restart of `imsd-ofonod` restarts GNOME Calls — are listed in
+[AGENTS.md §8.3](AGENTS.md).
 
-| Member | Signature |
-|---|---|
-| `Dial(number)` | `s → s` (callUni) |
-| `HangUp(callUni)` | `s` |
-| `Accept(callUni)` | `s` |
-| `SendDtmf(callUni, tones)` | `ss` |
-| `GetCalls()` | `→ aa{sv}` |
-| `GetStatus()` | `→ a{sv}` |
-| `CallAdded` | `s a{sv}` |
-| `CallStateChanged` | `s s s` (callUni, state, reason) |
-| `CallDeleted` | `s` |
-| `RegistrationChanged` | `b` |
+Call control is polkit's `net.catcrafts.IMS1.Voice`: the active local
+session and root may place, answer and end calls; an ssh login may not.
 
-Both `imsd-dialerd` and `imsd-ofonod` translate this ABI and add no members
-to it; a new desktop needs a new translation daemon, not changes here — one
-that runs as root on the system bus also gates its own callers through
-imsd-bus (see Architecture), or it bypasses `net.catcrafts.IMS1.Voice`.
+## Building
+
+[Crafter Build](https://forgejo.catcrafts.net/Catcrafts/Crafter.Build) plus
+clang/libc++/lld and the gio-2.0 headers:
+
+```sh
+crafter-build          # the daemon; -- --product=media|dialerd|ofonod for the others
+crafter-build test     # the seven unit-test suites
+make && make check     # the same, without crafter-build (distro packaging)
+```
+
+Cross-compiling for a phone, the Makefile's requirements, the package layout
+and the CI that publishes the apks are in [AGENTS.md](AGENTS.md) (§4, §9).
+
+## Documentation
+
+[AGENTS.md](AGENTS.md) is the complete reference — for coding agents, and
+for anyone who wants to know how imsd works or change it: the build products
+and the rule that keeps the engine core free of GLib and I/O, the test
+suites, the lint rules, the registration and recovery behaviour, the ims PDN
+bring-up, upgrades, the frozen D-Bus ABI, packaging and release mechanics,
+the full configuration reference, and the carrier behaviours the code was
+shaped by.
 
 ## License
 

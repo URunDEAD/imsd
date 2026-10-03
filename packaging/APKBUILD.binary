@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Catcrafts®
 # Maintainer: Jorijn van der Graaf <jorijnvdgraaf@catcrafts.net>
 # Binary packaging: wraps a crafter-build binary cross-compiled per the
-# README's "Cross-compiling" section into a proper apk — used by this repo's
+# cross-compiling flow of AGENTS.md §4.3 into a proper apk — used by this repo's
 # package CI (packaging/build-package.sh, which also seds pkgver from
 # implementations/main.cpp) and runnable by hand. The source tarball is
 # produced by packaging/make-bin-tarball.sh; the desktop/preset files and

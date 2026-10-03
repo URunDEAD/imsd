@@ -6,7 +6,7 @@ name: package
 # plain 'apk upgrade' without an fp6-img image run.
 #
 # Build: crafter-build cross-compiles against an Alpine aarch64 sysroot
-# (packaging/build-package.sh — the README's "Cross-compiling" flow), the
+# (packaging/build-package.sh — AGENTS.md §4.3's cross-compiling flow), the
 # test suite runs natively, and packaging/APKBUILD.binary wraps the result.
 # This needs no privileged runner: it runs in an alpine:edge container on
 # the ordinary arch-latest runner.

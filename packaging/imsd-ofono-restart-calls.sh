@@ -3,8 +3,8 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Catcrafts®
 #
 # ExecStartPost of imsd-ofonod.service. GNOME Calls 50.0 keeps a stale modem
-# when org.ofono vanishes and dials nothing until it is restarted (README,
-# Known gaps), so every start of imsd-ofonod after org.ofono went away
+# when org.ofono vanishes and dials nothing until it is restarted (AGENTS.md
+# §8.3, Known gaps), so every start of imsd-ofonod after org.ofono went away
 # restarts the Calls daemon of each user running one. Its first start since
 # boot is not one: no Calls has seen org.ofono go, and a Calls that runs
 # already (a login during the bring-up) is left alone. The unit's own

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # SPDX-FileCopyrightText: Copyright (C) 2026 Catcrafts®
 # CI package build: cross-compile imsd for aarch64 with crafter-build (the
-# README's "Cross-compiling" flow), run the test suite natively, and package
+# cross-compiling flow of AGENTS.md §4.3), run the test suite natively, and package
 # the result via packaging/APKBUILD.binary. Expects an x86_64 Alpine
 # environment with root — the workflow runs it in an alpine:edge job
 # container on an ordinary runner. Root only installs packages and hands off

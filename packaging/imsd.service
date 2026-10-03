@@ -22,7 +22,7 @@ TimeoutStartSec=900
 # /run/imsd.env: written by ims-pdn-up.sh (DEV= the connected ims netdev,
 # LOCAL= the PDN address ModemManager assigned to it).
 # /etc/imsd.env: admin configuration — PCSCF= is REQUIRED (the carrier's
-# P-CSCF address; see the README's Configuration section) and wins over the
+# P-CSCF address; see AGENTS.md §10, or the README) and wins over the
 # runtime-derived values.
 EnvironmentFile=-/run/imsd.env
 EnvironmentFile=-/etc/imsd.env

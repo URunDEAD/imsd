@@ -6,7 +6,7 @@
 imsd — the userspace IMS/VoLTE daemon (control plane).
 
 Owns net.catcrafts.IMS1 on the system bus with the project's frozen D-Bus ABI
-(README) and drives it with the engine core: register on the IMS PDN (USIM AKA
+(AGENTS.md §8.1) and drives it with the engine core: register on the IMS PDN (USIM AKA
 + IPsec sec-agree, fresh or warm-resume, with a keepalive re-REGISTER refresh),
 run outgoing and incoming calls through the Imsd:Engine call machine (inbound
 INVITEs on the protected-port listeners become ringing calls a dialer answers
