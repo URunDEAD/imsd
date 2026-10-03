@@ -93,11 +93,13 @@ export namespace imsd::engine {
     // unbarred registers within the hour); once a fresh registration is
     // due it also says the old registration is gone (KPN drops it the
     // moment an initial REGISTER arrives, throttled or not), as does a
-    // fresh attempt that got past the SA setup, and a resume that failed at
-    // bring-up (OldGone) — no reconnect over the old SA from then on. Every wait
+    // fresh attempt that got past the SA setup, a binding the network
+    // terminated, and a resume that failed at bring-up (OldGone) — no
+    // reconnect over the old SA from then on. Every wait
     // is either the self-imposed backoff, which a user's Dial cuts short,
     // or the network's own word (a Retry-After, the schedule after a
-    // refused or throttled fresh attempt), which nothing cuts short — a
+    // refused or throttled fresh attempt, a terminated binding's probation
+    // or its refusal schedule), which nothing cuts short — a
     // restart of the process neither: the shell keeps the holds (Holds)
     // and hands them to the next one (Restore). The shell supplies the
     // clock and the network; this holds the deadlines and names the next
@@ -137,10 +139,11 @@ export namespace imsd::engine {
         int throttleMinutes = ThrottleMinutesMin;
         bool fresh = false;         // the next registration attempt is a fresh one
         bool oldGone = false;       // the old registration is gone: nothing to reconnect over
+        bool terminated = false;    // the network terminated our binding, and the policy has counted it
         // the deadlines, on the shell's clock
         double backoffUntil = 0;    // self-imposed: no step before this; a Dial clears it
         double holdUntil = 0;       // the network's word for any attempt (a Retry-After on a refresh): nothing clears it
-        double freshHoldUntil = 0;  // no fresh attempt before this (the schedule after a refused or throttled fresh attempt, a fresh Retry-After)
+        double freshHoldUntil = 0;  // no fresh attempt before this (the schedule after a refused or throttled fresh attempt, a fresh Retry-After, probation, rejected/unregistered)
 
         bool Fresh() const { return fresh; }
         bool Reconnectable() const { return !oldGone; }
@@ -187,13 +190,18 @@ export namespace imsd::engine {
         // registration is due says the old registration is gone (KPN drops
         // it the moment an initial REGISTER arrives, throttled or not).
         void OnReconnectFailure(double now, Failure f, long retryAfter = 0, int status = 0) {
+            if (retryAfter > 0) holdUntil = std::max(holdUntil, now + static_cast<double>(std::min(retryAfter, RetryAfterMax)));
+            // A cycle over a registration already known gone — the network
+            // terminated the binding while the cycle waited for its final —
+            // fails by definition: not a silent cycle, not a refusal, and no
+            // backoff before the fresh registration that verdict scheduled.
+            if (oldGone) return;
             if (f == Failure::Refused) refusals++;
             else silentCycles++;
             if (refusals >= RefusalsBeforeFresh || silentCycles >= SilentCyclesBeforeFresh) fresh = true;
             if (status == 403 && fresh) oldGone = true;
             backoffUntil = now + reconnectDelay;
             reconnectDelay = std::min(reconnectDelay * 2, ReconnectDelayMax);
-            if (retryAfter > 0) holdUntil = std::max(holdUntil, now + static_cast<double>(std::min(retryAfter, RetryAfterMax)));
         }
 
         // A failed fresh registration; `saReplaced`: it got past the SA
@@ -217,6 +225,32 @@ export namespace imsd::engine {
             throttleMinutes = std::min(throttleMinutes * 3 / 2, ThrottleMinutesMax);
             if (retryAfter > 0) wait = std::max(static_cast<double>(std::min(retryAfter, RetryAfterMax)), FreshDelayMin);
             freshHoldUntil = now + wait;
+        }
+
+        // The network terminated our binding (a reg-event NOTIFY, RFC
+        // 3680): the old registration is gone. deactivated and expired
+        // mean a fresh registration now; probation after the network's
+        // retry-after (up to RetryAfterMax); rejected and unregistered on the
+        // refusal schedule —
+        // the network's word is neither hammered nor taken as final. One
+        // termination counts once, however often it is reported (every
+        // reg-event dialog of the account carries it, a NOTIFY may be
+        // retransmitted), and never shortens a hold already running.
+        void OnBindingTerminated(double now, std::string_view event, long retryAfter = 0) {
+            bool reported = terminated;
+            terminated = true;
+            oldGone = true;
+            fresh = true;
+            if (event == "probation") {
+                freshHoldUntil = std::max(freshHoldUntil, now + static_cast<double>(std::clamp(retryAfter, 1L, RetryAfterMax)));
+            } else if (reported) {
+                return;
+            } else if (event == "rejected" || event == "unregistered") {
+                freshHoldUntil = std::max(freshHoldUntil, now + throttleMinutes * 60.0);
+                throttleMinutes = std::min(throttleMinutes * 3 / 2, ThrottleMinutesMax);
+            } else {
+                backoffUntil = 0;
+            }
         }
 
         // The stored registration is not there to reconnect over (a resume

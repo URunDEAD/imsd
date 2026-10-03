@@ -154,6 +154,60 @@ export namespace imsd::sip {
         return s;
     }
 
+    // Our binding in a reg-event NOTIFY body (RFC 3680 reginfo): the
+    // <contact> whose <uri> carries `user` as its SIP user part, across every
+    // <registration> of the implicit set (the sip: and the tel: identity
+    // list the same contact). Active anywhere = Active; otherwise the first
+    // terminated occurrence's event and retry-after attribute; NotListed
+    // when no contact of ours is in the document — a partial update about
+    // other bindings, or a previous registration's binding (the contact our
+    // own fresh registration deactivated, O2 UK 2026-09-24).
+    struct RegInfoContact {
+        enum class State { NotListed, Active, Terminated };
+        State state = State::NotListed;
+        std::string event;     // terminated: deactivated | probation | rejected | unregistered | expired | …
+        long retryAfter = 0;   // terminated: the retry-after attribute (probation), seconds
+    };
+    RegInfoContact RegInfoContactState(std::string_view reginfo, std::string_view user) {
+        constexpr std::size_t npos = std::string_view::npos;
+        RegInfoContact out;
+        std::string needle = std::format(":{}@", user);   // sip:<user>@… / sips:<user>@…
+        std::size_t pos = 0;
+        while ((pos = reginfo.find("<contact", pos)) != npos) {
+            std::size_t tagEnd = reginfo.find('>', pos);
+            if (tagEnd == npos) break;
+            std::string_view tag = reginfo.substr(pos, tagEnd - pos);
+            std::size_t end = reginfo.find("</contact>", tagEnd);
+            std::string_view body = reginfo.substr(tagEnd + 1, end == npos ? npos : end - tagEnd - 1);
+            pos = end == npos ? reginfo.size() : end + 10;
+            std::size_t u = body.find("<uri>");
+            if (u == npos) continue;
+            std::size_t ue = body.find("</uri>", u);
+            std::string_view uri = Trim(body.substr(u + 5, ue == npos ? npos : ue - u - 5));
+            if (!uri.contains(needle)) continue;
+            auto attr = [&](std::string_view name) -> std::string_view {
+                std::string key = std::format(" {}=\"", name);
+                std::size_t a = tag.find(key);
+                if (a == npos) return {};
+                std::size_t b = tag.find('"', a + key.size());
+                return tag.substr(a + key.size(), b == npos ? npos : b - a - key.size());
+            };
+            std::string_view state = attr("state");
+            if (state == "active") {
+                out.state = RegInfoContact::State::Active;
+                out.event.clear();
+                out.retryAfter = 0;
+                return out;
+            }
+            if (state == "terminated" && out.state == RegInfoContact::State::NotListed) {
+                out.state = RegInfoContact::State::Terminated;
+                out.event = std::string(attr("event"));
+                out.retryAfter = LeadingDigits(attr("retry-after")).value_or(0);
+            }
+        }
+        return out;
+    }
+
     // Where a UDP response to this request must go (RFC 3261 18.2.2): the
     // top Via's sent-by port — unless the Via carries rport, in which case
     // the caller should reply to the request's source port instead

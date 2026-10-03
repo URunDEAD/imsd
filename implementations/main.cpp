@@ -635,7 +635,7 @@ std::int64_t NowEpoch() {
 
 // The recovery policy's holds, kept for the next process: the network's
 // word (a Retry-After, the schedule after a refused or throttled fresh
-// attempt) outlives a restart of imsd. They
+// attempt, a terminated binding's wait) outlives a restart of imsd. They
 // are filed under the daemon's address — another one, or a reboot, starts
 // clean — so the file names that address and the boot, and
 // lives in /run. Seconds left at `written_at`, which is on the boot
@@ -903,6 +903,7 @@ public:
             }
             MaybeRefresh();
             MaybeReconnect();
+            MaybeResubscribe();
             if (!call_ && sip_.Alive() && Mono() - lastKa_ > 30) { sip_.SendKeepalive(); lastKa_ = Mono(); }
             ReapMedia();
             if (call_ && call_->State() != imsd::engine::CallState::Active && Mono() > deadline_) {
@@ -918,14 +919,8 @@ public:
             if (call_ && callid == call_->CallId() && cseq.ends_with("INVITE")) {
                 Execute(call_->OnInviteResponse(*msg));
                 MaybeDropCall();
-            } else if (!subCallid_.empty() && callid == subCallid_ && cseq.ends_with("SUBSCRIBE")) {
-                if (*st >= 300) {
-                    Log(std::format("reg-event SUBSCRIBE refused: {}", imsd::sip::RefusalSummary(*msg)));
-                    DumpRaw("imsd-subscribe-fail.raw", *msg);
-                } else {
-                    Log(std::format("reg-event SUBSCRIBE -> {}", *st));
-                    if (*st >= 200) DumpRaw("imsd-subscribe-200.raw", *msg);
-                }
+            } else {
+                OnSubscribeResponse(*msg, *st);
             }
         }
         // shutdown: release an active call, keep the SA/registration for resume
@@ -1000,6 +995,11 @@ private:
     SipFlow sip_;
     ServerPorts server_;
     std::string subCallid_;   // live reg-event subscription dialog (empty: none)
+    bool subPending_ = false;      // SUBSCRIBE sent, no final yet
+    double subSentAt_ = 0;
+    double subRetryAt_ = 0;        // a failed/ended subscription is renewed at this time (0: none due)
+    double subRenewAt_ = 0;        // the live subscription is subscribed anew at this time, ahead of its granted expiry (0: none)
+    double subRetryDelay_ = 60;    // 60 s doubling to 10 min between failed SUBSCRIBEs
     int portPs_ = 0;          // P-CSCF protected server port (reconnect target)
     imsd::engine::RegRecovery recovery_;   // what to do when the registration stops working
     bool saReplaced_ = false;      // the running fresh attempt got past the SA setup (the old registration's SAs are gone)
@@ -1008,6 +1008,7 @@ private:
     imsd::util::Rng rng_;
     std::optional<imsd::engine::CallMachine> call_;
     bool dropCall_ = false;
+    bool closeFlowWhenIdle_ = false;   // a binding was terminated under a call: its flow closes with the call
     pid_t mediaPid_ = -1;
     double deadline_ = 0;
     // reply_ answers the inbound request being dispatched right now;
@@ -1094,8 +1095,9 @@ private:
         // The network's word holds at bring-up as it does in recovery: a
         // hold from before this start is waited out before the resume (a
         // refresh's Retry-After) or the fresh registration (a fresh attempt's
-        // schedule or Retry-After), and so is
-        // one the resume itself earns: a refusal's Retry-After.
+        // schedule or Retry-After, a terminated binding's wait), and so is
+        // one the resume itself earns — a refusal's Retry-After, a binding
+        // a NOTIFY terminated under it.
         if (resume != "0") {
             if (!WaitForPolicy()) throw Stopping{};
             // a registration the network wrote off before this start (the
@@ -1357,7 +1359,8 @@ private:
     // the send or of its last provisional. A request arriving on the client
     // flow meanwhile (a NOTIFY, an OPTIONS) is dispatched and answered, not
     // read as the reply; a provisional of our own transaction keeps the
-    // wait going; a response to another transaction is ignored. Throws
+    // wait going; a response to our reg-event SUBSCRIBE is handled as the
+    // run loop handles it, any other transaction's is ignored. Throws
     // when nothing answers or the flow dies under a dispatched request.
     std::string AwaitFinal(const std::string& callid, long cseq, std::string_view what) {
         std::string want = std::format("{} REGISTER", cseq);
@@ -1374,7 +1377,7 @@ private:
                 continue;
             }
             if (!imsd::sip::ResponseOf(*m, callid, want)) {
-                Log(std::format("ignoring a response to another transaction while awaiting the {} reply", what));
+                if (!OnSubscribeResponse(*m, *st)) Log(std::format("ignoring a response to another transaction while awaiting the {} reply", what));
                 continue;
             }
             if (*st >= 200) return *m;
@@ -1650,6 +1653,10 @@ private:
         } catch (const std::exception& e) {
             Log(std::format("reconnect re-REGISTER failed: {}", e.what()));
             CloseFlowAfterWait();
+            // the binding terminated under the wait (the flow closed, or
+            // under a call the wait timed out): that verdict named the next
+            // step, this is no silence
+            if (!recovery_.Reconnectable()) return;
             if (!PacketServiceUp()) { CoverageGap("refresh unanswered"); return; }
             RecoveryFailed(F::Silent, 0, "refresh unanswered");
         }
@@ -1680,10 +1687,16 @@ private:
         Log(std::format("registering fresh (recovery attempt {})", recovery_.freshAttempts + 1));
         sip_.Close();
         saReplaced_ = false;   // this attempt's, whatever fails first
-        subCallid_.clear();
+        // the subscription dialog is the registration's and goes with the
+        // attempt; a retry the network scheduled (its Retry-After) stands
+        // until a fresh registration replaces the old one; an attempt that
+        // fails before the SA setup leaves the old registration and that
+        // retry standing
+        subCallid_.clear(); subPending_ = false; subRenewAt_ = 0;
         try {
             RefreshPani();
             FreshRegister();
+            subRetryAt_ = 0;   // a new registration: its subscription starts afresh
             OnRegistered();
             Log("recovered by a fresh registration");
         } catch (const ThrottledError& e) {
@@ -1712,23 +1725,156 @@ private:
     // subscription.
     void OnRegistered() {
         recovery_.OnSuccess();
+        closeFlowWhenIdle_ = false;   // this registration's flow stands, whatever a verdict said of the one before
         KeepHolds();
         bool was = registered_;
         registered_ = true;
         EmitStatus(!was);
         lastRefresh_ = Mono(); lastKa_ = Mono();
+        // a refresh or a reconnect opens no subscription dialog while imsd
+        // holds one for the registration or has a retry scheduled; a fresh
+        // registration (or a start) has none yet, and a fresh attempt drops
+        // the one it holds before it sends. A retry already scheduled (the
+        // network's Retry-After, the backoff) is MaybeResubscribe's to send,
+        // not a registration's to bring forward — nor to start its backoff
+        // over: that resets with a subscription that starts afresh here, or
+        // is accepted
+        if (subCallid_.empty() && !subPending_ && subRetryAt_ == 0) { subRetryDelay_ = 60; SubscribeRegEvent(); }
+    }
+
+    // Subscribe to the reg event package (TS 24.229 5.1.1.3): one dialog per
+    // registration, sent over the registration flow; the S-CSCF's immediate
+    // NOTIFY (logged in DispatchRequest) is the network's own view of our
+    // bindings. Failure is non-fatal — registration is unaffected.
+    void SubscribeRegEvent() {
+        subRetryAt_ = 0; subRenewAt_ = 0;
+        subCallid_ = std::format("{}@{}", rng_.Token(16), local_);
+        std::string sub = imsd::msg::BuildSubscribeReg(ctx_, subCallid_, rng_.Token(8), rng_.Token(16));
+        if (sip_.Send(sub)) { Log("reg-event SUBSCRIBE sent"); subPending_ = true; subSentAt_ = Mono(); }
+        else { Log("reg-event SUBSCRIBE send failed"); subCallid_.clear(); ScheduleResubscribe(0); }
+    }
+
+    // A response on the client flow that belongs to our reg-event
+    // SUBSCRIBE, wherever the flow is read (the run loop, a REGISTER
+    // wait). False when it is not ours.
+    bool OnSubscribeResponse(const std::string& msg, int st) {
+        if (subCallid_.empty() || imsd::sip::Header(msg, "Call-ID") != subCallid_) return false;
+        if (!imsd::sip::Header(msg, "CSeq").value_or("").ends_with("SUBSCRIBE")) return false;
+        if (st >= 300) {
+            Log(std::format("reg-event SUBSCRIBE refused: {}", imsd::sip::RefusalSummary(msg)));
+            DumpRaw("imsd-subscribe-fail.raw", msg);
+            subPending_ = false; subCallid_.clear();
+            ScheduleResubscribe(imsd::sip::RetryAfter(msg).value_or(0));
+        } else {
+            Log(std::format("reg-event SUBSCRIBE -> {}", st));
+            if (st >= 200) {
+                DumpRaw("imsd-subscribe-200.raw", msg); subPending_ = false; subRetryDelay_ = 60;
+                if (auto e = imsd::sip::GrantedExpires(msg)) ArmSubscriptionRenewal(*e);
+            }
+        }
+        return true;
+    }
+
+    // The subscription is part of being registered (TS 24.229 5.1.1.3): a
+    // refused or unanswered SUBSCRIBE is retried, 60 s doubling to 10 min
+    // (a Retry-After wins), and a subscription the S-CSCF ends is renewed.
+    // Until now one failure left the daemon deaf to the network's view of
+    // its binding — O2 UK 2026-09-24: SUBSCRIBE 500, the registration
+    // killed 8 s later, nothing heard.
+    void ScheduleResubscribe(long retryAfter) {
+        double wait = std::max(subRetryDelay_, static_cast<double>(std::min(retryAfter, imsd::engine::RegRecovery::RetryAfterMax)));
+        subRetryDelay_ = std::min(subRetryDelay_ * 2, 600.0);
+        subRetryAt_ = Mono() + wait;
+        Log(std::format("reg-event: next SUBSCRIBE in {:.0f} s", wait));
+    }
+    void MaybeResubscribe() {
+        if (subPending_ && Mono() - subSentAt_ > 32) {   // Timer F: no final at all
+            Log("reg-event SUBSCRIBE unanswered");
+            subPending_ = false; subCallid_.clear();
+            ScheduleResubscribe(0);
+        }
+        if (call_ || !registered_ || !sip_.Alive()) return;
+        if (!subCallid_.empty() && !subPending_ && subRenewAt_ > 0 && Mono() >= subRenewAt_) {
+            // the granted lifetime is running out: a new dialog (the S-CSCF
+            // closes the previous one — KPN with noresource), on the same
+            // registration
+            Log("reg-event: the subscription nears its expiry; subscribing anew");
+            subCallid_.clear(); subRenewAt_ = 0;
+            SubscribeRegEvent();
+            return;
+        }
+        if (subRetryAt_ == 0 || Mono() < subRetryAt_) return;
         SubscribeRegEvent();
     }
 
-    // (Re-)subscribe to the reg event package (TS 24.229 5.1.1.3): a fresh
-    // dialog each time, sent over the registration flow; the S-CSCF's
-    // immediate NOTIFY (logged in DispatchRequest) is the network's own view
-    // of our bindings. Failure is non-fatal — registration is unaffected.
-    void SubscribeRegEvent() {
-        subCallid_ = std::format("{}@{}", rng_.Token(16), local_);
-        std::string sub = imsd::msg::BuildSubscribeReg(ctx_, subCallid_, rng_.Token(8), rng_.Token(16));
-        if (sip_.Send(sub)) Log("reg-event SUBSCRIBE sent");
-        else { Log("reg-event SUBSCRIBE send failed"); subCallid_.clear(); }
+    // The network granted the subscription `expires` seconds (a SUBSCRIBE
+    // 2xx, a NOTIFY's Subscription-State): subscribe anew 10 min before the
+    // end, or halfway through a shorter grant.
+    void ArmSubscriptionRenewal(long expires) {
+        double ahead = expires > 1200 ? expires - 600.0 : expires / 2.0;
+        subRenewAt_ = Mono() + std::max(ahead, 30.0);
+        Log(std::format("reg-event: subscription granted {} s; renewed in {:.0f} s", expires, subRenewAt_ - Mono()));
+    }
+
+    // The network's view of our binding (RFC 3680 reginfo), read from any
+    // reg-event NOTIFY — a subscription an earlier process left behind
+    // carries the same account (O2, 2026-09-24: the previous dialog's NOTIFY
+    // reached a restarted daemon whose own SUBSCRIBE had just got 500). A
+    // binding the registrar terminated needs a new registration: the
+    // policy decides when (TS 24.229 5.4.1.5, 5.1.1.7 — now for deactivated
+    // and expired, after retry-after for probation, on the refusal schedule
+    // for rejected and unregistered). Active or not listed: nothing to do.
+    // Subscription state is per dialog: only our live dialog's end is ours
+    // to renew, unless the binding went with it.
+    void OnRegEventNotify(const std::string& msg, std::string_view body) {
+        using S = imsd::sip::RegInfoContact::State;
+        auto c = imsd::sip::RegInfoContactState(body, imsd::msg::ContactUser(ctx_));
+        bool bindingGone = false;
+        if (c.state == S::Terminated) {
+            bindingGone = true;
+            if (registered_) { registered_ = false; EmitStatus(true); }
+            // a call lives on the client flow: the flow closes when the
+            // call is dropped, not under it — the call goes on, or the
+            // network releases it, and the fresh step follows the call as
+            // every other recovery step does
+            if (call_) closeFlowWhenIdle_ = true;
+            else
+                sip_.Close();
+            subCallid_.clear(); subPending_ = false; subRetryAt_ = 0; subRenewAt_ = 0;
+            recovery_.OnBindingTerminated(Boot(), c.event, c.retryAfter);
+            KeepHolds();
+            Log(std::format("reg-event: our binding is terminated ({}); {}", c.event, NextStep()));
+        } else if (c.state == S::Active) {
+            Log("reg-event: our binding is active");
+        }
+        auto ss = imsd::sip::Header(msg, "Subscription-State");
+        std::string_view callid = imsd::sip::Header(msg, "Call-ID").value_or("");
+        bool ours = !subCallid_.empty() && callid == subCallid_;
+        if (ss && ss->starts_with("active") && ours)
+            if (auto e = IntAfter(*ss, "expires=")) ArmSubscriptionRenewal(*e);
+        if (ss && ss->starts_with("terminated") && !ours && !bindingGone) {
+            Log(std::format("reg-event: an earlier subscription ({}) ended ({}); ours ({}) stands", callid, *ss, subCallid_.empty() ? "none" : subCallid_));
+        } else if (ss && ss->starts_with("terminated") && !bindingGone) {
+            // RFC 6665 §4.1.3: renew after deactivated, timeout, giveup and
+            // probation (after its retry-after, on the 60 s retry floor); not after rejected
+            // or noresource. KPN's S-CSCF ends a registration's previous
+            // subscription with noresource when a new one replaces it (dev
+            // phone 2026-09-25, Call-IDs compared); the 2026-09-24 reading
+            // that it ends every subscription came from opening a new one
+            // at every refresh and taking that closure for our own
+            std::string reason;
+            if (auto r = ss->find("reason="); r != std::string_view::npos) {
+                std::string_view v = ss->substr(r + 7);
+                reason = std::string(v.substr(0, v.find_first_of(";, \t\r")));
+            }
+            subCallid_.clear(); subPending_ = false; subRenewAt_ = 0;
+            if (reason == "deactivated" || reason == "timeout" || reason == "giveup" || reason == "probation") {
+                Log(std::format("reg-event: subscription ended ({}); renewing", *ss));
+                ScheduleResubscribe(IntAfter(*ss, "retry-after=").value_or(0));
+            } else {
+                Log(std::format("reg-event: subscription ended ({}); the next refresh subscribes anew", *ss));
+            }
+        }
     }
 
     // ---- command handling -------------------------------------------------
@@ -1762,7 +1908,9 @@ private:
             // recovery path one immediate shot first: user action cuts the
             // backoff short, never a wait the network imposed (a
             // Retry-After, the schedule after a refused or throttled fresh
-            // attempt — the policy keeps those). The shot's REGISTER wait dispatches
+            // attempt, the one after a binding the network rejected or
+            // unregistered, probation's retry-after — the policy keeps those).
+            // The shot's REGISTER wait dispatches
             // requests, so an incoming call may have arrived under it: the
             // same rule again.
             if (!sip_.Alive()) {
@@ -1813,7 +1961,12 @@ private:
                 ? std::string_view{}
                 : std::string_view(msg).substr(at + 4);
             if (method == "MESSAGE") Log(std::format("MESSAGE from {} ({} bytes):\n{}", imsd::sip::CallerId(msg), body.size(), body));
-            else if (auto ev = imsd::sip::Header(msg, "Event"); ev && ev->starts_with("reg")) Log(std::format("reg-event NOTIFY ({} bytes):\n{}", body.size(), body));
+            else if (auto ev = imsd::sip::Header(msg, "Event"); ev && ev->starts_with("reg")) {
+                Log(std::format("reg-event NOTIFY ({} bytes):\n{}", body.size(), body));
+                if (reply_) reply_(imsd::msg::BuildResponse200(ctx_, msg));
+                OnRegEventNotify(msg, body);
+                return;
+            }
             if (reply_) reply_(imsd::msg::BuildResponse200(ctx_, msg));
             return;
         }
@@ -1894,7 +2047,13 @@ private:
     }
 
     void MaybeDropCall() {
-        if (dropCall_) { call_.reset(); callReply_ = nullptr; dropCall_ = false; }
+        if (!dropCall_) return;
+        call_.reset(); callReply_ = nullptr; dropCall_ = false;
+        if (closeFlowWhenIdle_) {
+            closeFlowWhenIdle_ = false;
+            Log("the call is over: closing the flow of the binding the network terminated under it");
+            sip_.Close();
+        }
     }
 
     void StartMedia(const imsd::engine::MediaLeg& leg) {

@@ -241,6 +241,53 @@ int main() {
         Check(!ResponseOf("", "12345@host", "2 REGISTER"), "nothing is not it");
     }
 
+    // ---- RegInfoContactState: our binding in a reg-event NOTIFY (RFC 3680)
+    {
+        using S = RegInfoContact::State;
+        auto contact = [](std::string_view id, std::string_view state, std::string_view extra, std::string_view user) {
+            return std::format(
+                "\t\t<contact id=\"{}\" state=\"{}\"{}>\n"
+                "\t\t\t<uri>sip:{}@[2a03:db8::1]:45062</uri>\n"
+                "\t\t\t<unknown-param name=\"+sip.instance\">&quot;&lt;urn:gsma:imei:35901961-000000-0&gt;&quot; </unknown-param>\n"
+                "\t\t</contact>\n", id, state, extra, user);
+        };
+        auto reginfo = [](std::string_view contacts) {
+            return std::format(
+                "<?xml version=\"1.0\"?>\n"
+                "<reginfo xmlns=\"urn:ietf:params:xml:ns:reginfo\" version=\"1\" state=\"full\">\n"
+                "\t<registration aor=\"sip:+447700900000@example.net\" id=\"2\" state=\"active\">\n{0}\t</registration>\n"
+                "\t<registration aor=\"tel:+447700900000\" id=\"3\" state=\"active\">\n{0}\t</registration>\n"
+                "</reginfo>\n", contacts);
+        };
+        const std::string me = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const std::string old = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        // the first NOTIFY of a registration: our contact active in both registrations
+        auto r0 = RegInfoContactState(reginfo(contact("3", "active", " event=\"created\" expires=\"10800\"", me)), me);
+        Check(r0.state == S::Active, "our contact active -> Active");
+        // O2 2026-09-24 10:43: the previous registration's contact deactivated by ours, ours created
+        std::string both = contact("3", "terminated", " event=\"deactivated\"", old) + contact("4", "active", " event=\"created\" expires=\"10800\"", me);
+        auto r1 = RegInfoContactState(reginfo(both), me);
+        Check(r1.state == S::Active, "old contact terminated + ours active -> Active (the old one is not ours)");
+        auto r1o = RegInfoContactState(reginfo(both), old);
+        Check(r1o.state == S::Terminated && r1o.event == "deactivated" && r1o.retryAfter == 0, "seen from the old contact's side: Terminated/deactivated");
+        // a network-initiated deregistration of our own binding
+        auto r2 = RegInfoContactState(reginfo(contact("4", "terminated", " event=\"probation\" retry-after=\"120\"", me)), me);
+        Check(r2.state == S::Terminated && r2.event == "probation" && r2.retryAfter == 120, "probation with retry-after");
+        auto r3 = RegInfoContactState(reginfo(contact("4", "terminated", " event=\"rejected\"", me)), me);
+        Check(r3.state == S::Terminated && r3.event == "rejected", "rejected");
+        // active in one registration of the set beats terminated in another
+        std::string mixed =
+            "<reginfo version=\"2\" state=\"partial\">\n<registration aor=\"tel:+1\" id=\"3\" state=\"active\">\n" + contact("4", "terminated", " event=\"expired\"", me) +
+            "</registration>\n<registration aor=\"sip:+1@x\" id=\"2\" state=\"active\">\n" + contact("4", "active", "", me) + "</registration>\n</reginfo>";
+        Check(RegInfoContactState(mixed, me).state == S::Active, "active anywhere in the set -> Active");
+        // not ours at all
+        auto r4 = RegInfoContactState(reginfo(contact("9", "terminated", " event=\"unregistered\"", old)), me);
+        Check(r4.state == S::NotListed && r4.event.empty(), "a document without our contact -> NotListed");
+        Check(RegInfoContactState("", me).state == S::NotListed, "empty body -> NotListed");
+        Check(RegInfoContactState("<reginfo><registration><contact id=\"1\" state=\"active\"><uri>sip:aaaaaaaa@x</uri></contact>", me).state == S::NotListed, "a user part that is only a prefix of ours does not match");
+        Check(RegInfoContactState("<contact state=\"terminated\" event=\"expired\"><uri>sip:" + me + "@h</uri>", me).state == S::Terminated, "an unterminated element still parses");
+    }
+
     if (Failures == 0) std::println("Sip: all tests passed");
     return Failures;
 }

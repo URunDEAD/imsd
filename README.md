@@ -282,7 +282,7 @@ PCSCF=2001:db8::105
 | `RTP_PORT` | `50004` | local RTP port advertised in SDP |
 | `PRECOND` | `0` | `1` offers SDP QoS preconditions |
 | `CODECS` | *(empty — defaults)* | comma-separated codec preference list over `AMR-WB`, `AMR` (or `AMR-NB`), `PCMA`, `PCMU`: restricts and orders both the codecs offered on an outgoing call and those accepted from an inbound offer (default: offer AMR-WB + AMR, accept all four in that order). A bench knob — a network whose gateway transcodes every caller up to AMR-WB otherwise never lets the narrowband path run |
-| `DUMP_SIP` | `0` | `1` writes raw REGISTER-200/SUBSCRIBE-200 dumps, the last refused REGISTER or SUBSCRIBE final (`imsd-register-fail.raw`, `imsd-subscribe-fail.raw`), the last inbound INVITE (`imsd-invite-in.raw`) and the last outgoing INVITE (`imsd-invite-out.raw`), mode 0600, for debugging — they contain your IMSI/MSISDN and addresses. A refused REGISTER, and a refused SUBSCRIBE final the run loop reads, are logged with the status line and any Retry-After / Warning / Reason / Server headers |
+| `DUMP_SIP` | `0` | `1` writes raw REGISTER-200/SUBSCRIBE-200 dumps, the last refused REGISTER or SUBSCRIBE final (`imsd-register-fail.raw`, `imsd-subscribe-fail.raw`), the last inbound INVITE (`imsd-invite-in.raw`) and the last outgoing INVITE (`imsd-invite-out.raw`), mode 0600, for debugging — they contain your IMSI/MSISDN and addresses. A refused REGISTER or SUBSCRIBE is logged with its status line and any Retry-After / Warning / Reason / Server headers |
 | `DUMP_DIR`, `OUT_DIR` | state dir | where dumps / per-call media stats land |
 | `IMSD_MEDIA` | *(auto)* | path to `imsd-media` (default: next to `imsd`, else `/usr/libexec/imsd-media`) |
 
@@ -301,7 +301,8 @@ schedule (21 min, growing to 60), a silent one 30 s → 10 min, and a
 network `Retry-After` is honoured, up to an hour (the schedule's longest wait): a longer
 one is cut to it and the refusal heard again then. While a fresh registration is deferred, the existing SA is
 still retried on the reconnect backoff, unless the old registration is known gone: a `403` once a
-fresh registration is due, or an attempt that got past the SA setup. A `Dial`
+fresh registration is due, an attempt that got past the SA setup, or a binding
+the network terminated (reg-event). A `Dial`
 that reaches imsd while it is unregistered brings the next recovery step
 forward (the reconnect, or the fresh attempt once it is due), never a wait
 the network imposed (a `Retry-After`, or the schedule after a
@@ -313,11 +314,30 @@ restart of imsd: they are kept in
 `/run/imsd.holds` for the address they were set on, with the schedule's place
 (a restart does not start it over at 21 min), and waited out at the next
 start, before the resume (a refresh's `Retry-After`) or before the fresh
-registration (a fresh attempt's schedule or `Retry-After`); a reboot or
-another address starts clean.
+registration (a fresh attempt's schedule or `Retry-After`, a terminated
+binding's wait); a reboot or another address starts clean.
 The journal says which (`…; next: fresh registration in N s`, `registering
 fresh (recovery attempt N)`, `fresh registration deferred/refused/failed:
-…`, `bring-up deferred: …`).
+…`, `bring-up deferred: …`). The reg-event subscription — the network's own
+view of the binding, one live dialog per registration, subscribed anew ahead of
+the lifetime the S-CSCF granted — is retried when refused or unanswered
+(60 s doubling to 10 min, a `Retry-After` honoured up to an hour: a registration refresh
+neither brings a scheduled retry forward nor starts its back-off over) and renewed when the S-CSCF ends
+it for a reason that allows renewal (RFC 6665; after `noresource`,
+`rejected` or any other reason the renewal does not cover the next
+registration refresh subscribes anew); an earlier
+subscription's NOTIFY is still read for the binding's state, but its end is
+not ours to renew (KPN closes a registration's previous subscription with
+`noresource` when a new one replaces it); a NOTIFY that terminates the binding triggers a fresh
+registration (at once, or after the network's `retry-after`, up to an hour; after the
+call, when one is up; one exception: a REGISTER wait that still gets its 200
+after such a NOTIFY, a call having kept the flow, leaves that registration
+standing); after
+`rejected` and `unregistered` it waits on the refusal schedule (21 min,
+growing to 60), a wait no `Dial` cuts short — the binding is gone, so
+nothing is retried meanwhile. One termination counts once, however many
+NOTIFYs report it (a repeated `probation` report may extend its hold from
+its own `retry-after`).
 
 ### imsd-media (per-call, set through imsd's environment)
 

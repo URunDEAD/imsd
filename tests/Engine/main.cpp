@@ -14,8 +14,9 @@
 // 480, BYE both ways. Then RegRecovery, the registration recovery policy:
 // the refusal and silence thresholds, local refusals, the reconnect and
 // fresh backoffs, the throttle schedule, Retry-After, which waits a Dial
-// may cut short, when the old registration counts as gone, and the holds
-// a restart takes over (Holds/Restore). Pure reducers, no I/O.
+// may cut short, when the old registration counts as gone, the holds a
+// restart takes over (Holds/Restore), and a binding the network terminated
+// (OnBindingTerminated). Pure reducers, no I/O.
 import std;
 import Imsd;
 
@@ -976,6 +977,65 @@ int main() {
             RegRecovery t;
             t.OnFreshFailure(1000, F::Refused, 0, /*saReplaced=*/true);
             Check(!t.Reconnectable() && freshAt(t, 1000, 1000 + 21 * 60), "refused past the SA setup: gone, and on the schedule");
+        }
+        // the network terminated our binding
+        {
+            RegRecovery n;
+            n.OnBindingTerminated(1000, "expired");
+            Check(n.Fresh() && !n.Reconnectable() && freshAt(n, 1000, 0), "expired: fresh now, nothing to reconnect to");
+            RegRecovery o;
+            o.OnBindingTerminated(1000, "probation", 300);
+            Check(freshAt(o, 1000, 1300), "probation: after the network's retry-after");
+            o.OnDial();
+            Check(freshAt(o, 1000, 1300), "…which a Dial does not cut");
+            RegRecovery p;
+            p.OnBindingTerminated(1000, "probation");
+            Check(freshAt(p, 1000, 1001), "probation without a retry-after: at least 1 s");
+            RegRecovery q;
+            q.OnBindingTerminated(1000, "rejected");
+            Check(freshAt(q, 1000, 1000 + 21 * 60) && !q.Reconnectable(), "rejected: on the refusal schedule, a hold, the old SA not retried");
+            q.OnBindingTerminated(1001, "rejected");
+            q.OnBindingTerminated(2000, "unregistered");
+            Check(q.freshHoldUntil == 1000 + 21 * 60 && q.throttleMinutes == 31, "the same termination reported again (another dialog, a retransmission): counted once");
+            RegRecovery u;
+            u.OnBindingTerminated(1000, "deactivated");
+            u.OnFreshFailure(1000, F::Silent);
+            u.OnBindingTerminated(1005, "deactivated");
+            Check(freshAt(u, 1005, 1030), "…nor does a repeat cut the backoff of the attempt made since");
+            RegRecovery v;
+            v.OnFreshFailure(1000, F::Refused, 3000);
+            v.OnBindingTerminated(1010, "rejected");
+            Check(!v.Reconnectable() && freshAt(v, 1010, 4000) && v.throttleMinutes == 46, "a rejected binding never shortens the network's Retry-After");
+            RegRecovery w;
+            w.OnBindingTerminated(1000, "probation", 3000);
+            w.OnBindingTerminated(1010, "probation", 60);
+            Check(freshAt(w, 1010, 4000), "…nor a second probation report the first one's retry-after");
+            RegRecovery x;
+            x.OnBindingTerminated(1000, "probation", 86400);
+            Check(freshAt(x, 1000, 1000 + 3600), "probation's retry-after is cut to the hour like a Retry-After");
+            // terminated while a reconnect cycle waited for its re-REGISTER final: the cycle's failure is no news
+            RegRecovery y;
+            y.OnReconnectFailure(1000, F::Silent);
+            y.OnBindingTerminated(1010, "expired");
+            y.OnReconnectFailure(1011, F::Silent);
+            Check(y.silentCycles == 1 && freshAt(y, 1011, 0), "the flow closed under the cycle: not a silent cycle, the fresh registration now");
+            y.OnReconnectFailure(1012, F::Refused, 90, 503);
+            Check(y.refusals == 0 && freshAt(y, 1012, 1102), "…a refusal with a Retry-After on it: not counted, the network's hold kept");
+        }
+        // a terminated binding's verdict outlives the process with its hold
+        {
+            RegRecovery tg;
+            tg.OnBindingTerminated(1000, "rejected");
+            auto htg = tg.Holds(1100);
+            Check(htg.Any() && htg.oldGone && htg.freshHold == 1000 + 21 * 60 - 1100, "a terminated binding's holds carry that the old registration is gone");
+            RegRecovery th;
+            th.Restore(50, htg);
+            Check(!th.Reconnectable() && freshAt(th, 50, 50 + htg.freshHold), "…and the restart does not reconnect over its SAs: the fresh attempt waits what was left");
+            RegRecovery ti;
+            ti.OnBindingTerminated(1000, "probation", 1800);
+            RegRecovery tj;
+            tj.Restore(0, ti.Holds(1300));
+            Check(!tj.Reconnectable() && freshAt(tj, 0, 1500), "probation's retry-after survives a restart the same way");
         }
         // the network's holds outlive the process
         {
