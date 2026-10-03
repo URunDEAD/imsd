@@ -149,7 +149,11 @@ On a phone the daemon runs as root on the system bus (policy in
 account `user` access; adjust it if your session account is named
 differently), started by `packaging/imsd.service`
 after `packaging/ims-pdn-up.sh` has brought up the ims PDN through
-ModemManager. The bring-up never lets the ims PDN become the phone's IPv6
+ModemManager. An apk upgrade restarts `imsd` and `imsd-ofonod` once the
+transaction is done (a call in progress ends), as does adding a package
+again over the daemon an `apk del` left running; the restart resumes the
+registration over its existing SAs, or goes on waiting out a hold the
+network had set. The bring-up never lets the ims PDN become the phone's IPv6
 default route: the PDN's router advertisement is not accepted as a default
 router (`accept_ra_defrtr=0` on the netdev; its prefix and MTU still apply)
 and the P-CSCF gets a host route instead, so on IPv4-only wifi the phone's
@@ -227,7 +231,7 @@ Known gaps, all inherited rather than introduced:
   normal dialpad is unaffected — that reaches imsd's own classifier.
 - DTMF is forwarded to imsd, where `SendDtmf` is still a stub (RFC 4733 is not
   implemented yet) — the same limitation Plasma has.
-- **Restart GNOME Calls after restarting `imsd-ofonod` itself.** When the
+- **Restarting `imsd-ofonod` restarts GNOME Calls with it.** When the
   modem's `VoiceCallManager` interface goes away and comes back, Calls 50.0
   adds a new origin but leaves the old origin's `CallAdded` handler connected:
   after one such cycle every call is added twice, after a few the stale handler
@@ -237,7 +241,10 @@ Known gaps, all inherited rather than introduced:
   restarts and registration drops from triggering it, `imsd-ofonod` lists the
   interface permanently: `Online` tracks registration, and `Dial` fails with
   "imsd is not registered" / "imsd is not running" instead. Only `org.ofono`
-  vanishing — this daemon restarting — still cycles the origin.
+  vanishing — this daemon restarting — still cycles the origin, and after
+  that Calls dials nothing until it restarts, so the unit's `ExecStartPost`
+  restarts the Calls daemon of every user running one. Its first start
+  since boot leaves a running Calls alone.
 
 Development, without a phone or root:
 
@@ -311,12 +318,24 @@ refused or throttled fresh attempt); imsd-ofonod refuses a `Dial` then, and
 imsd-dialerd lists no modem. A bring-up the network deferred waits the same
 schedule out with nothing to reconnect over (the resume just found the
 stored SAs unusable), then tries again. The network's holds outlive a
-restart of imsd: they are kept in
+restart of imsd (an upgrade restarts it): they are kept in
 `/run/imsd.holds` for the PDN they were set on, with the schedule's place
 (a restart does not start it over at 21 min), and waited out at the next
 start, before the resume (a refresh's `Retry-After`) or before the fresh
 registration (a fresh attempt's schedule or `Retry-After`, a terminated
-binding's wait); a reboot or another PDN address starts clean.
+binding's wait); a reboot or another PDN address starts clean. An upgrade from a daemon
+older than 0.3.10, which kept its bring-up throttle wait in memory only,
+hands that wait over the same way when this start registers on the address
+it was earned on (the fresh-SA throttle's wait, `spi-s=0`; the old daemon's
+other deferrals, after a 401 it could not use, are not handed over): the
+upgrade records that daemon's invocation, and the next
+start reads its journal lines once the daemon has stopped — a wait that
+ended meanwhile is read as it ended; on another address (the normal hop:
+0.3.9 sat on the kernel's temporary address) only the verdict that the old
+registration is gone is kept and the start registers fresh at once. When
+the old address cannot be read the wait is handed over anyway; when the wait
+cannot be timed, or this start has no `LOCAL`, the journal says it was not
+handed over.
 The journal says which (`…; next: fresh registration in N s`, `registering
 fresh (recovery attempt N)`, `fresh registration deferred/refused/failed:
 …`, `bring-up deferred: …`). One case leaves through a real restart

@@ -11,7 +11,8 @@
 #   make check    -> build + run the 7 unit-test suites
 #   make install  -> DESTDIR/PREFIX staged install (binaries + systemd
 #                    units, D-Bus policies, dialerd autostart, the GNOME
-#                    Calls plugin override, ims-pdn-up.sh)
+#                    Calls plugin override, the imsd-ofono preset, and the libexec scripts
+#                    ims-pdn-up.sh, imsd-handover.sh, imsd-ofono-restart-calls.sh)
 #
 # Requires clang++ with libc++ and the libc++ std module sources
 # (std.cppm — Alpine: llvm-runtimes, Arch: libc++). Override STD_CPPM if
@@ -133,6 +134,8 @@ install: all
 	install -Dm755 $(O)/imsd-media $(DESTDIR)$(PREFIX)/libexec/imsd-media
 	install -Dm755 packaging/ims-pdn-up.sh \
 	    $(DESTDIR)$(PREFIX)/libexec/ims-pdn-up.sh
+	install -Dm755 packaging/imsd-handover.sh \
+	    $(DESTDIR)$(PREFIX)/libexec/imsd-handover.sh
 	install -Dm644 packaging/imsd.service \
 	    $(DESTDIR)$(PREFIX)/lib/systemd/system/imsd.service
 	install -Dm644 packaging/imsd-dialerd.desktop \
@@ -141,6 +144,8 @@ install: all
 	    $(DESTDIR)$(PREFIX)/share/dbus-1/system.d/net.catcrafts.IMS1.conf
 	install -Dm644 packaging/imsd-ofonod.service \
 	    $(DESTDIR)$(PREFIX)/lib/systemd/system/imsd-ofonod.service
+	install -Dm755 packaging/imsd-ofono-restart-calls.sh \
+	    $(DESTDIR)$(PREFIX)/libexec/imsd-ofono-restart-calls.sh
 	install -Dm644 packaging/org.ofono.conf \
 	    $(DESTDIR)$(PREFIX)/share/dbus-1/system.d/imsd-ofono.conf
 	install -Dm644 packaging/90_imsd-ofono.gschema.override \

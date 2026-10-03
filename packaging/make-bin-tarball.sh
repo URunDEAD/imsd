@@ -24,8 +24,9 @@ cp "$BIN" "$stage/imsd-$VER/imsd"
 cp "$MEDIA" "$stage/imsd-$VER/imsd-media"
 cp "$DIALERD" "$stage/imsd-$VER/imsd-dialerd"
 cp "$OFONOD" "$stage/imsd-$VER/imsd-ofonod"
-cp packaging/ims-pdn-up.sh packaging/imsd.service \
+cp packaging/ims-pdn-up.sh packaging/imsd-handover.sh packaging/imsd.service \
    packaging/imsd-dialerd.desktop packaging/imsd-ofonod.service \
+   packaging/imsd-ofono-restart-calls.sh \
    packaging/org.ofono.conf packaging/90_imsd-ofono.gschema.override \
    packaging/80-imsd-ofono.preset \
    packaging/net.catcrafts.IMS1.conf "$stage/imsd-$VER/"

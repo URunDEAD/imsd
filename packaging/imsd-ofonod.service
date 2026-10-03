@@ -3,8 +3,9 @@
 [Unit]
 Description=oFono-compatible GNOME Calls backend for imsd
 Documentation=https://forgejo.catcrafts.net/Catcrafts/imsd
-# org.ofono is a system-bus name, so this is a system service; it needs no
-# privileges beyond owning that name. Only enable it on a GNOME/Phosh session
+# org.ofono is a system-bus name, so this is a system service, and it runs
+# as root: its start hook restarts GNOME Calls in the users' own managers.
+# Only enable it on a GNOME/Phosh session
 # — Plasma Mobile uses imsd-dialerd instead. Both may run at once (different
 # buses, different consumers), but a real ofonod must not.
 Conflicts=ofono.service
@@ -17,6 +18,9 @@ Type=simple
 # matches imsd's configuration; imsd itself owns emergency classification.
 EnvironmentFile=-/etc/imsd.env
 ExecStart=/usr/bin/imsd-ofonod
+# GNOME Calls keeps a stale modem when org.ofono restarts and dials nothing
+# until it restarts too: restart the Calls daemon of each user running one
+ExecStartPost=-/usr/libexec/imsd-ofono-restart-calls.sh
 # it holds no call state of its own — imsd is re-queried on every reconnect
 Restart=on-failure
 RestartSec=5

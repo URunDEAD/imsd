@@ -5,8 +5,9 @@
 # README's "Cross-compiling" section into a proper apk — used by this repo's
 # package CI (packaging/build-package.sh, which also seds pkgver from
 # implementations/main.cpp) and runnable by hand. The source tarball is
-# produced by packaging/make-bin-tarball.sh; the desktop/preset files live
-# next to it in packaging/ (copy them beside this file). Since 2026-09-02
+# produced by packaging/make-bin-tarball.sh; the desktop/preset files and
+# the install scripts (*.post-upgrade, *.post-install) live next to it in
+# packaging/ (copy them beside this file). Since 2026-09-02
 # this is the only imsd packaging: fp6-img images install the apk this
 # builds from the registry rather than building their own.
 pkgname=imsd
@@ -29,6 +30,9 @@ provides="81voltd=$pkgver-r$pkgrel"
 # (ofono before systemd: systemd() amoves all of usr/lib/systemd/system,
 # so ofono() must take imsd-ofonod.service first)
 subpackages="$pkgname-ofono:ofono $pkgname-systemd"
+# restart the running daemons onto an upgrade (systemd's enqueue-marked); the
+# systemd subpackage marks imsd.service too, since it brings the unit file
+install="$pkgname.post-upgrade $pkgname.post-install $pkgname-ofono.post-upgrade $pkgname-ofono.post-install $pkgname-systemd.post-upgrade $pkgname-systemd.post-install"
 options="!check !tracedeps"
 source="
 	imsd-$pkgver.tar.gz
@@ -42,6 +46,7 @@ package() {
     install -Dm755 imsd-media "$pkgdir"/usr/libexec/imsd-media
     install -Dm755 imsd-dialerd "$pkgdir"/usr/bin/imsd-dialerd
     install -Dm755 ims-pdn-up.sh "$pkgdir"/usr/libexec/ims-pdn-up.sh
+    install -Dm755 imsd-handover.sh "$pkgdir"/usr/libexec/imsd-handover.sh
     install -Dm644 imsd.service "$pkgdir"/usr/lib/systemd/system/imsd.service
     install -Dm644 imsd-dialerd.desktop \
         "$pkgdir"/etc/xdg/autostart/imsd-dialerd.desktop
@@ -64,6 +69,8 @@ package() {
     printf '[Unit]\nConditionPathExists=/etc/imsd.env\n' \
         > "$pkgdir"/usr/lib/systemd/system/imsd.service.d/10-require-config.conf
     install -Dm755 imsd-ofonod "$pkgdir"/usr/bin/imsd-ofonod
+    install -Dm755 imsd-ofono-restart-calls.sh \
+        "$pkgdir"/usr/libexec/imsd-ofono-restart-calls.sh
     install -Dm644 imsd-ofonod.service \
         "$pkgdir"/usr/lib/systemd/system/imsd-ofonod.service
     install -Dm644 org.ofono.conf \
@@ -78,6 +85,7 @@ ofono() {
     pkgdesc="GNOME Calls (Phosh, GNOME Mobile) backend for imsd"
     depends="$pkgname=$pkgver-r$pkgrel calls"
     amove usr/bin/imsd-ofonod
+    amove usr/libexec/imsd-ofono-restart-calls.sh
     amove usr/lib/systemd/system/imsd-ofonod.service
     amove usr/share/dbus-1/system.d/imsd-ofono.conf
     amove usr/share/glib-2.0/schemas/90_imsd-ofono.gschema.override

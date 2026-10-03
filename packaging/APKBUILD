@@ -24,6 +24,8 @@ provides="81voltd=$pkgver-r$pkgrel"
 # Calls at the ofono provider. A Plasma Mobile phone wants imsd-dialerd, which
 # is in the main package, and must NOT get that override.
 subpackages="$pkgname-ofono:ofono"
+# restart the running daemons onto an upgrade (systemd's enqueue-marked)
+install="$pkgname.post-upgrade $pkgname.post-install $pkgname-ofono.post-upgrade $pkgname-ofono.post-install"
 source="$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
 builddir="$srcdir/$pkgname"
 
@@ -43,6 +45,7 @@ ofono() {
 	pkgdesc="GNOME Calls (Phosh, GNOME Mobile) backend for imsd"
 	depends="$pkgname=$pkgver-r$pkgrel calls"
 	amove usr/bin/imsd-ofonod
+	amove usr/libexec/imsd-ofono-restart-calls.sh
 	amove usr/lib/systemd/system/imsd-ofonod.service
 	amove usr/share/dbus-1/system.d/imsd-ofono.conf
 	amove usr/share/glib-2.0/schemas/90_imsd-ofono.gschema.override

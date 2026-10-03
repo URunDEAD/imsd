@@ -735,14 +735,14 @@ std::int64_t NowEpoch() {
 
 // The recovery policy's holds, kept for the next process: the network's
 // word (a Retry-After, the schedule after a refused or throttled fresh
-// attempt, a terminated binding's wait) outlives a restart of imsd. They
-// are filed under the PDN's address — another one, or a reboot, starts
-// clean — so the file names that address and the boot, and
-// lives in /run. Seconds left at `written_at`, which is on the boot
-// clock: no clock step moves it, and it runs through a suspend as the
-// network's timers do. Whether the old registration is gone travels with
-// them: a restart inside a hold must not resume over SAs the network has
-// written off.
+// attempt, a terminated binding's wait) outlives a restart of imsd, and
+// an upgrade restarts it. They are filed under the PDN's address —
+// another one, or a reboot, starts clean — so the file names that
+// address and the boot, and lives in /run. Seconds left at
+// `written_at`, which is on the boot clock: no clock step moves it, and
+// it runs through a suspend as the network's timers do. Whether the old
+// registration is gone travels with them: a restart inside a hold must
+// not resume over SAs the network has written off.
 std::int64_t BootSeconds() {
     timespec ts{};
     clock_gettime(CLOCK_BOOTTIME, &ts);
@@ -1232,13 +1232,14 @@ private:
         auto sa = imsd::ipsec::ParseExistingSa(state.out, policy.out, pcscf_, local_);
         // The registration may sit on another address of the link: before
         // 0.3.10 imsd registered on the kernel's temporary one (ims ledger
-        // F18). Resume there while it is still up — a restart keeps the
-        // registration for the price of a re-REGISTER, where a fresh one is
-        // an AKA run, a new SA pair and, when KPN refuses it, the old
-        // registration and a 21-minute wait (KPN refuses a fresh pair on an
-        // address whose registration is live and has accepted one on another
-        // address of the link meanwhile; other carriers' rules are unknown) —
-        // and move at the next fresh registration.
+        // F18). Resume there while it is still up — a restart, an upgrade
+        // among them, keeps the registration for the price of a re-REGISTER,
+        // where a fresh one is an AKA run, a new SA pair and, when KPN
+        // refuses it, the old registration and a 21-minute wait (KPN
+        // refuses a fresh pair on an address whose registration is live and
+        // has accepted one on another address of the link meanwhile; other
+        // carriers' rules are unknown) — and move at the next fresh
+        // registration.
         if (!sa) {
             for (const std::string& other : imsd::ipsec::SaLocals(state.out, pcscf_)) {
                 if (other == local_ || !OnLink(dev_, other)) continue;

@@ -13,6 +13,11 @@ Type=simple
 # idempotent. worst case ~14 min (2 min modem wait + 5 min registration
 # gate + connect retries), hence TimeoutStartSec
 ExecStartPre=/usr/libexec/ims-pdn-up.sh
+# a daemon older than 0.3.10 that an upgrade restarted inside its bring-up
+# throttle wait: the wait — on another address only the verdict that its
+# registration is gone — is handed over from its journal now that it has
+# stopped (imsd.post-upgrade recorded the invocation in /run/imsd.handover)
+ExecStartPre=-/usr/libexec/imsd-handover.sh
 TimeoutStartSec=900
 # /run/imsd.env: written by ims-pdn-up.sh (DEV= the connected ims netdev,
 # LOCAL= the PDN address ModemManager assigned to it).
