@@ -105,8 +105,24 @@ pdn/boot match, defaults for absent keys — proven on the phone only, captures
 
 ### 4.1 Native, with crafter-build
 
-Prerequisites: crafter-build, clang with libc++, lld, and the gio-2.0 headers
-(`glib2` on Arch, `glib-dev` on Alpine).
+crafter-build is the Crafter.Build Flatpak. It carries its own clang, lld and
+libc++, and its SDK (org.freedesktop.Sdk, from Flathub) has the gio-2.0
+headers, so the host needs Flatpak and nothing else:
+
+```sh
+flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak remote-add --if-not-exists catcrafts https://flatpak.catcrafts.net/catcrafts.flatpakrepo
+flatpak install catcrafts net.catcrafts.CrafterBuild//stable
+mkdir -p ~/.local/bin
+printf '#!/bin/sh\nexec flatpak run net.catcrafts.CrafterBuild//stable "$@"\n' > ~/.local/bin/crafter-build
+chmod +x ~/.local/bin/crafter-build
+```
+
+`crafter-build` is a script and not an alias so that the name also resolves in
+a shell that has not defined the alias (a fresh `bash -c`, a CI step);
+`~/.local/bin` has to be on `PATH` (any directory on it will do). The
+sandbox does not see the host's `/tmp`: keep the checkout under `/home`, or
+grant its directory with `flatpak run --filesystem=<dir>`.
 
 ```sh
 crafter-build                       # bin/imsd-<target>-<march>-<mtune>-<id>/imsd
@@ -119,6 +135,14 @@ crafter-build lint                  # the house-style rules of lint-rules.h
 
 Output directories under `bin/` are named `<product>-<target>-<march>-<mtune>-<id>`;
 the `./bin/imsd-*/imsd` globs in §8.3 rely on that.
+
+A host-native binary built this way links the Flatpak's libc++ through an
+rpath into `/app/lib`: run it inside the sandbox (`flatpak run --command=sh
+net.catcrafts.CrafterBuild//stable`, with `--socket=session-bus` for §8.3's
+daemons — the sandbox's own session bus is a filter that refuses their names;
+`crafter-build test` runs the suites there
+anyway), or build with `make` (§4.2) for one that runs on the host. A sysroot
+build (§4.3) gets no such rpath — it links the sysroot's libc++.
 
 ### 4.2 With make (distro packaging)
 
@@ -152,22 +176,30 @@ the `80-imsd-ofono.preset`.
 ### 4.3 Cross-compiling for a phone (aarch64 Alpine / postmarketOS)
 
 ```sh
-packaging/make-sysroot.sh                  # one-time: Alpine aarch64 sysroot from the CDN
+packaging/make-sysroot.sh                  # one-time: Alpine aarch64 sysroot from the CDN (edge)
 crafter-build -- --target=aarch64-alpine-linux-musl \
     --sysroot=$HOME/.cache/imsd/sysroot-aarch64-alpine \
     --march=armv8.6-a+fp16fml+aes+sha3+sm4 --mtune=cortex-a720
-# the same flags after `crafter-build test --target=aarch64-alpine-linux-musl`
-# run the suite under qemu-aarch64 against the sysroot
+# `crafter-build test` with the same flags fails: its runner is qemu-aarch64,
+# which the Flatpak's sandbox does not have. Test host-native (§4.1).
 ```
 
 `make-sysroot.sh` needs no root, qemu or device: it downloads
 `apk-tools-static` and the Alpine keys and populates a minimal rootfs (musl,
-libc++, glib and their headers, compiler-rt, libunwind, gcc for its
+libc++ with its std module source, glib and their headers, compiler-rt,
+libunwind, gcc for its
 `crtbeginS.o`/libgcc, which clang's `*-alpine-linux-musl` driver links
 against). In a cross build `project.cpp` does not ask the host's pkg-config
 (it would answer for the wrong architecture); it adds `-I=/usr/include/glib-2.0`
 and `-I=/usr/lib/glib-2.0/include`, which clang resolves inside the sysroot.
-This is the flow CI runs (§9.4).
+crafter-build compiles the std module against the sysroot's libc++ headers
+from the sysroot's own source — Alpine's `llvm-runtimes`, the same release
+as its libc++, which `make-sysroot.sh` installs (`libc++-dev` ships none);
+run over an existing sysroot the script upgrades its packages (`apk add
+--upgrade`).
+Without that source it falls back to the toolchain's source for the same libc++
+major release, then to the sources Crafter.Build carries for other
+releases. This is the flow CI runs (§9.4).
 
 ## 5. Tests
 
@@ -791,7 +823,9 @@ Known gaps, all inherited rather than introduced:
   (`imsd-ofono-restart-calls.sh`) restarts the Calls daemon of every user
   running one. The first start since boot leaves a running Calls alone.
 
-Development without a phone or root:
+Development without a phone or root (crafter-build's binaries inside the
+sandbox, the `make` build's `build/make/imsd` and `build/make/imsd-ofonod` on
+the host: §4.1):
 
 ```sh
 ./bin/imsd-*/imsd --session &            # imsd's ABI on the session bus
@@ -857,10 +891,15 @@ install finds no unit active and marks nothing. `imsd-systemd` marks
 ### 9.4 CI and what a push means
 
 `.forgejo/workflows/package.yml` runs on every push to `main` (and on
-dispatch): in an `alpine:edge` container, `packaging/build-package.sh`
-provisions clang/lld/llvm-runtimes/glib-dev/abuild, fetches the musl build of
-crafter-build, builds the sysroot, cross-compiles the four products, runs the
-suite natively, wraps the result with `APKBUILD.binary`, and the publish step
+dispatch): on the `flatpak` runner label (a privileged runner registered to
+this repository — bubblewrap inside the job container needs the privilege), in an
+`alpine:edge` container, `packaging/build-package.sh` installs the
+Crafter.Build Flatpak (`net.catcrafts.CrafterBuild//stable` from
+flatpak.catcrafts.net — the branch Crafter.Build publishes from its release
+tags, where `beta` follows every push to its master; the build log names its
+commit) and llvm/abuild, builds
+the sysroot, cross-compiles the four products, runs the suite natively inside
+the Flatpak, wraps the result with `APKBUILD.binary`, and the publish step
 uploads the apks to the Forgejo Alpine registry
 (`…/api/packages/Catcrafts/alpine/edge/fp6`) with `PACKAGE_TOKEN`. The
 registry answers 409 for an already-published version and the step treats

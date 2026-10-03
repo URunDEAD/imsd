@@ -8,7 +8,8 @@
 # clang can use via --sysroot. No root, no qemu, no device needed:
 #
 #   packaging/make-sysroot.sh [dir]        # default: ~/.cache/imsd/sysroot-aarch64-alpine
-#   crafter-build --target=aarch64-alpine-linux-musl --sysroot=<dir>
+#   crafter-build -- --target=aarch64-alpine-linux-musl --sysroot=<dir> \
+#       --march=… --mtune=…                # the phone's values: AGENTS.md §4.3
 set -eu
 
 SYSROOT="${1:-$HOME/.cache/imsd/sysroot-aarch64-alpine}"
@@ -16,8 +17,13 @@ MIRROR="${MIRROR:-https://dl-cdn.alpinelinux.org/alpine/edge}"
 ARCH=aarch64
 # gcc is in the list for its crtbeginS.o/libgcc: clang's driver for
 # *-alpine-linux-musl links against the GCC runtime it detects under
-# <sysroot>/usr/lib/gcc/<triple>/
-PKGS="musl-dev libc++ libc++-dev glib-dev compiler-rt llvm-libunwind-dev gcc"
+# <sysroot>/usr/lib/gcc/<triple>/. llvm-runtimes is in it for the std module
+# source of this very libc++ (usr/share/libc++/v1/std.cppm; libc++-dev ships
+# none): crafter-build compiles the sysroot's own copy first. --upgrade below
+# is for a run over an existing sysroot: added alone beside libc++ 22,
+# llvm-runtimes 23's source did not compile against its headers; upgraded
+# with it, it did.
+PKGS="musl-dev libc++ libc++-dev llvm-runtimes glib-dev compiler-rt llvm-libunwind-dev gcc"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -40,6 +46,6 @@ mkdir -p "$SYSROOT"
     --arch "$ARCH" --root "$SYSROOT" --initdb --no-scripts --no-cache \
     --usermode --keys-dir "$work/usr/share/apk/keys/$ARCH" \
     -X "$MIRROR/main" -X "$MIRROR/community" \
-    add $PKGS
+    add --upgrade $PKGS
 
 echo ">> done: $SYSROOT"

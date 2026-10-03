@@ -8,16 +8,17 @@ name: package
 # Build: crafter-build cross-compiles against an Alpine aarch64 sysroot
 # (packaging/build-package.sh — AGENTS.md §4.3's cross-compiling flow), the
 # test suite runs natively, and packaging/APKBUILD.binary wraps the result.
-# This needs no privileged runner: it runs in an alpine:edge container on
-# the ordinary arch-latest runner.
+# crafter-build is the Crafter.Build Flatpak, and bubblewrap inside the job
+# container needs a privileged runner: the job runs on the `flatpak` label
+# (a privileged runner registered to this repository), in an alpine:edge
+# container.
 #
 # Release gating is the version: pkgver comes from implementations/main.cpp,
 # the registry answers 409 for an already-published version, and the publish
 # step treats that as "nothing to do" — so pushes only release when the
 # Version constant bumps. This is the only producer of the imsd apk: fp6-img
-# images install the published package from the registry (pinned version,
-# pinned sha256) instead of building their own, so image and 'apk upgrade'
-# carry the same binary.
+# images install the published package from the registry instead of
+# building their own, so image and 'apk upgrade' carry the same binary.
 #
 # Publishing needs PACKAGE_TOKEN (catbot account, package:write scope) — an
 # org-level secret on Catcrafts since 2026-09-02, shared with fp6-img;
@@ -30,7 +31,7 @@ on:
 
 jobs:
   package:
-    runs-on: arch-latest
+    runs-on: flatpak
     container:
       image: alpine:edge
     timeout-minutes: 90

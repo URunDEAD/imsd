@@ -42,11 +42,11 @@ your carrier's P-CSCF address.
 
 On a Catcrafts Fairphone 6 image imsd is installed from the project's apk
 registry and upgrades with `apk upgrade` (an upgrade restarts the daemon; a
-call in progress ends). Elsewhere, build it (below), `make install`, and
-enable the units yourself — `systemctl enable imsd`, and `systemctl enable
---now imsd-ofonod` for GNOME Calls: imsd's preset, the
-`multi-user.target.wants` link and the `/etc/imsd.env` condition below come
-with the apk, not with `make install`.
+call in progress ends). Elsewhere, build it with `make` (below), run
+`make install`, and enable the units yourself — `systemctl enable imsd`,
+and `systemctl enable --now imsd-ofonod` for GNOME Calls: imsd's preset,
+the `multi-user.target.wants` link and the `/etc/imsd.env` condition
+below come with the apk, not with `make install`.
 
 Configuration is environment variables in `/etc/imsd.env`; the one required
 setting is the P-CSCF:
@@ -102,13 +102,23 @@ session and root may place, answer and end calls; an ssh login may not.
 
 ## Building
 
-[Crafter Build](https://forgejo.catcrafts.net/Catcrafts/Crafter.Build) plus
-clang/libc++/lld and the gio-2.0 headers:
+With the [Crafter Build](https://forgejo.catcrafts.net/Catcrafts/Crafter.Build)
+Flatpak, which carries the compiler:
 
 ```sh
+flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak remote-add --if-not-exists catcrafts https://flatpak.catcrafts.net/catcrafts.flatpakrepo
+flatpak install catcrafts net.catcrafts.CrafterBuild//stable
+alias crafter-build='flatpak run net.catcrafts.CrafterBuild//stable'
 crafter-build          # the daemon; -- --product=media|dialerd|ofonod for the others
 crafter-build test     # the seven unit-test suites
-make && make check     # the same, without crafter-build (distro packaging)
+```
+
+Or without crafter-build (distro packaging), with clang/libc++/lld and the
+gio-2.0 headers:
+
+```sh
+make && make check
 ```
 
 Cross-compiling for a phone, the Makefile's requirements, the package layout
