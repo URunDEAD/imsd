@@ -45,11 +45,12 @@ plugins/provider/ofono/ — get these wrong and the plugin silently ignores us:
 
 Runs as root because `org.ofono` is a system-bus name (policy in
 packaging/org.ofono.conf). It does no I/O beyond D-Bus: every call decision
-stays in imsd. Everything happens on the GLib main loop, so there is no
-locking.
+stays in imsd. Its calls reach imsd as root, so it asks polkit about its own
+callers (ImsdBus): call control is net.catcrafts.IMS1.Voice, as on imsd.
+Everything happens on the GLib main loop, so there is no locking.
 
   --session   own org.ofono on the session bus and talk to imsd there
-              (development: no root, no policy file)
+              (development: no root, no policy file, no polkit)
   IMSD_BUS=session|system   override only the imsd side of that choice
 */
 
@@ -57,6 +58,7 @@ locking.
 #include <glib-unix.h>
 
 import std;
+import ImsdBus;
 
 namespace {
 
@@ -315,7 +317,9 @@ void HandleCallMethod(GDBusConnection*, const gchar*, const gchar* objectPath, c
     g_dbus_method_invocation_return_dbus_error(inv, "org.freedesktop.DBus.Error.UnknownMethod", "no such method");
 }
 
-const GDBusInterfaceVTable CallVtable = { HandleCallMethod, nullptr, nullptr, {} };
+bool IsRead(std::string_view method) { return method == "GetProperties" || method == "GetCalls" || method == "GetModems"; }
+constexpr char ErrAccessDenied[] = "org.ofono.Error.AccessDenied";
+const GDBusInterfaceVTable CallVtable = { imsd::bus::Gated<HandleCallMethod, IsRead, ErrAccessDenied, Log>, nullptr, nullptr, {} };
 
 guint RegisterObject(const char* xml, const char* path, const GDBusInterfaceVTable* vtable) {
     GDBusNodeInfo* node = g_dbus_node_info_new_for_xml(xml, nullptr);
@@ -596,9 +600,9 @@ void HandleSsMethod(GDBusConnection*, const gchar*, const gchar*, const gchar*, 
 }
 
 const GDBusInterfaceVTable ManagerVtable = { HandleManagerMethod, nullptr, nullptr, {} };
-const GDBusInterfaceVTable ModemVtable = { HandleModemMethod, nullptr, nullptr, {} };
-const GDBusInterfaceVTable VcmVtable = { HandleVcmMethod, nullptr, nullptr, {} };
-const GDBusInterfaceVTable SsVtable = { HandleSsMethod, nullptr, nullptr, {} };
+const GDBusInterfaceVTable ModemVtable = { imsd::bus::Gated<HandleModemMethod, IsRead, ErrAccessDenied, Log>, nullptr, nullptr, {} };
+const GDBusInterfaceVTable VcmVtable = { imsd::bus::Gated<HandleVcmMethod, IsRead, ErrAccessDenied, Log>, nullptr, nullptr, {} };
+const GDBusInterfaceVTable SsVtable = { imsd::bus::Gated<HandleSsMethod, IsRead, ErrAccessDenied, Log>, nullptr, nullptr, {} };
 
 // ---- imsd events ------------------------------------------------------------
 void PublishVoiceState() {
@@ -727,6 +731,7 @@ int main(int argc, char** argv) {
         if (std::string_view(argv[i]) == "--session") session = true;
 
     GBusType ofonoBus = session ? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM;
+    imsd::bus::AuthorizeCalls = !session;
     std::string imsdBusName = EnvOr("IMSD_BUS", session ? "session" : "system");
     GBusType imsdBus = imsdBusName == "session" ? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM;
 

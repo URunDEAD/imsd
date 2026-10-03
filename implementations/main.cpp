@@ -11,8 +11,10 @@ Owns net.catcrafts.IMS1 on the system bus with the project's frozen D-Bus ABI
 run outgoing and incoming calls through the Imsd:Engine call machine (inbound
 INVITEs on the protected-port listeners become ringing calls a dialer answers
 via Accept), and spawn one imsd-media data-plane process per answered call.
-GLib/GDBus lives only here; every message, digest, SA command, and call-state
-decision comes from the GLib-free core.
+GLib/GDBus lives only here and in ImsdBus (the polkit gate in front of call
+control, shared with imsd-ofonod) — the integration daemons imsd-dialerd and
+imsd-ofonod carry their own; every message, digest, SA command, and
+call-state decision comes from the GLib-free core.
 
 Threads: a dedicated engine thread runs the SIP loop (blocking framed recv,
 protected-port listeners, media reaping, keepalive); the GLib main loop owns
@@ -20,7 +22,8 @@ the bus. D-Bus method calls push commands to the engine queue; engine events
 reach the bus via g_idle_add, where the calls table + status snapshot live
 (touched only on the main thread).
 
-  --session   own the name on the session bus (development; no policy needed)
+  --session   own the name on the session bus (development; no policy, no
+              polkit)
 */
 
 #include <arpa/inet.h>
@@ -40,6 +43,7 @@ reach the bus via g_idle_add, where the calls table + status snapshot live
 
 import std;
 import Imsd;
+import ImsdBus;
 
 namespace {
 
@@ -2408,7 +2412,9 @@ void HandleMethodCall(GDBusConnection*, const gchar*, const gchar*, const gchar*
     g_dbus_method_invocation_return_dbus_error(inv, "org.freedesktop.DBus.Error.UnknownMethod", "no such method");
 }
 
-const GDBusInterfaceVTable Vtable = { HandleMethodCall, nullptr, nullptr, {} };
+bool IsRead(std::string_view method) { return method == "GetStatus" || method == "GetCalls"; }
+constexpr char ErrAccessDenied[] = "org.freedesktop.DBus.Error.AccessDenied";
+const GDBusInterfaceVTable Vtable = { imsd::bus::Gated<HandleMethodCall, IsRead, ErrAccessDenied, Log>, nullptr, nullptr, {} };
 
 void OnBusAcquired(GDBusConnection* conn, const gchar*, gpointer) {
     DbusConn = conn;
@@ -2455,6 +2461,7 @@ int main(int argc, char** argv) {
     }
     Log(std::format("LOCAL={} P-CSCF=[{}]:{}", local, EnvOr("PCSCF", "(unset)"), EnvOr("PCSCF_PORT", "5060")));
     if (!session) LogAudioSession();
+    imsd::bus::AuthorizeCalls = !session;
 
     Engine engine;
     engine.SetLocal(local);

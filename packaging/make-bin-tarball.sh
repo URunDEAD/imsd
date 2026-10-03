@@ -29,6 +29,7 @@ cp packaging/ims-pdn-up.sh packaging/imsd-handover.sh packaging/imsd.service \
    packaging/imsd-ofono-restart-calls.sh \
    packaging/org.ofono.conf packaging/90_imsd-ofono.gschema.override \
    packaging/80-imsd-ofono.preset \
-   packaging/net.catcrafts.IMS1.conf "$stage/imsd-$VER/"
+   packaging/net.catcrafts.IMS1.conf packaging/net.catcrafts.IMS1.policy \
+   "$stage/imsd-$VER/"
 tar -C "$stage" -czf "imsd-$VER.tar.gz" "imsd-$VER"
 echo "wrote imsd-$VER.tar.gz ($(du -h "imsd-$VER.tar.gz" | cut -f1))"

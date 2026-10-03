@@ -17,8 +17,9 @@ pkgdesc="Userspace IMS/VoLTE daemon for mainline Linux phones"
 url="https://forgejo.catcrafts.net/Catcrafts/imsd"
 arch="aarch64"
 license="GPL-3.0-only"
-# the media leg dlopen's the AMR-WB codecs; pw-record/pw-play drive PipeWire
-depends="modemmanager libc++ opencore-amr vo-amrwbenc pipewire-tools"
+# the media leg dlopen's the AMR-WB codecs; pw-record/pw-play drive PipeWire;
+# polkit answers the daemons' call-control check (ImsdBus)
+depends="modemmanager libc++ opencore-amr vo-amrwbenc pipewire-tools polkit"
 # versioned provides = imsd satisfies soc-qcom-modem's 81voltd dependency AND
 # excludes the real package: 81voltd serves the modem's own ims-PDN requests,
 # which races imsd for the PDN and flaps it with a new prefix every ~2.5 min
@@ -52,6 +53,8 @@ package() {
         "$pkgdir"/etc/xdg/autostart/imsd-dialerd.desktop
     install -Dm644 net.catcrafts.IMS1.conf \
         "$pkgdir"/usr/share/dbus-1/system.d/net.catcrafts.IMS1.conf
+    install -Dm644 net.catcrafts.IMS1.policy \
+        "$pkgdir"/usr/share/polkit-1/actions/net.catcrafts.IMS1.policy
     # the skel override hides kde-telephony's modem daemon autostart for the
     # account created at install — imsd-dialerd owns those session bus names
     install -Dm644 "$srcdir"/org.kde.modem.daemon.desktop \

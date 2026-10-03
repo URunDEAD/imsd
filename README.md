@@ -25,11 +25,12 @@ every decision — SIP framing, SDP selection, the AKAv1-MD5 digest, the
 `ip xfrm` command sequence, and the whole call FSM — is unit-tested on a dev
 box with no bus, modem, or phone; several suites pin output byte-for-byte
 against recorded network traffic. GLib/GDBus, sockets, and subprocess control
-live only in the `imsd` daemon shell.
+live only in the `imsd` daemon shell, apart from imsd-bus, the GLib polkit
+gate it shares with imsd-ofonod.
 
 ## Architecture
 
-C++26 modules, built with Crafter Build. Five build products:
+C++26 modules, built with Crafter Build. Six build products:
 
 - **imsd-core** (static library) — the engine, pure `import std` C++ with no
   GLib and no I/O side effects. Everything here is unit-testable on any dev
@@ -37,7 +38,12 @@ C++26 modules, built with Crafter Build. Five build products:
   byte-for-byte against recorded network traffic.
 - **imsd** (executable) — the daemon shell: GLib main loop, GDBus service,
   sockets, subprocess control (`qmicli`/`mmcli`/`ip`), and the registration
-  sequence + run loop that pumps the core. All GLib and I/O live here.
+  sequence + run loop that pumps the core.
+- **imsd-bus** (static library) — the polkit gate in front of call control
+  (`net.catcrafts.IMS1.Voice`), which imsd and imsd-ofonod both link. GLib,
+  so kept outside imsd-core. A translation daemon that runs as root on the
+  system bus reaches imsd as root, which polkit always allows, so it gates
+  its own callers through this or it is a bypass.
 - **imsd-media** (executable) — the RTP/AMR-WB data plane, spawned once per
   call. Pure `import std` + POSIX, no GLib; links `-ldl` and dlopen's the
   codecs. A separate process for crash isolation and the far-end-hangup
@@ -52,7 +58,8 @@ C++26 modules, built with Crafter Build. Five build products:
 - **imsd-ofonod** (executable) — the GNOME Calls integration, for Phosh and
   GNOME Mobile: a system daemon owning `org.ofono` and presenting imsd as an
   oFono modem, which is the seam GNOME Calls' bundled `ofono` provider plugin
-  drives. GDBus translation only, no core; built with `-- --product=ofonod`.
+  drives. GDBus translation, no core, plus the imsd-bus gate on its own
+  callers; built with `-- --product=ofonod`.
   See [GNOME Calls (Phosh, GNOME Mobile)](#gnome-calls-phosh-gnome-mobile).
 
 ### Desktop integration
@@ -144,10 +151,12 @@ crafter-build -- --target=aarch64-alpine-linux-musl \
 busctl --user call net.catcrafts.IMS1 /net/catcrafts/IMS1 net.catcrafts.IMS1 GetStatus
 ```
 
-On a phone the daemon runs as root on the system bus (policy in
-`packaging/net.catcrafts.IMS1.conf` — it grants the postmarketOS default
-account `user` access; adjust it if your session account is named
-differently), started by `packaging/imsd.service`
+On a phone the daemon runs as root on the system bus, where any local
+account may reach it (`packaging/net.catcrafts.IMS1.conf`); placing,
+answering and ending a call is polkit's `net.catcrafts.IMS1.Voice`
+(`packaging/net.catcrafts.IMS1.policy`, checked by imsd and imsd-ofonod
+alike): the active local session — the dialer, whatever the account is
+called — and root, not an ssh login. It is started by `packaging/imsd.service`
 after `packaging/ims-pdn-up.sh` has brought up the ims PDN through
 ModemManager. An apk upgrade restarts `imsd` and `imsd-ofonod` once the
 transaction is done (a call in progress ends), as does adding a package
@@ -398,8 +407,10 @@ integrations depend on it:
 | `CallDeleted` | `s` |
 | `RegistrationChanged` | `b` |
 
-Both `imsd-dialerd` and `imsd-ofonod` are pure translations of this ABI; a new
-desktop needs a new translation daemon, not changes here.
+Both `imsd-dialerd` and `imsd-ofonod` translate this ABI and add no members
+to it; a new desktop needs a new translation daemon, not changes here — one
+that runs as root on the system bus also gates its own callers through
+imsd-bus (see Architecture), or it bypasses `net.catcrafts.IMS1.Voice`.
 
 ## License
 

@@ -57,6 +57,24 @@ static void ApplyGioFlags(Configuration& cfg) {
     }
 }
 
+// ImsdBus — the polkit gate imsd and imsd-ofonod put in front of call
+// control. A static library of its own: GLib, so outside imsd-core.
+static std::unique_ptr<Configuration> BusLibrary(std::span<const std::string_view> args) {
+    auto bus = std::make_unique<Configuration>();
+    bus->path = "./";
+    bus->name = "imsd-bus";
+    bus->outputName = "imsd-bus";
+    ApplyStandardArgs(*bus, args);
+    bus->type = ConfigurationType::LibraryStatic;
+    {
+        std::array<fs::path, 1> ifaces = { "interfaces/ImsdBus" };
+        std::array<fs::path, 0> impls = {};
+        bus->GetInterfacesAndImplementations(ifaces, impls);
+    }
+    ApplyGioFlags(*bus);
+    return bus;
+}
+
 extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> args) {
     // Four executables come out of this repo; which one a build produces is
     // chosen by `--product=`:
@@ -70,7 +88,8 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
     //                      (pure GDBus translation, no core).
     //   ofonod           — imsd-ofonod, the system-bus GNOME Calls backend
     //                      (org.ofono.*) bridging to imsd, for Phosh and
-    //                      GNOME Mobile (pure GDBus translation, no core).
+    //                      GNOME Mobile (GDBus translation plus the imsd-bus
+    //                      polkit gate on its callers, no core).
     bool wantMedia = false;
     bool wantDialerd = false;
     bool wantOfonod = false;
@@ -86,6 +105,8 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
         ofonod.outputName = "imsd-ofonod";
         ApplyStandardArgs(ofonod, args);
         ofonod.type = ConfigurationType::Executable;
+        static auto Bus = BusLibrary(args);
+        ofonod.dependencies = { Bus.get() };
         {
             std::array<fs::path, 0> ifaces = {};
             std::array<fs::path, 1> impls = { "implementations/ofonod" };
@@ -161,7 +182,8 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
     cfg.outputName = "imsd";
     ApplyStandardArgs(cfg, args);
     cfg.type = ConfigurationType::Executable;
-    cfg.dependencies = { Core.get() };
+    static auto Bus = BusLibrary(args);
+    cfg.dependencies = { Core.get(), Bus.get() };
     {
         std::array<fs::path, 0> ifaces = {};
         std::array<fs::path, 1> impls = { "implementations/main" };

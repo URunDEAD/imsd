@@ -10,7 +10,7 @@
 #   make          -> build/make/{imsd,imsd-media,imsd-dialerd,imsd-ofonod}
 #   make check    -> build + run the 7 unit-test suites
 #   make install  -> DESTDIR/PREFIX staged install (binaries + systemd
-#                    units, D-Bus policies, dialerd autostart, the GNOME
+#                    units, D-Bus and polkit policies, dialerd autostart, the GNOME
 #                    Calls plugin override, the imsd-ofono preset, and the libexec scripts
 #                    ims-pdn-up.sh, imsd-handover.sh, imsd-ofono-restart-calls.sh)
 #
@@ -75,6 +75,12 @@ $(PCM)/Imsd-Engine.pcm: $(PCM)/Imsd-Util.pcm $(PCM)/Imsd-Sip.pcm \
     $(PCM)/Imsd-Sdp.pcm $(PCM)/Imsd-Messages.pcm
 $(PCM)/Imsd.pcm: $(PARTITIONS:%=$(PCM)/%.pcm)
 
+# ImsdBus: the polkit gate imsd and imsd-ofonod share — GLib, so outside
+# imsd-core, and its BMI needs the gio include paths.
+$(PCM)/ImsdBus.pcm: interfaces/ImsdBus.cppm $(PCM)/std.pcm | $(PCM)
+	$(CXX) $(ALL_CXXFLAGS) $(GIO_CFLAGS) -fprebuilt-module-path=$(PCM) \
+	    --precompile $< -o $@
+
 # ---- imsd-core (static lib of the pure-C++ engine modules) ----------------
 
 $(OBJ)/%.o: $(PCM)/%.pcm | $(OBJ)
@@ -85,11 +91,11 @@ $(O)/libimsd-core.a: $(CORE_OBJS)
 
 # ---- executables -----------------------------------------------------------
 
-$(OBJ)/main.o: implementations/main.cpp $(PCM)/Imsd.pcm | $(OBJ)
+$(OBJ)/main.o: implementations/main.cpp $(PCM)/Imsd.pcm $(PCM)/ImsdBus.pcm | $(OBJ)
 	$(CXX) $(ALL_CXXFLAGS) $(GIO_CFLAGS) -fprebuilt-module-path=$(PCM) \
 	    -c $< -o $@
 
-$(O)/imsd: $(OBJ)/main.o $(O)/libimsd-core.a
+$(O)/imsd: $(OBJ)/main.o $(OBJ)/ImsdBus.o $(O)/libimsd-core.a
 	$(CXX) $(ALL_CXXFLAGS) $(ALL_LDFLAGS) $^ $(GIO_LIBS) -lpthread -o $@
 
 $(OBJ)/media.o: implementations/media.cpp $(PCM)/std.pcm | $(OBJ)
@@ -105,11 +111,11 @@ $(OBJ)/dialerd.o: implementations/dialerd.cpp $(PCM)/std.pcm | $(OBJ)
 $(O)/imsd-dialerd: $(OBJ)/dialerd.o
 	$(CXX) $(ALL_CXXFLAGS) $(ALL_LDFLAGS) $^ $(GIO_LIBS) -o $@
 
-$(OBJ)/ofonod.o: implementations/ofonod.cpp $(PCM)/std.pcm | $(OBJ)
+$(OBJ)/ofonod.o: implementations/ofonod.cpp $(PCM)/ImsdBus.pcm | $(OBJ)
 	$(CXX) $(ALL_CXXFLAGS) $(GIO_CFLAGS) -fprebuilt-module-path=$(PCM) \
 	    -c $< -o $@
 
-$(O)/imsd-ofonod: $(OBJ)/ofonod.o
+$(O)/imsd-ofonod: $(OBJ)/ofonod.o $(OBJ)/ImsdBus.o
 	$(CXX) $(ALL_CXXFLAGS) $(ALL_LDFLAGS) $^ $(GIO_LIBS) -o $@
 
 # ---- tests -----------------------------------------------------------------
@@ -142,6 +148,8 @@ install: all
 	    $(DESTDIR)/etc/xdg/autostart/imsd-dialerd.desktop
 	install -Dm644 packaging/net.catcrafts.IMS1.conf \
 	    $(DESTDIR)$(PREFIX)/share/dbus-1/system.d/net.catcrafts.IMS1.conf
+	install -Dm644 packaging/net.catcrafts.IMS1.policy \
+	    $(DESTDIR)$(PREFIX)/share/polkit-1/actions/net.catcrafts.IMS1.policy
 	install -Dm644 packaging/imsd-ofonod.service \
 	    $(DESTDIR)$(PREFIX)/lib/systemd/system/imsd-ofonod.service
 	install -Dm755 packaging/imsd-ofono-restart-calls.sh \

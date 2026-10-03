@@ -9,8 +9,9 @@ url="https://forgejo.catcrafts.net/Catcrafts/imsd"
 arch="aarch64 x86_64"
 license="GPL-3.0-only"
 # the media leg dlopen's the AMR-WB codecs; pw-record/pw-play drive PipeWire —
-# none of which abuild's .so auto-scan can see
-depends="modemmanager opencore-amr vo-amrwbenc pipewire-tools"
+# none of which abuild's .so auto-scan can see; polkit answers the daemons'
+# call-control check (ImsdBus)
+depends="modemmanager opencore-amr vo-amrwbenc pipewire-tools polkit"
 # clang/libc++ C++26 modules build (see Makefile); llvm-runtimes ships the
 # libc++ std module sources (/usr/share/libc++/v1/std.cppm) it precompiles
 makedepends="clang lld libc++-dev llvm-libunwind-dev llvm-runtimes glib-dev pkgconf"

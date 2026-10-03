@@ -3,9 +3,11 @@
 [Unit]
 Description=oFono-compatible GNOME Calls backend for imsd
 Documentation=https://forgejo.catcrafts.net/Catcrafts/imsd
-# org.ofono is a system-bus name, so this is a system service, and it runs
-# as root: its start hook restarts GNOME Calls in the users' own managers.
-# Only enable it on a GNOME/Phosh session
+# org.ofono is a system-bus name only root may own (org.ofono.conf), so this
+# is a system service run as root: imsd admits the calls it forwards as
+# root's (it has asked polkit about its own caller), and its start hook
+# restarts GNOME Calls in the users' own managers. Only enable it on a
+# GNOME/Phosh session
 # — Plasma Mobile uses imsd-dialerd instead. Both may run at once (different
 # buses, different consumers), but a real ofonod must not.
 Conflicts=ofono.service
