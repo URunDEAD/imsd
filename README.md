@@ -5,18 +5,17 @@
 
 Userspace IMS/VoLTE daemon for mainline Linux phones.
 
-Modem firmware on typical mainline-Linux phones will bring up the IMS PDN but
-can't be used for actual call audio. imsd implements the whole IMS client in
-userspace instead: SIP registration with USIM AKA authentication over kernel
+Most Linux phones drive the modem's internal IMS engine.
+imsd implements the whole IMS client in userspace instead:
+SIP registration with USIM AKA authentication over kernel
 IPsec (ESP), call signalling, and the AMR-WB RTP media plane wired into
-PipeWire so a stock mobile dialer — Plasma Dialer, or GNOME Calls under Phosh
-and GNOME Mobile — can place and receive real VoLTE calls on a commercial
-network.
+PipeWire so a stock mobile dialer like Plasma Dialer or GNOME Calls under Phosh
+can place and receive real VoLTE calls on a commercial network.
 
 ## Status
 
 Call-capable, both directions: outgoing calls place, answer, carry full-duplex
-AMR-WB audio and tear down; incoming calls ring, answer and carry media the
+AMR-WB audio and tear down. Incoming calls ring, answer and carry media the
 same way, driven end-to-end from a stock dialer over a frozen D-Bus ABI.
 Not there yet: DTMF (`SendDtmf` is a stub), hold/multiparty/call waiting,
 USSD, P-CSCF discovery (the address is configured by hand).
@@ -35,25 +34,26 @@ Verified by community members to be fully working:
 imsd talks to the modem through ModemManager plus `qmicli` over QRTR, installs
 its security associations with `ip xfrm` and plays audio through PipeWire, so
 in practice: a Qualcomm modem on a mainline kernel with working
-WWAN/ModemManager integration, kernel ESP, PipeWire, systemd and polkit — and
+WWAN/ModemManager integration, kernel ESP, PipeWire, systemd, polkit and
 your carrier's P-CSCF address.
 
 ## Install and configure
 
-On a Catcrafts Fairphone 6 image imsd is installed from the project's apk
-registry and upgrades with `apk upgrade` (an upgrade restarts the daemon; a
-call in progress ends). Elsewhere, build it with `make` (below), run
-`make install`, and enable the units yourself — `systemctl enable imsd`,
-and `systemctl enable --now imsd-ofonod` for GNOME Calls: imsd's preset,
-the `multi-user.target.wants` link and the `/etc/imsd.env` condition
-below come with the apk, not with `make install`.
+For automatic updates add the Catcrafts Alpine repository. Note this does also pull in other packages.
+
+Otherwise just download the latest `imsd` and `imsd-systemd` APKs and install them.
+
+Both can be found in the packages tab:
+
+```
+https://forgejo.catcrafts.net/Catcrafts/-/packages/alpine/imsd
+```
 
 Configuration is environment variables in `/etc/imsd.env`; the one required
 setting is the P-CSCF:
 
 ```sh
-# your carrier's P-CSCF address — from a stock-firmware capture or the
-# carrier's IMS documentation
+# your carrier's P-CSCF address, capture via: `adb shell dumpsys telephony.registry` on Android
 PCSCF=2001:db8::105
 ```
 
@@ -67,9 +67,6 @@ and waiting out whatever the network tells it to wait out. Check on it with:
 journalctl -u imsd -f
 busctl --system call net.catcrafts.IMS1 /net/catcrafts/IMS1 net.catcrafts.IMS1 GetStatus
 ```
-
-Every variable, what the daemon does when the registration breaks, and
-what the journal lines mean are in [AGENTS.md](AGENTS.md) (§10, §7.4, §7.8).
 
 ## Dialers
 
@@ -92,47 +89,69 @@ the install (`/etc/skel`); an existing account hides it itself with a
 For Phosh and GNOME Mobile, `apk add imsd-ofono` enables `imsd-ofonod` and
 points GNOME Calls at its `ofono` provider (a gschema override; the per-user
 equivalent is `gsettings set org.gnome.Calls autoload-plugins "['ofono']"`).
-Do not run it alongside a real `ofonod`. Known gaps — USSD, hold and
-multiparty, caller-ID withholding, the empty emergency-call screen, and why a
-restart of `imsd-ofonod` restarts GNOME Calls — are listed in
-[AGENTS.md §8.3](AGENTS.md).
+Do not run it alongside a real `ofonod`.
 
 Call control is polkit's `net.catcrafts.IMS1.Voice`: the active local
 session and root may place, answer and end calls; an ssh login may not.
 
-## Building
+## Full config:
 
-With the [Crafter Build](https://forgejo.catcrafts.net/Catcrafts/Crafter.Build)
-Flatpak, which carries the compiler:
+| Variable | Default | Meaning |
+|---|---|---|
+| `PCSCF` | *(none — required)* | P-CSCF address (IPv6); without it registration fails with a clear error |
+| `PCSCF_PORT` | `5060` | unprotected SIP port for the initial REGISTER |
+| `DEV` | `qmapmux0.0` | ims-PDN netdev; the packaged service passes the real one via `/run/imsd.env` |
+| `LOCAL` | *(auto)* | UE address. The packaged service gets the PDN address ModemManager assigned, via `/run/imsd.env` from `ims-pdn-up.sh`; a manual run prefers a global IPv6 on `DEV` that is neither temporary nor `dynamic` (RA-derived), then any non-temporary one, then the first (the kernel's temporary SLAAC address is listed first, and a registration bound to it is lost when the kernel retires it) |
+| `USER_AGENT` | `imsd/<version>` | REGISTER User-Agent. Some networks fingerprint UAs; setting your device's stock build string reproduces the stock modem's registration exactly. Empty omits the header |
+| `STATE_FILE` | `/var/lib/imsd/imsreg.state` (root) / `$XDG_STATE_HOME/imsd/imsreg.state` | persisted registration context for warm resume |
+| `HOLDS_FILE` | `/run/imsd.holds` (root) / `$XDG_RUNTIME_DIR/imsd.holds` (`/tmp/imsd.holds` without a runtime dir) | the waits the network imposed (a `Retry-After`, the refusal schedule), where that schedule stands and whether the old registration is gone (`old_gone`), kept across a restart of imsd for the PDN they were set on — not across a reboot; `/dev/null` switches the file off (only a regular file is ever removed; anything else is emptied). `imsd-handover.sh` honours it too |
+| `RESUME` | `auto` | `0` forces a fresh registration (ignores a warm SA) |
+| `REFRESH_INTERVAL` | *(auto)* | keepalive re-REGISTER period in s; default = half the granted expiry, clamped to [120, 1800] |
+| `EALG` | `aes-cbc` | offered ESP cipher (`aes-cbc`, `des-ede3-cbc`, `null`). From the 401's `Security-Server` list imsd selects the highest-preference `ipsec-3gpp` mechanism that matches this offer (RFC 3329 §2.3.1) and takes the SPIs/ports from the entry carrying them (some cores list every mechanism they support and put the SPIs on the one they applied); when no entry matches, the P-CSCF's SPI-carrying entry is installed as listed (`hmac-md5-96`, an absent `ealg` = null) and the journal says so. The line, the selection and the SA parameters are logged at every fresh registration |
+| `SIP_TRANSPORT` | `auto` | transport of the protected leg (the second REGISTER and everything after it): `tcp`, `udp`, or `auto` = TCP, falling back to a fresh registration over UDP when the P-CSCF leaves two TCP connects unanswered — but only on a phone that has never registered over TCP: once the state file records a TCP registration, a silent connect is treated as an outage, not a policy (delete the file or set `udp` to override, e.g. after a SIM change). The challenge (first REGISTER) is always UDP. Over UDP a REGISTER or INVITE larger than ~1.2 KB leaves as IPv6 fragments at the ims PDN's 1280-byte MTU (the journal says so once per flow); there are no SIP retransmission timers over UDP yet, so a lost datagram costs a timeout. The SAs, the listener and the firewall rule cover both transports |
+| `EMERGENCY_NUMBERS` | *(empty)* | comma-separated additions to the builtin 112/911 emergency numbers (e.g. a private test core's short code). SIM `EF_ECC` is not read yet. `imsd-ofonod` reads it too, for the oFono `EmergencyNumbers` property |
+| `RTP_PORT` | `50004` | local RTP port advertised in SDP |
+| `PRECOND` | `0` | `1` offers SDP QoS preconditions |
+| `CODECS` | *(empty — defaults)* | comma-separated codec preference list over `AMR-WB`, `AMR` (or `AMR-NB`), `PCMA`, `PCMU`: restricts and orders both the codecs offered on an outgoing call and those accepted from an inbound offer (default: offer AMR-WB + AMR, accept all four in that order). A bench knob — a network whose gateway transcodes every caller up to AMR-WB otherwise never lets the narrowband path run |
+| `DUMP_SIP` | `0` | `1` writes raw REGISTER-200/SUBSCRIBE-200 dumps, the last refused REGISTER or SUBSCRIBE final (`imsd-register-fail.raw`, `imsd-subscribe-fail.raw`), the last inbound INVITE (`imsd-invite-in.raw`) and the last outgoing INVITE (`imsd-invite-out.raw`), mode 0600, for debugging — they contain your IMSI/MSISDN and addresses. A refused REGISTER or SUBSCRIBE is logged with its status line and any Retry-After / Warning / Reason / Server headers |
+| `DUMP_DIR`, `OUT_DIR` | state dir | where dumps / per-call media stats land |
+| `IMSD_MEDIA` | *(auto)* | path to `imsd-media` (default: next to `imsd`, else `/usr/libexec/imsd-media`) |
 
-```sh
-flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak remote-add --if-not-exists catcrafts https://flatpak.catcrafts.net/catcrafts.flatpakrepo
-flatpak install catcrafts net.catcrafts.CrafterBuild//stable
-alias crafter-build='flatpak run net.catcrafts.CrafterBuild//stable'
-crafter-build          # the daemon; -- --product=media|dialerd|ofonod for the others
-crafter-build test     # the seven unit-test suites
-```
+The protected client/server ports are fixed at 45061/45062
+(`imsd::util::PortUc`/`PortUs`) — changing them in source also requires
+updating the firewall rules `ims-pdn-up.sh` installs.
 
-Or without crafter-build (distro packaging), with clang/libc++/lld and the
-gio-2.0 headers:
+### imsd-media (per-call, set through imsd's environment)
 
-```sh
-make && make check
-```
+| Variable | Default | Meaning |
+|---|---|---|
+| `MIC`, `PLAY` | `1`, `1` | uplink mic capture / downlink playout via PipeWire, as imsd passes them (`imsd-media` started by hand defaults both to off) |
+| `AUDIO_USER` | *(auto)* | account whose PipeWire session carries call audio; imsd sets it per call from logind's seat0 session. Set in imsd's own environment it pins an account instead |
+| `GAIN`, `PLAY_GAIN` | `10`, `1.0` | uplink / downlink gain, as imsd passes them (`imsd-media` started by hand defaults `GAIN` to `1.0`) |
+| `AMR_MODE` | `2` | AMR encoder mode of whichever AMR codec is active, as imsd passes it (12.65 kbit/s for AMR-WB; `imsd-media` started by hand defaults to 2 for AMR-WB and 7 for AMR) |
+| `DTX` | `0` | encoder discontinuous transmission |
+| `MEDIA_TIMEOUT` | `6.0` | seconds of downlink silence before exit 3 (far-end-hangup signal) |
+| `RTP_DUMP` | `0` | `1` captures raw downlink RTP next to the stats file |
 
-Cross-compiling for a phone, the Makefile's requirements, the package layout
-and the CI that publishes the apks are in [AGENTS.md](AGENTS.md) (§4, §9).
+## D-Bus ABI
 
-## Documentation
+`net.catcrafts.IMS1` at `/net/catcrafts/IMS1`. The ABI is frozen.
 
-[AGENTS.md](AGENTS.md) is the complete reference — for coding agents, and
-for anyone who wants to know how imsd works or change it: the build products
-and the rule that keeps the engine core free of GLib and I/O, the test
-suites, the lint rules, the registration and recovery behaviour, the ims PDN
-bring-up, upgrades, the frozen D-Bus ABI, packaging and release mechanics,
-the full configuration reference, and the carrier behaviours the code was
-shaped by.
+| Member | Signature |
+|---|---|
+| `Dial(number)` | `s → s` (callUni) |
+| `HangUp(callUni)` | `s` |
+| `Accept(callUni)` | `s` |
+| `SendDtmf(callUni, tones)` | `ss` |
+| `GetCalls()` | `→ aa{sv}` |
+| `GetStatus()` | `→ a{sv}` |
+| `CallAdded` | `s a{sv}` |
+| `CallStateChanged` | `s s s` (callUni, state, reason) |
+| `CallDeleted` | `s` |
+| `RegistrationChanged` | `b` |
+
+Both `imsd-dialerd` and `imsd-ofonod` are users of this ABI.
+A new desktop needs a new translation daemon, not changes here.
 
 ## License
 

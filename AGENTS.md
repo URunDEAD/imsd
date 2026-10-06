@@ -6,7 +6,8 @@
 This file is for coding agents and for anyone changing imsd: what the
 repository contains, how it is built, tested and packaged, how the daemon
 behaves at runtime, and the conventions a change has to follow. The README
-is the short, human-facing introduction; everything it leaves out is here.
+is for users: what imsd is, how to install and configure it. The
+configuration variables are documented there, not here (§10).
 Where this file and the code disagree, the code is right and this file has a
 bug — fix it in the same change.
 
@@ -913,54 +914,23 @@ bump commit titled `imsd X.Y.Z` that changes only the `Version` constant.
 ## 10. Configuration reference
 
 Everything is environment variables. The packaged unit reads
-`/run/imsd.env` (from `ims-pdn-up.sh`) and then `/etc/imsd.env` (yours, wins
-on conflict). Minimum viable `/etc/imsd.env`:
-
-```sh
-# REQUIRED until P-CSCF discovery from the PDN's PCO is implemented: your
-# carrier's P-CSCF address. Find it in a stock-firmware capture or your
-# carrier's IMS documentation.
-PCSCF=2001:db8::105
-```
+`/run/imsd.env` (from `ims-pdn-up.sh`) and then `/etc/imsd.env` (the user's,
+wins on conflict). The variables are user documentation: the tables and the
+minimum `/etc/imsd.env` are in the README.
 
 ### 10.1 imsd
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `PCSCF` | *(none — required)* | P-CSCF address (IPv6); without it registration fails with a clear error |
-| `PCSCF_PORT` | `5060` | unprotected SIP port for the initial REGISTER |
-| `DEV` | `qmapmux0.0` | ims-PDN netdev; the packaged service passes the real one via `/run/imsd.env` |
-| `LOCAL` | *(auto)* | UE address. The packaged service gets the PDN address ModemManager assigned, via `/run/imsd.env` from `ims-pdn-up.sh`; a manual run prefers a global IPv6 on `DEV` that is neither temporary nor `dynamic` (RA-derived), then any non-temporary one, then the first (the kernel's temporary SLAAC address is listed first, and a registration bound to it is lost when the kernel retires it) |
-| `USER_AGENT` | `imsd/<version>` | REGISTER User-Agent. Some networks fingerprint UAs; setting your device's stock build string reproduces the stock modem's registration exactly. Empty omits the header |
-| `STATE_FILE` | `/var/lib/imsd/imsreg.state` (root) / `$XDG_STATE_HOME/imsd/imsreg.state` | persisted registration context for warm resume |
-| `HOLDS_FILE` | `/run/imsd.holds` (root) / `$XDG_RUNTIME_DIR/imsd.holds` (`/tmp/imsd.holds` without a runtime dir) | the waits the network imposed (a `Retry-After`, the refusal schedule), where that schedule stands and whether the old registration is gone (`old_gone`), kept across a restart of imsd for the PDN they were set on — not across a reboot; `/dev/null` switches the file off (only a regular file is ever removed; anything else is emptied). `imsd-handover.sh` honours it too |
-| `RESUME` | `auto` | `0` forces a fresh registration (ignores a warm SA) |
-| `REFRESH_INTERVAL` | *(auto)* | keepalive re-REGISTER period in s; default = half the granted expiry, clamped to [120, 1800] |
-| `EALG` | `aes-cbc` | offered ESP cipher (`aes-cbc`, `des-ede3-cbc`, `null`). From the 401's `Security-Server` list imsd selects the highest-preference `ipsec-3gpp` mechanism that matches this offer (RFC 3329 §2.3.1) and takes the SPIs/ports from the entry carrying them (some cores list every mechanism they support and put the SPIs on the one they applied); when no entry matches, the P-CSCF's SPI-carrying entry is installed as listed (`hmac-md5-96`, an absent `ealg` = null) and the journal says so. The line, the selection and the SA parameters are logged at every fresh registration |
-| `SIP_TRANSPORT` | `auto` | transport of the protected leg (the second REGISTER and everything after it): `tcp`, `udp`, or `auto` = TCP, falling back to a fresh registration over UDP when the P-CSCF leaves two TCP connects unanswered — but only on a phone that has never registered over TCP: once the state file records a TCP registration, a silent connect is treated as an outage, not a policy (delete the file or set `udp` to override, e.g. after a SIM change). The challenge (first REGISTER) is always UDP. Over UDP a REGISTER or INVITE larger than ~1.2 KB leaves as IPv6 fragments at the ims PDN's 1280-byte MTU (the journal says so once per flow); there are no SIP retransmission timers over UDP yet, so a lost datagram costs a timeout. The SAs, the listener and the firewall rule cover both transports |
-| `EMERGENCY_NUMBERS` | *(empty)* | comma-separated additions to the builtin 112/911 emergency numbers (e.g. a private test core's short code). SIM `EF_ECC` is not read yet. `imsd-ofonod` reads it too, for the oFono `EmergencyNumbers` property |
-| `RTP_PORT` | `50004` | local RTP port advertised in SDP |
-| `PRECOND` | `0` | `1` offers SDP QoS preconditions |
-| `CODECS` | *(empty — defaults)* | comma-separated codec preference list over `AMR-WB`, `AMR` (or `AMR-NB`), `PCMA`, `PCMU`: restricts and orders both the codecs offered on an outgoing call and those accepted from an inbound offer (default: offer AMR-WB + AMR, accept all four in that order). A bench knob — a network whose gateway transcodes every caller up to AMR-WB otherwise never lets the narrowband path run |
-| `DUMP_SIP` | `0` | `1` writes raw REGISTER-200/SUBSCRIBE-200 dumps, the last refused REGISTER or SUBSCRIBE final (`imsd-register-fail.raw`, `imsd-subscribe-fail.raw`), the last inbound INVITE (`imsd-invite-in.raw`) and the last outgoing INVITE (`imsd-invite-out.raw`), mode 0600, for debugging — they contain your IMSI/MSISDN and addresses. A refused REGISTER or SUBSCRIBE is logged with its status line and any Retry-After / Warning / Reason / Server headers |
-| `DUMP_DIR`, `OUT_DIR` | state dir | where dumps / per-call media stats land |
-| `IMSD_MEDIA` | *(auto)* | path to `imsd-media` (default: next to `imsd`, else `/usr/libexec/imsd-media`) |
-
-The protected client/server ports are fixed at 45061/45062
-(`imsd::util::PortUc`/`PortUs`) — changing them in source also requires
-updating the firewall rules `ims-pdn-up.sh` installs.
+The README's first table. The protected client/server ports are fixed at
+45061/45062 (`imsd::util::PortUc`/`PortUs`) — changing them in source also
+requires updating the firewall rules `ims-pdn-up.sh` installs.
 
 ### 10.2 imsd-media (per call, set through imsd's environment)
 
+The README's second table. Two pairs are not configuration and are left out
+there:
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `MIC`, `PLAY` | `1`, `1` | uplink mic capture / downlink playout via PipeWire, as imsd passes them (`imsd-media` started by hand defaults both to off) |
-| `AUDIO_USER` | *(auto)* | account whose PipeWire session carries call audio; imsd sets it per call from logind's seat0 session (§7.6). Set in imsd's own environment it pins an account instead |
-| `GAIN`, `PLAY_GAIN` | `10`, `1.0` | uplink / downlink gain, as imsd passes them (`imsd-media` started by hand defaults `GAIN` to `1.0`) |
-| `AMR_MODE` | `2` | AMR encoder mode of whichever AMR codec is active, as imsd passes it (12.65 kbit/s for AMR-WB; `imsd-media` started by hand defaults to 2 for AMR-WB and 7 for AMR) |
-| `DTX` | `0` | encoder discontinuous transmission |
-| `MEDIA_TIMEOUT` | `6.0` | seconds of downlink silence before exit 3 (far-end-hangup signal) |
-| `RTP_DUMP` | `0` | `1` captures raw downlink RTP next to the stats file |
 | `CODEC`, `OCTET_ALIGN` | *(from the SDP)* | set by imsd from the negotiated answer; not configuration |
 | `MIC_SRC`, `PCM_DUMP` | *(unset)* | test seams (§5) |
 
@@ -993,7 +963,7 @@ only the imsd side of its bus choice.
   file lists with `make install`, `make-bin-tarball.sh` and
   `APKBUILD.binary`'s `package()` when a packaged file is added.
 - **The README and this file follow the code in the same commit.** A new
-  knob gets its row in §10; a new state its journal line in §7.8; a new file
+  knob gets its row in the README's configuration tables; a new state its journal line in §7.8; a new file
   under `/run` or `/var/lib` its row in §7.7.
 - **Compatibility notes are kept where the mechanism lives**, not in a
   changelog the repository does not have: the 0.3.9 hand-over is documented
