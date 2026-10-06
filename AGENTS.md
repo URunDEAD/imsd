@@ -34,7 +34,6 @@ PipeWire. The verified device/carrier combinations are in the README.
 | Path | What it is |
 |---|---|
 | `project.cpp` | The canonical build description, for [Crafter Build](https://forgejo.catcrafts.net/Catcrafts/Crafter.Build). Chooses the product by `--product=`. |
-| `Makefile` | Distro-packaging mirror of `project.cpp`: the same clang module pipeline, the same flags. Keep the two in sync when products, module partitions or link flags change. |
 | `lint-rules.h` | The house-style lint rules (§6), registered from `project.cpp` through `AddProjectLintRules`. Project-local on purpose. |
 | `interfaces/Imsd.cppm` | The primary module interface of `imsd-core`: `export import`s the seven partitions below. |
 | `interfaces/Imsd-Util.cppm` | `imsd::util` — SIP tokens, IPv6 host/port formatting, hex/base64, MD5 (RFC 1321), the fixed protected ports `PortUc`/`PortUs` (45061/45062). |
@@ -50,9 +49,9 @@ PipeWire. The verified device/carrier combinations are in the README.
 | `implementations/dialerd.cpp` | `imsd-dialerd`, the Plasma Mobile session-bus backend (`org.kde.telephony.*`). |
 | `implementations/ofonod.cpp` | `imsd-ofonod`, the GNOME Calls system-bus backend (`org.ofono`). |
 | `tests/<Suite>/main.cpp` | The seven unit-test suites: `Util`, `Aka`, `Ipsec`, `Messages`, `Engine`, `Sip`, `Sdp`. |
-| `packaging/` | systemd units, the bring-up and upgrade scripts, D-Bus and polkit policies, presets, the gschema override, the two APKBUILDs and the CI helpers (§9). |
+| `packaging/` | systemd units, the bring-up and upgrade scripts, D-Bus and polkit policies, presets, the gschema override, `APKBUILD.binary` and the CI helpers (§9). |
 | `.forgejo/workflows/package.yml` | CI: builds the aarch64 apks on every push to `main` and publishes them to the Forgejo Alpine registry (§9.4). |
-| `bin/`, `build/` | Build outputs (crafter-build and make respectively). Ignored. |
+| `bin/`, `build/` | crafter-build's outputs and intermediates. Ignored. |
 
 Also ignored by `.gitignore`, and never to be committed: `*.raw`, `*.rtp`,
 `*.stats`, `imsreg.state`, `imsd-*.tar.gz` — captures and runtime state carry
@@ -142,37 +141,8 @@ rpath into `/app/lib`: run it inside the sandbox (`flatpak run --command=sh
 net.catcrafts.CrafterBuild//stable`, with `--socket=session-bus` for §8.3's
 daemons — the sandbox's own session bus is a filter that refuses their names;
 `crafter-build test` runs the suites there
-anyway), or build with `make` (§4.2) for one that runs on the host. A sysroot
+anyway). A sysroot
 build (§4.3) gets no such rpath — it links the sysroot's libc++.
-
-### 4.2 With make (distro packaging)
-
-GNU make, `clang++` with libc++ and the libc++ std module sources (`std.cppm`:
-package `llvm-runtimes` on Alpine, `libc++` on Arch; override `STD_CPPM` if it
-lives elsewhere), lld, pkg-config and the gio-2.0 headers.
-
-```sh
-make            # build/make/{imsd,imsd-media,imsd-dialerd,imsd-ofonod}
-make check      # the same seven suites
-make install    # DESTDIR/PREFIX staged install, including the packaging/ files
-```
-
-The Makefile forces `CXX = clang++` (abuild exports `CXX=c++`, which is gcc
-and has no `--precompile`); an explicit `make CXX=…` still wins. One flag set
-is used for every translation unit because BMIs are rejected on
-compiler-option mismatch — per-target extras are limited to `-I`/`-D` and
-`-l`/`-L`. From `pkg-config gio-2.0` only `-I`/`-D` and `-l`/`-L` pass
-through: it also emits `-pthread`, which would config-mismatch the shared
-`std` BMI (`project.cpp` filters identically; pthread lives in libc on every
-platform targeted). The BMI file names must stay `<module>-<partition>.pcm` —
-that is how clang resolves `import :Part;` under `-fprebuilt-module-path`.
-
-`make install` places: the four binaries (`imsd-media` under `libexec`),
-`ims-pdn-up.sh` and `imsd-handover.sh` under `libexec`, `imsd.service` and
-`imsd-ofonod.service`, `imsd-dialerd.desktop` in `/etc/xdg/autostart`, the
-D-Bus policies (`net.catcrafts.IMS1.conf`, `imsd-ofono.conf`), the polkit
-policy, `imsd-ofono-restart-calls.sh`, the GNOME Calls gschema override and
-the `80-imsd-ofono.preset`.
 
 ### 4.3 Cross-compiling for a phone (aarch64 Alpine / postmarketOS)
 
@@ -204,11 +174,11 @@ releases. This is the flow CI runs (§9.4).
 
 ## 5. Tests
 
-`crafter-build test` and `make check` run the same seven suites. Each suite
+`crafter-build test` runs the seven suites. Each suite
 is a plain `main()` with a `Check(bool, message)` counter: failures print
 `FAIL: …`, success prints `<Suite>: all tests passed`, and the exit status is
 the failure count for six suites — non-zero short of a multiple of 256 — and
-1 for `Engine`. Seven `all tests passed` lines from `make check`, on every
+1 for `Engine`. `crafter-build test` ending in `7 passed`, on every
 commit of a range (§11), is the project's definition of green.
 
 What the suites pin:
@@ -774,9 +744,7 @@ Phosh drives. The answered calls predate the polkit gate (§5).
 Setup: `apk add imsd-ofono` enables `imsd-ofonod.service` by preset and ships
 a gschema override setting `org.gnome.Calls autoload-plugins` to `['ofono']`
 (the per-user equivalent is `gsettings set org.gnome.Calls autoload-plugins
-"['ofono']"`); a hand install (`make install`) enables the unit itself with
-`systemctl enable --now imsd-ofonod` (it is a system service: `org.ofono` is
-a system-bus name) and compiles the schema override. Drop `mm` rather than adding `ofono` alongside it: the
+"['ofono']"`). Drop `mm` rather than adding `ofono` alongside it: the
 ModemManager provider would offer the modem's CS voice path as a second
 origin, and on a phone whose voice path is imsd that origin carries no audio.
 Never run it beside a real `ofonod` (one name, one owner;
@@ -824,9 +792,8 @@ Known gaps, all inherited rather than introduced:
   (`imsd-ofono-restart-calls.sh`) restarts the Calls daemon of every user
   running one. The first start since boot leaves a running Calls alone.
 
-Development without a phone or root (crafter-build's binaries inside the
-sandbox, the `make` build's `build/make/imsd` and `build/make/imsd-ofonod` on
-the host: §4.1):
+Development without a phone or root (crafter-build's binaries run inside the
+sandbox: §4.1):
 
 ```sh
 ./bin/imsd-*/imsd --session &            # imsd's ABI on the session bus
@@ -836,26 +803,19 @@ busctl --user call org.ofono / org.ofono.Manager GetModems
 
 ## 9. Packaging, CI and releases
 
-### 9.1 The two APKBUILDs
+### 9.1 The APKBUILD
 
-- `packaging/APKBUILD.binary` is **the** packaging since 2026-09-02: it wraps
-  a crafter-build binary cross-compiled per §4.3 (bundled by
-  `packaging/make-bin-tarball.sh` together with the units, scripts and
-  policies) into the apks CI publishes. `pkgver` is taken from the `Version`
-  constant in `implementations/main.cpp` by `build-package.sh`.
-  Subpackages: `imsd-ofono` (the GNOME Calls backend, opt-in) and
-  `imsd-systemd` (the unit files; `install_if` systemd — ordered after
-  `imsd-ofono` because `systemd()` amoves all of `usr/lib/systemd/system`).
-- `packaging/APKBUILD` is the from-source route through the Makefile (`make`,
-  `make check`, `make install`) for distros that build from source. It is
-  not the binary route's equal: no `imsd-systemd` subpackage and none of what
-  §9.2 lists for the apk (imsd's preset, the enable link, the condition
-  drop-in, the `/etc/skel` override), no `libc++` in `depends`; only the
-  `imsd-ofono` file list matches. Its `pkgver` is not bumped per release
-  (0.3.0) and its `source=` expects a `v$pkgver` tag archive, which the
-  repository has no tags for.
+`packaging/APKBUILD.binary` is **the** packaging since 2026-09-02: it wraps
+a crafter-build binary cross-compiled per §4.3 (bundled by
+`packaging/make-bin-tarball.sh` together with the units, scripts and
+policies) into the apks CI publishes. `pkgver` is taken from the `Version`
+constant in `implementations/main.cpp` by `build-package.sh`.
+Subpackages: `imsd-ofono` (the GNOME Calls backend, opt-in) and
+`imsd-systemd` (the unit files; `install_if` systemd — ordered after
+`imsd-ofono` because `systemd()` amoves all of `usr/lib/systemd/system`).
+There is no from-source recipe: a build needs crafter-build (§4.1).
 
-Both declare `provides="81voltd=$pkgver-r$pkgrel"`: it satisfies
+It declares `provides="81voltd=$pkgver-r$pkgrel"`: this satisfies
 `soc-qcom-modem`'s dependency and excludes the real package, because 81voltd
 serves the modem's own ims-PDN requests, races imsd for the PDN and flaps it
 with a new prefix every ~2.5 min — two IMS stacks cannot share one PDN.
@@ -870,10 +830,7 @@ unit's sequencing is only tested under systemd.
 `ConditionPathExists=/etc/imsd.env`, so VoLTE survives reboots without a
 manual `systemctl enable` and an unconfigured phone does not boot into a
 failing unit. `imsd-ofonod.service` is enabled the same way by `imsd-ofono`.
-All of that is the apk's doing (`APKBUILD.binary`'s `package()`): `make
-install` places the unit files and `80-imsd-ofono.preset` only, so a hand
-install runs `systemctl enable imsd` (and `imsd-ofonod`) itself and gets no
-`/etc/imsd.env` condition.
+All of that is the apk's doing (`APKBUILD.binary`'s `package()`).
 The main package hides kde-telephony's `modem-daemon` autostart for accounts
 created after it is installed (`/etc/skel/.config/autostart/org.kde.modem.daemon.desktop`)
 because `imsd-dialerd` owns those names.
@@ -959,9 +916,8 @@ only the imsd side of its bus choice.
 - **One change, one commit; a fix goes into the commit that introduced the
   problem** while a range is unpublished (rebase), never as a follow-up on
   top. Every commit of a range builds and passes the seven suites on its own.
-- **Keep `project.cpp` and the Makefile in sync**, and the two APKBUILDs'
-  file lists with `make install`, `make-bin-tarball.sh` and
-  `APKBUILD.binary`'s `package()` when a packaged file is added.
+- **Keep `make-bin-tarball.sh`'s file list and `APKBUILD.binary`'s
+  `package()` in sync** when a packaged file is added.
 - **The README and this file follow the code in the same commit.** A new
   knob gets its row in the README's configuration tables; a new state its journal line in §7.8; a new file
   under `/run` or `/var/lib` its row in §7.7.
