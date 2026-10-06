@@ -34,7 +34,6 @@ PipeWire. The verified device/carrier combinations are in the README.
 | Path | What it is |
 |---|---|
 | `project.cpp` | The canonical build description, for [Crafter Build](https://forgejo.catcrafts.net/Catcrafts/Crafter.Build). Chooses the product by `--product=`. |
-| `lint-rules.h` | The house-style lint rules (§6), registered from `project.cpp` through `AddProjectLintRules`. Project-local on purpose. |
 | `interfaces/Imsd.cppm` | The primary module interface of `imsd-core`: `export import`s the seven partitions below. |
 | `interfaces/Imsd-Util.cppm` | `imsd::util` — SIP tokens, IPv6 host/port formatting, hex/base64, MD5 (RFC 1321), the fixed protected ports `PortUc`/`PortUs` (45061/45062). |
 | `interfaces/Imsd-Sip.cppm` | `imsd::sip` — SIP as a text layer plus TCP framing: header extraction, status codes, the granted lifetime, `ResponseOf` transaction matching. Not a full RFC 3261 parser, deliberately. |
@@ -130,7 +129,7 @@ crafter-build -- --product=media    # bin/imsd-media-…/imsd-media
 crafter-build -- --product=dialerd  # bin/imsd-dialerd-…/imsd-dialerd
 crafter-build -- --product=ofonod   # bin/imsd-ofonod-…/imsd-ofonod
 crafter-build test                  # the seven unit-test suites
-crafter-build lint                  # the house-style rules of lint-rules.h
+crafter-build lint                  # the house-style rules (§4.2, §6)
 ```
 
 Output directories under `bin/` are named `<product>-<target>-<march>-<mtune>-<id>`;
@@ -143,6 +142,33 @@ daemons — the sandbox's own session bus is a filter that refuses their names;
 `crafter-build test` runs the suites there
 anyway). A sysroot
 build (§4.3) gets no such rpath — it links the sysroot's libc++.
+
+### 4.2 The lint rules, a dependency of project.cpp
+
+`project.cpp` imports the house-style rules (§6) from their own repository:
+
+```cpp
+#pragma crafter dependency "https://forgejo.catcrafts.net/Catcrafts/Crafter.LintRules.git" commit "<sha>"
+import Crafter.LintRules;
+```
+
+crafter-build clones that repository — and updates the clone on later loads —
+and builds it for the host whenever it loads `project.cpp`: every build does
+this, CI's included, not only `lint`. The commit is pinned, so a change to
+the rules reaches imsd when the pin moves. `LintRules::AddRules` registers
+the rules on each product's configuration.
+
+```sh
+crafter-build lint            # report every finding; exit 1 on any
+crafter-build lint 'naming'   # one rule (the argument is a glob)
+crafter-build format          # apply the transform rules in place
+```
+
+Six rules read the AST (`naming`, `no-char-pointer`, `const-local`,
+`constexpr-constant`, `fixed-width-types`, `single-declaration`) and need the
+module PCMs: build the four programs and the tests first. With crafter-build
+2.1.0 they still do not run on 2 of the 18 files, `implementations/main.cpp`
+among them (`'type_traits' file not found`).
 
 ### 4.3 Cross-compiling for a phone (aarch64 Alpine / postmarketOS)
 
@@ -277,26 +303,20 @@ Rules:
 
 ## 6. Code style and lint
 
-`crafter-build lint` reports the rules of `lint-rules.h`; `crafter-build format`
-applies the transform rules. The rules, by name:
+The rules are the Catcrafts house style,
+[Crafter.LintRules](https://forgejo.catcrafts.net/Catcrafts/Crafter.LintRules),
+pulled in by `project.cpp` (§4.2); that repository's README lists the
+seventeen of them. `// lint-disable-file <rule>` (by convention on line 4,
+after the SPDX header and a blank line) and `// lint-disable-next-line <rule>`
+suppress a rule where a file needs it; nearly every source file disables
+`fixed-width-types`.
 
-| Rule | Meaning |
-|---|---|
-| `spdx-header` | Line 1 `// SPDX-License-Identifier: …`, line 2 `// SPDX-FileCopyrightText: …`, line 3 blank. Line 4 may carry `// lint-disable-file <rule> …` where a file needs one. |
-| `no-tabs` | Spaces only. |
-| `naming` | Types, aliases, functions, statics, namespace-scope globals and `constexpr` constants are PascalCase; locals and parameters camelCase; one trailing underscore marks a member or shadows a keyword (`label_`, `requires_`). Heuristic, report-only. |
-| `enum-class` | `enum class`, never a plain `enum`. |
-| `no-iostream-print` | `std::println` (and `std::println(std::cerr, …)`), never `std::cout` / `<<` to `std::cerr`. |
-| `no-char-pointer` | `std::string` / `std::string_view` over `char*`. C interop stays: argv, getenv/setenv, dlerror, `c_str()`/`.data()` call sites, `reinterpret_cast`, `extern "C"`. |
-| `format-concat` | `std::format` instead of `+` with a string literal; simple single-line chains are rewritten automatically, anything else is reported. |
-| `fixed-width-types` | `std::int32_t` and friends instead of `short`/`int`/`long` (transform); lines with `main`/`argc`/`argv` or `extern "C"` keep C ints. Nearly every source file disables this one on line 4. |
-| `single-declaration` | One declaration per statement; `Type a = x, b = y;` is auto-split, declarators with pointers, references, parens or templates are reported. |
-| `brace-style` | K&R: a `{` alone on a line after a `)`/`else`/`do`/`try` header joins the header line. Standalone scope blocks stay. |
-| `if-single-line` | A single-statement `if` body joins the `if` line when the result stays within 250 columns and neither line carries a comment. |
-| `wrap-join` | Wrapped call arguments and `&&`/`||`/`|` continuations join back onto one line when the expression fits in 250 columns. |
-| `paren-spacing` | No padding inside parentheses. |
-| `trim-trailing-ws` | No trailing whitespace. |
-| `final-newline` | The file ends with a newline: one is appended when it is missing. |
+The tree was written under an earlier, project-local copy of the rules and
+does not pass the shared ones yet: `crafter-build lint` reports 72 findings
+(2026-10-06) — `naming` 44 (constants and statics are PascalCase here, the
+shared rule wants camelCase), `const-local` 10 (a rule the copy did not
+have), `single-declaration` 2 (not reported under the copy), `format-concat`
+13 and `wrap-join` 3 (as under the copy). CI does not run lint.
 
 Beyond the rules:
 

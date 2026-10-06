@@ -4,7 +4,8 @@
 // lint-disable-file no-char-pointer
 import std;
 import Crafter.Build;
-#include "lint-rules.h"
+#pragma crafter dependency "https://forgejo.catcrafts.net/Catcrafts/Crafter.LintRules.git" commit "e906f797da2cd0b1776dd1b420f9b04d3cd24baf"
+import Crafter.LintRules;
 namespace fs = std::filesystem;
 using namespace Crafter;
 
@@ -113,7 +114,7 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
             ofonod.GetInterfacesAndImplementations(ifaces, impls);
         }
         ApplyGioFlags(ofonod);
-        ProjectLint::AddProjectLintRules(ofonod);
+        LintRules::AddRules(ofonod);
         return ofonod;
     }
     if (wantDialerd) {
@@ -129,7 +130,7 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
             dialerd.GetInterfacesAndImplementations(ifaces, impls);
         }
         ApplyGioFlags(dialerd);
-        ProjectLint::AddProjectLintRules(dialerd);
+        LintRules::AddRules(dialerd);
         return dialerd;
     }
     if (wantMedia) {
@@ -146,7 +147,7 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
         }
         media.linkFlags.push_back("-ldl");       // dlopen the AMR-WB codecs
         media.linkFlags.push_back("-lpthread");  // std::jthread playout/mic
-        ProjectLint::AddProjectLintRules(media);
+        LintRules::AddRules(media);
         return media;
     }
 
@@ -201,7 +202,7 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
     cfg.AddTest("Sip").Dependencies({ Core.get() });
     cfg.AddTest("Sdp").Dependencies({ Core.get() });
 
-    ProjectLint::AddProjectLintRules(cfg);
+    LintRules::AddRules(cfg);
 
     return cfg;
 }
