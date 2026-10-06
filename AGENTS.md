@@ -436,6 +436,15 @@ configures the muxed netdev. Idempotent; a non-zero exit fails the unit.
 - Waits up to 120 s for a modem, then gates the connect attempts on network
   registration (`IMS_REG_TIMEOUT`, default 300 s): some carriers attach ~2 min
   after boot.
+- Never creates or connects a bearer while the modem is `disabled` — its
+  radio is off (airplane mode): a modem still disabled after the wait, or
+  disabled when an attempt is due, makes the script exit non-zero (`modem …
+  disabled … (radio off): not connecting`) and systemd retries. A bearer
+  connect on a disabled modem fails with `no-service` and leaves
+  ModemManager's state `enabled` with the modem in low power; switching the
+  radio back on then no longer brings it up (dev phone 2026-10-06: not
+  registered after 150 s, against 5 s without the attempt; a ModemManager
+  disable/enable recovered it).
 - Connects by **3GPP profile index** (`IMS_PROFILE_ID`, default: looked up by
   APN in `qmicli --wds-get-profile-list=3gpp`), not by APN string: a
   profile-indexed request is exempt from the modem's attach-family forcing

@@ -39,6 +39,12 @@ bearer_paths() {
     kv -m "$MODEM" | sed -n 's/^modem\.generic\.bearers\.value\[[0-9]*\] *: *//p'
 }
 
+# A disabled modem has its radio off (airplane mode): leave it alone. A bearer
+# connect on it fails with no-service and leaves ModemManager's state
+# `enabled` with the modem still in low power; switching the radio back on
+# then no longer brings the modem up (dev phone 2026-10-06).
+radio_off() { [ "$(modem_state)" = disabled ]; }
+
 envval() {  # $1 = key — for manual runs; under systemd the vars are inherited
     sed -n "s/^$1=//p" /etc/imsd.env 2>/dev/null | tail -n1 | tr -d '"'
 }
@@ -165,6 +171,10 @@ if [ -z "$BEARER" ]; then
         [ "$STATE" != "$last" ] && log "waiting for registration (state: ${STATE:-unknown})"
         last=$STATE
         if [ "$waited" -ge "$REG_TIMEOUT" ]; then
+            if [ "$STATE" = disabled ]; then
+                log "modem still disabled after $REG_TIMEOUT s (radio off): not connecting"
+                exit 1
+            fi
             log "not registered after $REG_TIMEOUT s — attempting anyway"
             break
         fi
@@ -193,6 +203,7 @@ n=0
 while [ -z "$BEARER" ]; do
     n=$((n + 1))
     [ "$n" -gt 10 ] && { log "bearer connect failed after 10 attempts"; exit 1; }
+    radio_off && { log "modem disabled (radio off): not connecting"; exit 1; }
     B=$(find_ims_bearer no)   # reuse a stale disconnected ims bearer of this run's shape
     if [ -z "$B" ]; then
         if [ -n "$PROFILE_ID" ]; then
