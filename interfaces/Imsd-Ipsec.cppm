@@ -13,11 +13,13 @@ alg (HMAC-SHA-1-96 or HMAC-MD5-96) keyed with IK; confidentiality is the
 negotiated ealg keyed with CK. Both come from the Security-Server mechanism
 the P-CSCF selected in its 401 (parsed here), and this module turns the
 negotiated SPIs/ports/keys into the exact argv lists the daemon shell hands to
-`ip`; for a warm resume it reconstructs the SPIs, ports, and Security-Server
-value back out of `ip xfrm state`/`policy` text — the Security-Verify and
-the P-CSCF ports for the resume's flow, and the SPIs in use, which a
-reregistration's new SPIs must differ from (and the state file falls back
-to).
+`ip`; for a warm resume it reconstructs the SPIs and ports back out of `ip
+xfrm state`/`policy` text — the P-CSCF ports for the resume's flow, and the
+SPIs in use, which a reregistration's new SPIs must differ from (and the
+state file falls back to) — and a one-mechanism Security-Server value that
+stands in for the Security-Verify when the state file holds no list for the
+SA pair in the kernel (`ChooseResumeSecurityVerify` decides; since 0.3.12
+the 401's own list is stored there).
 
 Pure std C++ (the shell runs the commands and captures the text). Command
 shapes and the parser are pinned by tests/Ipsec.
@@ -308,7 +310,7 @@ export namespace imsd::ipsec {
     // What a warm SA in the kernel tells us — enough for a refresh re-REGISTER
     // to re-bind without re-authenticating.
     struct ExistingSa {
-        std::string securityServer;  // reconstructed Security-Server header value
+        std::string securityServer;  // one-mechanism Security-Server value: the resume's Security-Verify when the state file holds no list for this pair
         int portPs = 0;
         int portPc = 0;
         std::uint32_t spiUc = 0;     // our inbound client SPI (a reregistration offers a different one)
@@ -401,6 +403,35 @@ export namespace imsd::ipsec {
         if (!(havePs && havePc && havePortPs && havePortPc)) return std::nullopt;
         sa.securityServer = std::format("ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=aes-cbc; " "spi-c={}; spi-s={}; port-c={}; port-s={}", sa.spiPc, sa.spiPs, sa.portPc, sa.portPs);
         return sa;
+    }
+
+    // The Security-Verify a resume sends, and where it came from: the state
+    // file's list when the entry carrying its SPIs names the SA pair the
+    // kernel holds (a file an attempt the process did not live to record
+    // left behind names another pair), else the one-mechanism entry rebuilt
+    // from the SA — for an empty or unparseable value too.
+    struct ResumeSecurityVerify {
+        enum class Source { Stored, NoneStored, OtherSa };
+        Source source = Source::NoneStored;
+        std::string value;
+        std::size_t mechanisms = 0;                // of the stored list, when it is used
+        std::optional<std::uint32_t> storedSpiPs;  // the stored list's spi-s (OtherSa); nullopt = none parsed
+    };
+    ResumeSecurityVerify ChooseResumeSecurityVerify(std::string_view stored, const ExistingSa& sa, std::string_view offeredEalg) {
+        ResumeSecurityVerify r;
+        r.value = sa.securityServer;
+        if (stored.empty()) return r;
+        r.source = ResumeSecurityVerify::Source::OtherSa;
+        if (auto parsed = ParseSecurityServer(stored, "hmac-sha-1-96", offeredEalg)) {
+            const SecurityMechanism& c = parsed->Carrier();
+            r.storedSpiPs = c.spiPs;
+            if (c.spiPc == sa.spiPc && c.spiPs == sa.spiPs && c.portPc == sa.portPc && c.portPs == sa.portPs) {
+                r.source = ResumeSecurityVerify::Source::Stored;
+                r.value = std::string(stored);
+                r.mechanisms = parsed->mechanisms.size();
+            }
+        }
+        return r;
     }
 
     // Every local address holding an SA to the P-CSCF, once each, in kernel

@@ -644,6 +644,14 @@ struct RegState {
     // state file; its reregistrations carry an empty digest, the pre-0.3.11
     // shape, until the next fresh registration.
     std::string authNonce, authCnonce, authResponse;
+    // The Security-Verify this registration's protected REGISTERs, its
+    // reg-event SUBSCRIBE and its INVITEs echo: the 401's whole
+    // Security-Server list (RFC 3329 §2.3.1). Set on the fresh 200 and at
+    // the resume, never from an attempt in flight:
+    // the member ss_ holds a fresh attempt's 401 before that attempt can
+    // still abort (the throttle, an unsupported mechanism), and the
+    // standing registration's state writes must not store it.
+    std::string securityServer;
 };
 
 // Writable directory for the daemon's own files: the persisted registration
@@ -658,14 +666,21 @@ std::string StateDir() {
 // tiny JSON reader/writer for the persisted registration context.
 std::string StatePath() { return EnvOr("STATE_FILE", std::format("{}/imsreg.state", StateDir())); }
 
+// `security_server` is the registration's Security-Verify (RegState's
+// securityServer: the 401's joined list); a resume takes it from here
+// since 0.3.12. The file's values are quoted without escaping; a value
+// with a quote, a backslash or a newline in it (none RFC 3329's token
+// syntax produces) is written empty, and the resume falls back to the SA.
 void PersistState(const RegState& r, const std::string& route, const std::string& ppi, const std::string& aor, const std::string& transport) {
+    std::string ss = r.securityServer.find_first_of("\"\\\n") == std::string::npos ? r.securityServer : std::string();
     std::string j = std::format(
         "{{\"callid\": \"{}\", \"ftag\": \"{}\", \"cseq\": {}, \"spi_uc\": {}, "
         "\"spi_us\": {}, \"expiry\": {}, \"route\": \"{}\", \"ppi\": \"{}\", "
         "\"aor\": \"{}\", \"contact_user\": \"{}\", \"transport\": \"{}\", "
-        "\"auth_nonce\": \"{}\", \"auth_cnonce\": \"{}\", \"auth_response\": \"{}\"}}",
+        "\"auth_nonce\": \"{}\", \"auth_cnonce\": \"{}\", \"auth_response\": \"{}\", "
+        "\"security_server\": \"{}\"}}",
         r.callid, r.ftag, r.cseq, r.spiUc, r.spiUs, r.expiry, route, ppi, aor,
-        r.contactUser, transport, r.authNonce, r.authCnonce, r.authResponse);
+        r.contactUser, transport, r.authNonce, r.authCnonce, r.authResponse, ss);
     std::string path = StatePath();
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
@@ -689,7 +704,7 @@ void DumpRaw(std::string_view name, std::string_view msg) {
 }
 
 struct PersistedState {
-    std::optional<std::string> callid, ftag, route, ppi, aor, contactUser, transport, authNonce, authCnonce, authResponse;
+    std::optional<std::string> callid, ftag, route, ppi, aor, contactUser, transport, authNonce, authCnonce, authResponse, securityServer;
     std::optional<long> cseq, spiUc, spiUs, expiry;
 };
 std::optional<PersistedState> LoadState() {
@@ -710,6 +725,7 @@ std::optional<PersistedState> LoadState() {
     ps.authNonce = QuotedAfter(s, "\"auth_nonce\": \"");       // the three absent in pre-0.3.11 files
     ps.authCnonce = QuotedAfter(s, "\"auth_cnonce\": \"");
     ps.authResponse = QuotedAfter(s, "\"auth_response\": \"");
+    ps.securityServer = QuotedAfter(s, "\"security_server\": \"");   // absent in pre-0.3.12 files
     ps.cseq = IntAfter(s, "\"cseq\": ");
     ps.spiUc = IntAfter(s, "\"spi_uc\": ");
     ps.spiUs = IntAfter(s, "\"spi_us\": ");
@@ -1280,7 +1296,29 @@ private:
         // No fallback identity: an empty ppi omits P-Preferred-Identity and
         // is re-learned from the next 200's P-Associated-URI.
         ppi_ = ps->ppi.value_or("");
-        ss_ = sa->securityServer;
+        // The Security-Verify the protected REGISTERs, the reg-event
+        // SUBSCRIBE and the INVITEs echo: the 401's whole Security-Server
+        // list (RFC 3329 §2.3.1), from the state file since 0.3.12, or the
+        // one-mechanism entry rebuilt from the SA — Imsd:Ipsec chooses
+        // (ChooseResumeSecurityVerify). The rebuilt entry is KPN's answer to
+        // the default offer in the same bytes, not a list such as O2's six,
+        // which the RFC has the server answer with a 494; a refused resume
+        // registers fresh.
+        auto rsv = imsd::ipsec::ChooseResumeSecurityVerify(ps->securityServer.value_or(""), *sa, ealgOffer_);
+        ss_ = rsv.value;
+        using Source = imsd::ipsec::ResumeSecurityVerify::Source;
+        switch (rsv.source) {
+        case Source::Stored:
+            Log(std::format("Security-Verify from the state file ({} mechanism{})", rsv.mechanisms, rsv.mechanisms == 1 ? "" : "s"));
+            break;
+        case Source::NoneStored:
+            Log("state file holds no Security-Server (a pre-0.3.12 file, or a list the file cannot hold): Security-Verify rebuilt from the SA as one mechanism");
+            break;
+        case Source::OtherSa:
+            Log(std::format("state file's Security-Server names another SA pair than the one in the kernel (spi-s {} vs {}): Security-Verify rebuilt from the SA as one mechanism",
+                            rsv.storedSpiPs ? std::to_string(*rsv.storedSpiPs) : "none", sa->spiPs));
+            break;
+        }
         // The public identity our requests are signed with (From) — restored
         // here so a call placed before the refresh 200 re-learns it does not
         // fall back to the barred temporary IMPU.
@@ -1308,6 +1346,7 @@ private:
         reg_.spiUc = static_cast<std::uint32_t>(ps->spiUc.value_or(sa->spiUc));
         reg_.spiUs = static_cast<std::uint32_t>(ps->spiUs.value_or(sa->spiUs));
         reg_.expiry = ps->expiry.value_or(0);
+        reg_.securityServer = ss_;
         reg_.authNonce = ps->authNonce.value_or(""); reg_.authCnonce = ps->authCnonce.value_or(""); reg_.authResponse = ps->authResponse.value_or("");
         if (reg_.authNonce.empty()) Log("state file holds no challenge answer (pre-0.3.11): the refresh carries an empty digest");
         auto [okMsg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1);
@@ -1477,6 +1516,7 @@ private:
         reg_.contactUser = contactUser;
         reg_.spiUc = spiUc; reg_.spiUs = spiUs;
         reg_.authNonce = *nonceB64; reg_.authCnonce = cnonce; reg_.authResponse = response;
+        reg_.securityServer = ss_;
         reg_.expiry = imsd::sip::GrantedExpires(ok).value_or(0);
         DumpRaw("imsd-register-200.raw", ok);
         UpdateRouteAndPpi(ok);
@@ -1572,9 +1612,9 @@ private:
     // successful authentication, a Security-Client with new SPIs and a new
     // client port for the SA pairs a re-authentication would set up (the
     // server port stays, TS 33.203 7.4.0), the Security-Verify (the 401's
-    // list for a registration this process made fresh; for a resumed one
-    // the entry rebuilt from the kernel's SA, on every reregistration until
-    // the next fresh registration). Returns (200 msg, used cseq). A 401
+    // list, kept in the state file since 0.3.12 so a resumed registration
+    // echoes it too; a resume from an older file sends the one entry
+    // rebuilt from the kernel's SA). Returns (200 msg, used cseq). A 401
     // asks for re-authentication over temporary SAs on the proposed ports,
     // which imsd does not do: it is thrown as a refusal whose recovery is a
     // fresh registration (RegRecovery's 401 rule). Every refresh of the

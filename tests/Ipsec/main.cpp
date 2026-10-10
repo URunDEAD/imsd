@@ -196,6 +196,38 @@ int main() {
         auto bare = ParseSecurityServer("ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=null;", "hmac-sha-1-96", "null");
         Check(bare && bare->mechanisms.size() == 1 && bare->offerMatched && !bare->Carrier().spiPs && !bare->Carrier().portPs, "no spi-s: absent, not zero");
     }
+    // ---- the resume's Security-Verify: the stored list only for the SA pair the kernel holds
+    {
+        using Source = ResumeSecurityVerify::Source;
+        ExistingSa sa;
+        sa.spiPc = 129427852u; sa.spiPs = 133937015u; sa.portPc = 6051; sa.portPs = 6060;
+        sa.securityServer = "ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=aes-cbc; spi-c=129427852; spi-s=133937015; port-c=6051; port-s=6060";
+        auto ok = ChooseResumeSecurityVerify(O2, sa, "null");
+        Check(ok.source == Source::Stored && ok.value == O2 && ok.mechanisms == 6, "resume: O2's six-entry list whose carrier is the kernel's pair -> the list verbatim, six mechanisms");
+        auto okAes = ChooseResumeSecurityVerify(O2, sa, "aes-cbc");
+        Check(okAes.source == Source::Stored && okAes.value == O2, "resume: the same under the aes offer (the carrier does not depend on the offer)");
+        constexpr std::pair<std::string_view, std::string_view> off[] = {
+            {"spi-c", "ipsec-3gpp;q=0.94;alg=hmac-sha-1-96;mod=trans;spi-c=129427853;spi-s=133937015;port-c=6051;port-s=6060"},
+            {"spi-s", "ipsec-3gpp;q=0.94;alg=hmac-sha-1-96;mod=trans;spi-c=129427852;spi-s=133937016;port-c=6051;port-s=6060"},
+            {"port-c", "ipsec-3gpp;q=0.94;alg=hmac-sha-1-96;mod=trans;spi-c=129427852;spi-s=133937015;port-c=6052;port-s=6060"},
+            {"port-s", "ipsec-3gpp;q=0.94;alg=hmac-sha-1-96;mod=trans;spi-c=129427852;spi-s=133937015;port-c=6051;port-s=6061"},
+        };
+        for (const auto& [field, text] : off) {
+            auto r = ChooseResumeSecurityVerify(text, sa, "null");
+            Check(r.source == Source::OtherSa && r.value == sa.securityServer, std::format("resume: {} off by one -> the rebuilt entry", field));
+        }
+        auto offSpiS = ChooseResumeSecurityVerify(off[1].second, sa, "null");
+        Check(offSpiS.storedSpiPs && *offSpiS.storedSpiPs == 133937016u, "resume: the stored spi-s is reported for the log line");
+        auto none = ChooseResumeSecurityVerify("", sa, "null");
+        Check(none.source == Source::NoneStored && none.value == sa.securityServer, "resume: nothing stored -> the rebuilt entry");
+        auto junk = ChooseResumeSecurityVerify("not a list", sa, "null");
+        Check(junk.source == Source::OtherSa && junk.value == sa.securityServer && !junk.storedSpiPs, "resume: an unparseable value -> the rebuilt entry, no spi-s to report");
+        ExistingSa kpn;
+        kpn.spiPc = 49889723u; kpn.spiPs = 49889722u; kpn.portPc = 33142; kpn.portPs = 6000;
+        kpn.securityServer = "ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=aes-cbc; spi-c=49889723; spi-s=49889722; port-c=33142; port-s=6000";
+        auto k = ChooseResumeSecurityVerify(kpn.securityServer, kpn, "aes-cbc");
+        Check(k.source == Source::Stored && k.value == kpn.securityServer && k.mechanisms == 1, "resume: KPN's one-entry list for its pair -> the list, one mechanism");
+    }
     // ---- selection rules and syntax corners
     {
         // spec-shaped list: every entry carries the SPI set, md5 preferred by q — we offered sha1, so sha1 wins (audit A1)

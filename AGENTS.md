@@ -73,7 +73,7 @@ in every source but the re-exporting `Imsd.cppm`, clang + libc++ + lld.
 The rule behind the split: **`imsd-core` stays GLib-free and free of I/O so
 that every decision in it has a unit test.** New protocol logic goes into a
 partition with a test. The shell (`main.cpp`) holds protocol decisions no
-test reaches — some older than 0.3.10, some added by 0.3.10 or 0.3.11: the reg-event
+test reaches — some older than 0.3.10, some added by 0.3.10, 0.3.11 or 0.3.12: the reg-event
 subscription schedule (§7.4: its retry
 ladder, Retry-After clamp, Timer F, renewal point and RFC 6665 reasons); the
 registration sequence and its transactions (`AwaitFinal`/`AwaitInitialFinal`:
@@ -82,7 +82,10 @@ meanwhile and the routing of our reg-event SUBSCRIBE's final read there, the
 12 s wait restarted on a provisional); the reregistration's headers and its
 answer to a challenge (`Reregister`: the stored challenge answer, or the empty
 digest for a pre-0.3.11 state file, the new SPIs, `PortUcNext`; a 401 thrown
-as a refusal carrying its status); the
+as a refusal carrying its status); the state-file round trip
+(`PersistState`/`LoadState`: the `security_server` key, written empty for a
+value with a quote, a backslash or a newline — the choice between that list
+and the entry rebuilt from the SA is `Imsd:Ipsec`'s, with a test); the
 inputs to `RegRecovery` — `SipFlow::Connect`'s split of failures into local
 refusals and network silence, and the catch sites that sort a failed refresh
 (the keepalive's, `ReconnectCycle`'s) and a failed fresh attempt
@@ -261,6 +264,23 @@ Rules:
   bench — and O2 has not run this shape) and
   the escalation by one refused refresh that carries a `Retry-After` — the
   escalation to a fresh registration is pinned in `tests/Engine` only; a
+  resume echoing a multi-mechanism Security-Server list on the wire (the
+  choice of the stored list is pinned in `tests/Ipsec` with O2's recorded
+  list; KPN's has one mechanism, so on the bench the stored value and the
+  rebuilt one are the same bytes; O2's six-entry list has not resumed on
+  this code, and the state-file round trip is shell code no test
+  reaches); a Security-Server list `PersistState` writes empty (one with
+  a quote, a backslash or a newline — neither KPN's nor O2's list has
+  one; the resume of such a file ran with a hand-edited empty key,
+  2026-10-11); a state write of a standing registration after a fresh
+  attempt that aborted before its SA setup (`RegState::securityServer`,
+  not the attempt's `ss_` — on KPN the old SA's retry after a throttled
+  attempt is refused 403, the throttled-attempt chain below, so no such
+  write follows here); the window that leaves a state file naming another
+  SA pair than the kernel's (a stop or a crash between a fresh attempt's
+  SA setup and its 200's state write — the check is pinned in `tests/Ipsec`
+  and ran on a hand-edited list, 2026-10-11; the window itself is not
+  staged); a
   refused initial or fresh
   REGISTER (403, 5xx) at bring-up or in recovery (KPN has only throttled or
   stayed silent — pinned in `tests/Engine` only); the write-off of the old
@@ -427,10 +447,20 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    45063) for the SA pairs a re-authentication would set up — the server
    port stays (TS 33.203 7.4.0) — and the Security-Verify (the 401's list).
    A registration resumed from the kernel's SAs sends the same
-   Authorization and Security-Client, but its Security-Verify — on the
-   resume's re-REGISTER and on every keepalive after it, until its next
-   fresh registration — is the one entry rebuilt from the SA
-   (`Imsd:Ipsec`), not the 401's list, as before 0.3.11. A 401 to a
+   Security-Client as that refresh, the Authorization the state file holds
+   (a file from before 0.3.11: the empty digest) and the Security-Verify
+   from the state file (since 0.3.12); resumed from a file written before
+   0.3.12, from one whose list `PersistState` wrote empty, or from one
+   whose list names another SA pair than the kernel holds (an attempt the
+   process did not live to record: its SAs installed, its 200 not
+   written), it sends —
+   on the resume's re-REGISTER, the keepalive re-REGISTERs, the reg-event
+   SUBSCRIBE and INVITEs, until its next fresh registration — the one
+   entry rebuilt from the SA
+   (`Imsd:Ipsec`, which makes the choice): KPN's one-entry answer to the
+   default offer in the same bytes, not a list such as O2's six, which RFC 3329 §2.3.1 has the server answer with a
+   494 when it does not mirror its own; a refused resume registers fresh.
+   A 401 to a
    reregistration asks for re-authentication over temporary SAs on the
    proposed ports, which imsd does not implement: it is a refusal and the
    recovery is a fresh registration (§7.4). Every refresh of the pre-0.3.11
@@ -438,7 +468,13 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    in-use SPIs) was refused with 503 (§13).
 
 The state file is JSON: `callid`, `ftag`, `cseq`, `spi_uc`, `spi_us`,
-`expiry`, `route`, `ppi`, `aor`, `contact_user`, `transport`, and since
+`expiry`, `route`, `ppi`, `aor`, `contact_user`, `transport`, since 0.3.12
+`security_server` (the registration's Security-Verify: the 401's list,
+written empty when it holds a quote, a backslash or a newline; absent,
+empty or naming another SA pair than the kernel's — a file from before
+0.3.12, such a list, or a file an unrecorded attempt left behind — the
+resume rebuilds one mechanism from the SA, logs which, and stores that),
+and since
 0.3.11 `auth_nonce`, `auth_cnonce`, `auth_response` (a registration resumed
 from an older file has none: its reregistrations — the resume's and the
 keepalives', across restarts — carry the empty digest, as before 0.3.11,
@@ -746,7 +782,12 @@ Lines the operator (and the scripts) look for, all prefixed `imsd: `:
   no challenge answer (pre-0.3.11): the refresh carries an empty digest`
   at a resume of a registration made before 0.3.11 — every reregistration
   of it carries the empty digest until its next fresh registration, and
-  the line repeats at each later resume of it.
+  the line repeats at each later resume of it; `Security-Verify from the
+  state file (1 mechanism)` / `(N mechanisms)`, `state file holds no Security-Server (a
+  pre-0.3.12 file, or a list the file cannot hold): Security-Verify
+  rebuilt from the SA as one mechanism` or `state file's Security-Server
+  names another SA pair than the one in the kernel (spi-s N vs M):
+  Security-Verify rebuilt from the SA as one mechanism` at every resume.
 - `connect: no answer from the P-CSCF N times (…)` when the protected
   connect series ends unanswered.
 
@@ -1010,7 +1051,8 @@ only the imsd side of its bus choice.
   something else.
 - SIP dumps and the state file carry the IMSI, the MSISDN, SPIs and
   addresses, and the state file (since 0.3.11) the last challenge answer —
-  nonce, cnonce and response. Dumps are mode 0600 under the state dir, off by default
+  nonce, cnonce and response — and (since 0.3.12) the P-CSCF's
+  Security-Server list. Dumps are mode 0600 under the state dir, off by default
   (`DUMP_SIP=0`), and never leave the phone in a commit.
 - The ims PDN is a walled garden: `ims-pdn-up.sh` keeps it from becoming
   the default route and gives the P-CSCF a host route; imsd adds one per

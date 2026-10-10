@@ -29,8 +29,9 @@ import :Sip;
 export namespace imsd::msg {
 
     // Everything the builders need that is stable for the life of a
-    // registration. Ports default to the fixed protected values; route/ppi/
-    // securityServer are filled in from the REGISTER 200 OK.
+    // registration. Ports default to the fixed protected values; route and
+    // ppi are filled in from the REGISTER 200 OK, securityServer from the
+    // 401 (at a resume, from the state file).
     struct Context {
         imsd::aka::Identity id;
         std::string local;
@@ -63,7 +64,7 @@ export namespace imsd::msg {
                                       // self-targeted requests like reg-event
                                       // SUBSCRIBE; the temporary (IMSI-derived)
                                       // IMPU is barred for anything but REGISTER
-        std::string securityServer;   // Security-Verify value (the network's ss)
+        std::string securityServer;   // Security-Verify value: the 401's Security-Server list (from the state file on a resume)
         // P-Access-Network-Info value (imsd::aka::ParsePani from live mmcli
         // location: real MCC/MNC/TAC/ECI, FDD). Empty omits the header —
         // never fabricate one: the network reads it to learn which access
