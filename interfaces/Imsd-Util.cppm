@@ -24,6 +24,12 @@ export namespace imsd::util {
     // an installed package's nftables accept rules.
     constexpr int PortUc = 45061;
     constexpr int PortUs = 45062;
+    // The client port a reregistration proposes for the SA pairs a
+    // re-authentication would set up: TS 33.203 7.4.0 keeps the server
+    // ports (port_us, port_ps) and changes the client ports (port_uc,
+    // port_pc). imsd answers such a challenge with a fresh registration, so
+    // nothing is bound here and the firewall rules need not open it.
+    constexpr int PortUcNext = 45063;
 
     // An address is IPv6 iff it contains a colon (matches the Python is6()).
     inline bool Is6(std::string_view addr) { return addr.contains(':'); }

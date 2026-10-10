@@ -192,6 +192,20 @@ int main() {
            Reg2, "protected REGISTER");
     }
 
+    // ---- a reregistration (the keepalive refresh, a resume): the last
+    // challenge answer verbatim, new SPIs and a new client port in
+    // Security-Client, the server port unchanged (TS 24.229 5.1.1.4.2,
+    // TS 33.203 7.4.0)
+    {
+        std::string auth = AuthAka(c, "NONCEXYZ", "CNONCE0123456789", "RESP0000");
+        std::string r3 = BuildRegisterProtected(c, "REGCALLID@2001:db8::db43", "FTAG5678", "REGBRANCH123456", 3, 55555u, 66666u, auth, 45063);
+        Check(r3.contains("\r\nSecurity-Client: ipsec-3gpp; alg=hmac-sha-1-96; ealg=aes-cbc; spi-c=55555; spi-s=66666; port-c=45063; port-s=45062\r\n"), "refresh Security-Client: new SPIs, a new client port, the same server port");
+        Check(r3.contains("\r\nCSeq: 3 REGISTER\r\n") && r3.contains("\r\nVia: SIP/2.0/TCP [2001:db8::db43]:45062;") && r3.contains("@[2001:db8::db43]:45062>"), "refresh: CSeq+1, the server port in Via and Contact");
+        Check(r3.contains(std::format("\r\n{}\r\n", auth)), "refresh carries the last challenge answer verbatim");
+        std::string r3same = BuildRegisterProtected(c, "REGCALLID@2001:db8::db43", "FTAG5678", "REGBRANCH123456", 3, 55555u, 66666u, auth);
+        Check(r3same.contains("port-c=45061; port-s=45062\r\n"), "without a client port the in-use one is offered (the initial registration's second REGISTER)");
+    }
+
     // ---- protected-leg transport follows Context.transport (SIP_TRANSPORT=udp,
     // or the auto fallback): every protected request's Via says UDP, the
     // challenge's Via stays UDP either way, and TCP is the untouched default.

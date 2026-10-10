@@ -88,9 +88,15 @@ export namespace imsd::msg {
         return std::format("Via: SIP/2.0/{} {};branch=z9hG4bK{};rport", transport, imsd::util::HostPort(c.local, port), branch);
     }
 
-    // Security-Client value carrying our in-use client SPIs + protected ports.
+    // Security-Client value: the SPIs and protected ports offered for the SA
+    // pairs this REGISTER may set up — the in-use ones on an initial
+    // registration, new SPIs and a new client port on a reregistration
+    // (TS 24.229 5.1.1.4.2 d; TS 33.203 7.4.0: the server port stays).
+    inline std::string SecurityClient(const Context& c, std::uint32_t spiUc, std::uint32_t spiUs, int portUc, int portUs) {
+        return std::format("Security-Client: ipsec-3gpp; alg=hmac-sha-1-96; ealg={}; " "spi-c={}; spi-s={}; port-c={}; port-s={}", c.ealgOffer, spiUc, spiUs, portUc, portUs);
+    }
     inline std::string SecurityClient(const Context& c, std::uint32_t spiUc, std::uint32_t spiUs) {
-        return std::format("Security-Client: ipsec-3gpp; alg=hmac-sha-1-96; ealg={}; " "spi-c={}; spi-s={}; port-c={}; port-s={}", c.ealgOffer, spiUc, spiUs, c.portUc, c.portUs);
+        return SecurityClient(c, spiUc, spiUs, c.portUc, c.portUs);
     }
 
     // Authorization line with an empty (unchallenged) digest — the first
@@ -217,9 +223,17 @@ export namespace imsd::msg {
     // The stock oracle sends it in BOTH REGISTERs (2026-07-21 capture,
     // reg2 build at 19:30:44); an earlier reading that reg2 omits it was
     // wrong and cost us all terminating delivery. `authLine` is a full
-    // Authorization line (AuthEmpty for the refresh's first try, AuthAka
-    // once challenged).
-    std::string BuildRegisterProtected(const Context& c, std::string_view callid, std::string_view ftag, std::string_view branch, int cseq, std::uint32_t spiUc, std::uint32_t spiUs, std::string_view authLine) {
+    // Authorization line: AuthAka with the challenge's answer for the
+    // initial registration's second REGISTER and, verbatim, for every
+    // reregistration after it (TS 24.229 5.1.1.4.2 a: the last received
+    // nonce, the last calculated response); AuthEmpty for a registration
+    // resumed from a pre-0.3.11 state file, on every reregistration until
+    // its next fresh registration. A
+    // reregistration also passes NEW SPIs and the client port it proposes
+    // for a re-authentication's SA pairs (`portUc`, TS 33.203 7.4.0: the
+    // server port stays); 0 offers the in-use client port, the initial
+    // registration's case.
+    std::string BuildRegisterProtected(const Context& c, std::string_view callid, std::string_view ftag, std::string_view branch, int cseq, std::uint32_t spiUc, std::uint32_t spiUs, std::string_view authLine, int portUc = 0) {
         std::vector<std::string> l = {
             std::format("REGISTER {} SIP/2.0", c.id.regUri),
             ViaLine(c, c.transport, c.portUs, branch),
@@ -233,7 +247,7 @@ export namespace imsd::msg {
             std::string(authLine),
             "Require: sec-agree",
             "Proxy-Require: sec-agree",
-            SecurityClient(c, spiUc, spiUs),
+            SecurityClient(c, spiUc, spiUs, portUc ? portUc : c.portUc, c.portUs),
             std::format("Security-Verify: {}", c.securityServer),
         };
         l.push_back("Supported: sec-agree, path");

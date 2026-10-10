@@ -73,13 +73,16 @@ in every source but the re-exporting `Imsd.cppm`, clang + libc++ + lld.
 The rule behind the split: **`imsd-core` stays GLib-free and free of I/O so
 that every decision in it has a unit test.** New protocol logic goes into a
 partition with a test. The shell (`main.cpp`) holds protocol decisions no
-test reaches — some older than 0.3.10, some added by it: the reg-event
+test reaches — some older than 0.3.10, some added by 0.3.10 or 0.3.11: the reg-event
 subscription schedule (§7.4: its retry
 ladder, Retry-After clamp, Timer F, renewal point and RFC 6665 reasons); the
 registration sequence and its transactions (`AwaitFinal`/`AwaitInitialFinal`:
 which message is a REGISTER's final, the dispatch of requests arriving
 meanwhile and the routing of our reg-event SUBSCRIBE's final read there, the
-12 s wait restarted on a provisional; `Reregister`'s one re-challenge); the
+12 s wait restarted on a provisional); the reregistration's headers and its
+answer to a challenge (`Reregister`: the stored challenge answer, or the empty
+digest for a pre-0.3.11 state file, the new SPIs, `PortUcNext`; a 401 thrown
+as a refusal carrying its status); the
 inputs to `RegRecovery` — `SipFlow::Connect`'s split of failures into local
 refusals and network silence, and the catch sites that sort a failed refresh
 (the keepalive's, `ReconnectCycle`'s) and a failed fresh attempt
@@ -253,8 +256,11 @@ Rules:
   on the screenshot carry no timestamps; KPN's refusals, all 403, carry
   none) and a `Dial` bringing a recovery step
   forward (imsd-ofonod refuses the `Dial` itself and imsd-dialerd forwards
-  it) is pinned in `tests/Engine` only; the escalation by one refused
-  refresh that carries a `Retry-After` is pinned in `tests/Engine` only; a
+  it) is pinned in `tests/Engine` only; a 401 to a reregistration (the
+  refreshes KPN accepted were never challenged — consecutive CSeqs on every
+  bench — and O2 has not run this shape) and
+  the escalation by one refused refresh that carries a `Retry-After` — the
+  escalation to a fresh registration is pinned in `tests/Engine` only; a
   refused initial or fresh
   REGISTER (403, 5xx) at bring-up or in recovery (KPN has only throttled or
   stayed silent — pinned in `tests/Engine` only); the write-off of the old
@@ -412,10 +418,31 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    (§10.1, `SIP_TRANSPORT`), `REGISTERED (fresh)`. Then the reg-event
    SUBSCRIBE (§7.4).
 5. A keepalive re-REGISTER refresh at half the granted lifetime, within
-   120–1800 s (`REFRESH_INTERVAL`), only while idle.
+   120–1800 s (`REFRESH_INTERVAL`), only while idle. The refresh of a
+   registration this process made fresh is a reregistration as TS 24.229
+   5.1.1.4.2 has it: the same Call-ID and Contact, CSeq+1, the
+   Authorization of the last successful authentication verbatim (the 401's
+   nonce, our cnonce and response, kept in the state file), a
+   Security-Client with new SPIs and a new client port (`PortUcNext`,
+   45063) for the SA pairs a re-authentication would set up — the server
+   port stays (TS 33.203 7.4.0) — and the Security-Verify (the 401's list).
+   A registration resumed from the kernel's SAs sends the same
+   Authorization and Security-Client, but its Security-Verify — on the
+   resume's re-REGISTER and on every keepalive after it, until its next
+   fresh registration — is the one entry rebuilt from the SA
+   (`Imsd:Ipsec`), not the 401's list, as before 0.3.11. A 401 to a
+   reregistration asks for re-authentication over temporary SAs on the
+   proposed ports, which imsd does not implement: it is a refusal and the
+   recovery is a fresh registration (§7.4). Every refresh of the pre-0.3.11
+   shape on record from O2 UK (an initial registration's empty digest, the
+   in-use SPIs) was refused with 503 (§13).
 
 The state file is JSON: `callid`, `ftag`, `cseq`, `spi_uc`, `spi_us`,
-`expiry`, `route`, `ppi`, `aor`, `contact_user`, `transport`.
+`expiry`, `route`, `ppi`, `aor`, `contact_user`, `transport`, and since
+0.3.11 `auth_nonce`, `auth_cnonce`, `auth_response` (a registration resumed
+from an older file has none: its reregistrations — the resume's and the
+keepalives', across restarts — carry the empty digest, as before 0.3.11,
+until its next fresh registration, and each such resume logs it).
 
 A failed fresh bring-up exits non-zero and systemd retries after
 `RestartSec` — except a bring-up the network refused or throttled, which
@@ -488,8 +515,11 @@ manual runs): `IMS_APN` (default `ims`), `IMS_IP_TYPE` (`ipv6`),
 
 What the daemon does when the registration stops working after bring-up, as
 a pure reducer the shell feeds with the clock and the network's answers. Two
-kinds of failure reach it: a **refusal** (the network answered a refresh or a
-fresh REGISTER with a final other than 200/401) and **silence** (the flow died
+kinds of failure reach it: a **refusal** (the network answered a refresh with
+a final other than 200 — a 401, re-authentication, included — or a fresh
+registration's REGISTER with a final other than the expected one: from 300
+up on the unprotected one, whose 401 is the challenge, anything but 200 on
+the protected one) and **silence** (the flow died
 and reconnecting through the SA, or the refresh over it, got no answer).
 Neither is retried for long on the same registration (TS 24.229 5.1.1.4 and
 RFC 5626 have the UE register anew). Before this reducer existed the daemon
@@ -502,7 +532,7 @@ The policy, with its constants:
 | Step | Rule |
 |---|---|
 | Reconnect | Through the existing SA, then refresh. Back-off 5 s → 5 min (`ReconnectDelayMin`/`Max`). |
-| Escalate to a fresh registration | After one refused refresh whose `Retry-After` is at least a second (the network's considered answer; a `Retry-After` of 0 or one that does not parse counts as none; O2 2026-10-08: the refresh refused 503 with Retry-After 414 s, the refresh after that wait 503 with Retry-After 772 s), after two refused refreshes without one (`RefusalsBeforeFresh`), or two reconnect cycles that end without an answer (`SilentCyclesBeforeFresh`) while the modem reports packet service (`PacketServiceUp`: ModemManager's registration and packet-service state, as `ims-pdn-up.sh` reads them). A cycle that fails during a coverage gap is the phone's silence, not the network's: not counted, retried on the local-refusal pace, so a radio gap across a refresh does not escalate into a fresh registration, which KPN refuses while the registration is live and drops it for (§13). New Call-ID, new challenge, new SA pair (`registering fresh (recovery attempt N)`). |
+| Escalate to a fresh registration | After one refused refresh whose `Retry-After` is at least a second (the network's considered answer; a `Retry-After` of 0 or one that does not parse counts as none; O2 2026-10-08: the refresh refused 503 with Retry-After 414 s, the refresh after that wait 503 with Retry-After 772 s) or a 401 (re-authentication, which imsd answers with a fresh registration rather than over temporary SAs), after two refused refreshes without one (`RefusalsBeforeFresh`), or two reconnect cycles that end without an answer (`SilentCyclesBeforeFresh`) while the modem reports packet service (`PacketServiceUp`: ModemManager's registration and packet-service state, as `ims-pdn-up.sh` reads them). A cycle that fails during a coverage gap is the phone's silence, not the network's: not counted, retried on the local-refusal pace, so a radio gap across a refresh does not escalate into a fresh registration, which KPN refuses while the registration is live and drops it for (§13). New Call-ID, new challenge, new SA pair (`registering fresh (recovery attempt N)`). |
 | A refused or throttled fresh attempt | Waits on the **throttle schedule**: 21 min, growing ×1.5 to 60 (`ThrottleMinutesMin`/`Max`). KPN refuses a fresh SA pair on an address whose registration is live (§13), and drops that registration the moment an initial REGISTER arrives. |
 | A silent fresh attempt | Backs off 30 s → 10 min (`FreshDelayMin`/`Max`). |
 | `Retry-After` | Always wins over a shorter wait, honoured up to an hour (`RetryAfterMax`, the schedule's longest wait); a longer one is cut to an hour and the refusal heard again then. On a refused fresh attempt it replaces the schedule's wait, shorter or longer, never below 30 s (`FreshDelayMin`). |
@@ -710,7 +740,13 @@ Lines the operator (and the scripts) look for, all prefixed `imsd: `:
 - `reg-event SUBSCRIBE sent`, and the binding's state from NOTIFY.
 - `audio session: …` at start and at each call's media start; `CODECS override active: …`.
 - A refused REGISTER or SUBSCRIBE is logged with its status line and
-  any `Retry-After` / `Warning` / `Reason` / `Server` headers.
+  any `Retry-After` / `Warning` / `Reason` / `Server` headers;
+  `re-REGISTER challenged: 401 …; re-authentication asked, the next
+  registration is a fresh one` for a challenged refresh; `state file holds
+  no challenge answer (pre-0.3.11): the refresh carries an empty digest`
+  at a resume of a registration made before 0.3.11 — every reregistration
+  of it carries the empty digest until its next fresh registration, and
+  the line repeats at each later resume of it.
 - `connect: no answer from the P-CSCF N times (…)` when the protected
   connect series ends unanswered.
 
@@ -973,7 +1009,8 @@ only the imsd side of its bus choice.
   policy that names an account breaks the moment the account is called
   something else.
 - SIP dumps and the state file carry the IMSI, the MSISDN, SPIs and
-  addresses. Dumps are mode 0600 under the state dir, off by default
+  addresses, and the state file (since 0.3.11) the last challenge answer —
+  nonce, cnonce and response. Dumps are mode 0600 under the state dir, off by default
   (`DUMP_SIP=0`), and never leave the phone in a commit.
 - The ims PDN is a walled garden: `ims-pdn-up.sh` keeps it from becoming
   the default route and gives the P-CSCF a host route; imsd adds one per
@@ -1009,7 +1046,14 @@ the related code.
   second. The origin of `RegRecovery`. On 2026-10-08, under 0.3.10 (the
   first release to log a Retry-After), a refresh was refused 503 with
   `Retry-After` 414 s and the refresh after that wait 503 with `Retry-After`
-  772 s: the origin of the `Retry-After` escalation.
+  772 s: the origin of the `Retry-After` escalation. Every refresh of the
+  pre-0.3.11 shape — an initial registration's empty digest and the in-use
+  SPIs in Security-Client — on record from O2 was refused with 503: 21 on
+  2026-09-24 under 0.3.9 and the same loop again that afternoon on a
+  stationary phone, two on 2026-10-08 under 0.3.10, and the user never saw
+  one succeed, while
+  the fresh registrations that followed were accepted: the origin of the
+  5.1.1.4.2 refresh shape. KPN accepts both shapes without a challenge.
 - **KPN closes a registration's previous reg-event subscription with
   `noresource`** when a new one replaces it: that end is not renewed.
 - **Modem attach-family forcing** (Odido, O2 UK, Swisscom): an APN-string

@@ -900,6 +900,17 @@ int main() {
             k.OnSuccess();
             Check(k.Reconnectable(), "success forgets it");
         }
+        // a 401 to a refresh asks for re-authentication over temporary SAs,
+        // which imsd does not do: the fresh registration at once, the old
+        // SA kept (the network still holds the registration)
+        {
+            RegRecovery j;
+            j.OnReconnectFailure(1000, F::Refused, 0, 401);
+            Check(j.Fresh() && j.Reconnectable() && j.refusals == 1 && freshAt(j, 1000, 1005), "a 401 on the first refusal: the fresh attempt after the backoff");
+            RegRecovery jr;
+            jr.OnReconnectFailure(1000, F::Refused, 0, 503);
+            Check(!jr.Fresh() && reconnectAt(jr, 1000, 1005), "a bare 503 (no Retry-After) is still the hiccup case: one more refresh first");
+        }
         // O2 10:43: the flow killed 8 s after the 200, every SYN unanswered
         r.OnReconnectFailure(1000, F::Silent);
         Check(!r.Fresh() && reconnectAt(r, 1000, 1005), "first silent cycle: retry in 5 s");

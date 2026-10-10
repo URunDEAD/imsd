@@ -14,8 +14,10 @@ negotiated ealg keyed with CK. Both come from the Security-Server mechanism
 the P-CSCF selected in its 401 (parsed here), and this module turns the
 negotiated SPIs/ports/keys into the exact argv lists the daemon shell hands to
 `ip`; for a warm resume it reconstructs the SPIs, ports, and Security-Server
-value back out of `ip xfrm state`/`policy` text so a refresh re-REGISTER can
-advertise the SPIs actually in use.
+value back out of `ip xfrm state`/`policy` text — the Security-Verify and
+the P-CSCF ports for the resume's flow, and the SPIs in use, which a
+reregistration's new SPIs must differ from (and the state file falls back
+to).
 
 Pure std C++ (the shell runs the commands and captures the text). Command
 shapes and the parser are pinned by tests/Ipsec.
@@ -309,7 +311,7 @@ export namespace imsd::ipsec {
         std::string securityServer;  // reconstructed Security-Server header value
         int portPs = 0;
         int portPc = 0;
-        std::uint32_t spiUc = 0;     // our inbound client SPI (advertise on refresh)
+        std::uint32_t spiUc = 0;     // our inbound client SPI (a reregistration offers a different one)
         std::uint32_t spiUs = 0;     // our inbound server SPI
         std::uint32_t spiPs = 0;
         std::uint32_t spiPc = 0;

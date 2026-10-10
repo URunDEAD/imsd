@@ -54,6 +54,7 @@ constexpr const char* ObjPath = "/net/catcrafts/IMS1";
 constexpr const char* Iface = "net.catcrafts.IMS1";
 constexpr int PortUc = imsd::util::PortUc;
 constexpr int PortUs = imsd::util::PortUs;
+constexpr int PortUcNext = imsd::util::PortUcNext;
 constexpr int InitPort = 5060;
 
 std::string EnvOr(const char* k, std::string d) {
@@ -296,10 +297,12 @@ constexpr std::string_view TransportName(Transport t) { return t == Transport::U
 // live). Handled in-process: a
 // systemd restart every RestartSec would never clear it.
 struct ThrottledError : std::runtime_error { using std::runtime_error::runtime_error; };
-// A REGISTER the network refused: the protected one, or a refresh, answered
-// with a final other than 200 (a refresh's first 401 is its challenge); the
-// unprotected initial one answered with a final from 300 up (its 401 is the
-// challenge). The status and its Retry-After feed imsd::engine::RegRecovery.
+// A REGISTER the network refused: the protected one, or a reregistration,
+// answered with a final other than 200 (a reregistration's 401 asks for a
+// re-authentication imsd does not do over the old SAs: a refusal carrying
+// 401); the unprotected initial one answered with a final from 300 up (its
+// 401 is the challenge). The status and its Retry-After feed
+// imsd::engine::RegRecovery.
 struct RefusedError : std::runtime_error {
     int status;
     long retryAfter;
@@ -635,6 +638,12 @@ struct RegState {
     // Contact user-part of the stored binding (UUID since the s53 oracle
     // diff; empty = legacy IMSI binding from an older state file).
     std::string contactUser;
+    // The answer to the last challenge — the 401's nonce, our cnonce and
+    // the response — which every reregistration carries verbatim (TS
+    // 24.229 5.1.1.4.2 a). Empty = a registration resumed from a pre-0.3.11
+    // state file; its reregistrations carry an empty digest, the pre-0.3.11
+    // shape, until the next fresh registration.
+    std::string authNonce, authCnonce, authResponse;
 };
 
 // Writable directory for the daemon's own files: the persisted registration
@@ -653,9 +662,10 @@ void PersistState(const RegState& r, const std::string& route, const std::string
     std::string j = std::format(
         "{{\"callid\": \"{}\", \"ftag\": \"{}\", \"cseq\": {}, \"spi_uc\": {}, "
         "\"spi_us\": {}, \"expiry\": {}, \"route\": \"{}\", \"ppi\": \"{}\", "
-        "\"aor\": \"{}\", \"contact_user\": \"{}\", \"transport\": \"{}\"}}",
+        "\"aor\": \"{}\", \"contact_user\": \"{}\", \"transport\": \"{}\", "
+        "\"auth_nonce\": \"{}\", \"auth_cnonce\": \"{}\", \"auth_response\": \"{}\"}}",
         r.callid, r.ftag, r.cseq, r.spiUc, r.spiUs, r.expiry, route, ppi, aor,
-        r.contactUser, transport);
+        r.contactUser, transport, r.authNonce, r.authCnonce, r.authResponse);
     std::string path = StatePath();
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
@@ -679,7 +689,7 @@ void DumpRaw(std::string_view name, std::string_view msg) {
 }
 
 struct PersistedState {
-    std::optional<std::string> callid, ftag, route, ppi, aor, contactUser, transport;
+    std::optional<std::string> callid, ftag, route, ppi, aor, contactUser, transport, authNonce, authCnonce, authResponse;
     std::optional<long> cseq, spiUc, spiUs, expiry;
 };
 std::optional<PersistedState> LoadState() {
@@ -697,6 +707,9 @@ std::optional<PersistedState> LoadState() {
     ps.aor = QuotedAfter(s, "\"aor\": \"");
     ps.contactUser = QuotedAfter(s, "\"contact_user\": \"");
     ps.transport = QuotedAfter(s, "\"transport\": \"");   // absent in pre-0.3.5 files: TCP
+    ps.authNonce = QuotedAfter(s, "\"auth_nonce\": \"");       // the three absent in pre-0.3.11 files
+    ps.authCnonce = QuotedAfter(s, "\"auth_cnonce\": \"");
+    ps.authResponse = QuotedAfter(s, "\"auth_response\": \"");
     ps.cseq = IntAfter(s, "\"cseq\": ");
     ps.spiUc = IntAfter(s, "\"spi_uc\": ");
     ps.spiUs = IntAfter(s, "\"spi_us\": ");
@@ -1295,7 +1308,9 @@ private:
         reg_.spiUc = static_cast<std::uint32_t>(ps->spiUc.value_or(sa->spiUc));
         reg_.spiUs = static_cast<std::uint32_t>(ps->spiUs.value_or(sa->spiUs));
         reg_.expiry = ps->expiry.value_or(0);
-        auto [okMsg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1, reg_.spiUc, reg_.spiUs);
+        reg_.authNonce = ps->authNonce.value_or(""); reg_.authCnonce = ps->authCnonce.value_or(""); reg_.authResponse = ps->authResponse.value_or("");
+        if (reg_.authNonce.empty()) Log("state file holds no challenge answer (pre-0.3.11): the refresh carries an empty digest");
+        auto [okMsg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1);
         reg_.cseq = used;
         if (auto e = imsd::sip::GrantedExpires(okMsg)) reg_.expiry = *e;
         UpdateRouteAndPpi(okMsg);
@@ -1461,6 +1476,7 @@ private:
         reg_.callid = callidReg; reg_.ftag = ftag; reg_.cseq = 2;
         reg_.contactUser = contactUser;
         reg_.spiUc = spiUc; reg_.spiUs = spiUs;
+        reg_.authNonce = *nonceB64; reg_.authCnonce = cnonce; reg_.authResponse = response;
         reg_.expiry = imsd::sip::GrantedExpires(ok).value_or(0);
         DumpRaw("imsd-register-200.raw", ok);
         UpdateRouteAndPpi(ok);
@@ -1551,35 +1567,35 @@ private:
         throw std::runtime_error("no 401 to unprotected REGISTER");
     }
 
-    // re-REGISTER over the (resumed or live) SA. Returns (200 msg, used cseq).
-    std::pair<std::string, long> Reregister(const std::string& callid, const std::string& ftag, long startCseq, std::uint32_t spiUc, std::uint32_t spiUs) {
-        std::string auth = imsd::msg::AuthEmpty(ctx_);
-        long cseq = startCseq;
-        bool challenged = false;
-        for (;;) {
-            std::string reg = imsd::msg::BuildRegisterProtected(ctx_, callid, ftag, rng_.Token(16), cseq, spiUc, spiUs, auth);
-            if (!sip_.Send(reg)) throw std::runtime_error("send re-REGISTER failed");
-            std::string m = AwaitFinal(callid, cseq, "re-REGISTER");
-            auto st = imsd::sip::Status(m);
-            if (st == 200) return {m, cseq};
-            if (st == 401 && !challenged) {
-                challenged = true;
-                auto nonce = QuotedAfter(m, "nonce=\"");
-                auto raw = nonce ? imsd::util::FromBase64(*nonce) : std::nullopt;
-                if (!raw || raw->size() < 32) throw std::runtime_error("bad 401 nonce on refresh");
-                std::vector<std::uint8_t> rnd(raw->begin(), raw->begin() + 16);
-                std::vector<std::uint8_t> autn(raw->begin() + 16, raw->begin() + 32);
-                auto aka = Authenticate(rnd, autn);
-                if (!aka) throw std::runtime_error("AKA failed on refresh");
-                std::string cnonce = rng_.Token(16);
-                std::string response = imsd::aka::DigestAkav1(*nonce, aka->res, cnonce, ctx_.id.regUri, ctx_.id.impi, ctx_.id.domain);
-                auth = imsd::msg::AuthAka(ctx_, *nonce, cnonce, response);
-                cseq++;
-                continue;
-            }
-            DumpRaw("imsd-register-fail.raw", m);
-            throw RefusedError(std::format("re-REGISTER refused: {}", imsd::sip::RefusalSummary(m)), *st, imsd::sip::RetryAfter(m).value_or(0));
-        }
+    // A reregistration over the (resumed or live) SA, TS 24.229 5.1.1.4.2:
+    // the same Call-ID and Contact, CSeq+1, the Authorization of the last
+    // successful authentication, a Security-Client with new SPIs and a new
+    // client port for the SA pairs a re-authentication would set up (the
+    // server port stays, TS 33.203 7.4.0), the Security-Verify (the 401's
+    // list for a registration this process made fresh; for a resumed one
+    // the entry rebuilt from the kernel's SA, on every reregistration until
+    // the next fresh registration). Returns (200 msg, used cseq). A 401
+    // asks for re-authentication over temporary SAs on the proposed ports,
+    // which imsd does not do: it is thrown as a refusal whose recovery is a
+    // fresh registration (RegRecovery's 401 rule). Every refresh of the
+    // pre-0.3.11 shape on record from O2 UK — an initial registration's
+    // empty digest, the in-use SPIs — was refused 503 (2026-09-24 under
+    // 0.3.9, 2026-10-08 under 0.3.10) while the fresh registrations that
+    // followed were accepted; KPN accepted both shapes without a challenge.
+    std::pair<std::string, long> Reregister(const std::string& callid, const std::string& ftag, long cseq) {
+        std::string auth = reg_.authNonce.empty() ? imsd::msg::AuthEmpty(ctx_)
+                                                  : imsd::msg::AuthAka(ctx_, reg_.authNonce, reg_.authCnonce, reg_.authResponse);
+        std::uint32_t spiUc = 0, spiUs = 0;
+        do spiUc = rng_.UInt(0x10000, 0xFFFFFFF); while (spiUc == reg_.spiUc || spiUc == reg_.spiUs);
+        do spiUs = rng_.UInt(0x10000, 0xFFFFFFF); while (spiUs == reg_.spiUc || spiUs == reg_.spiUs || spiUs == spiUc);
+        std::string reg = imsd::msg::BuildRegisterProtected(ctx_, callid, ftag, rng_.Token(16), cseq, spiUc, spiUs, auth, PortUcNext);
+        if (!sip_.Send(reg)) throw std::runtime_error("send re-REGISTER failed");
+        std::string m = AwaitFinal(callid, cseq, "re-REGISTER");
+        auto st = imsd::sip::Status(m);
+        if (st == 200) return {m, cseq};
+        DumpRaw("imsd-register-fail.raw", m);
+        if (st == 401) throw RefusedError(std::format("re-REGISTER challenged: {}; re-authentication asked, the next registration is a fresh one", imsd::sip::RefusalSummary(m)), 401, imsd::sip::RetryAfter(m).value_or(0));
+        throw RefusedError(std::format("re-REGISTER refused: {}", imsd::sip::RefusalSummary(m)), *st, imsd::sip::RetryAfter(m).value_or(0));
     }
 
     void UpdateRouteAndPpi(const std::string& okMsg) {
@@ -1662,7 +1678,7 @@ private:
         if (Mono() - lastRefresh_ < interval) return;
         try {
             RefreshPani();
-            auto [msg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1, reg_.spiUc, reg_.spiUs);
+            auto [msg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1);
             reg_.cseq = used;
             if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
             PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
@@ -1670,11 +1686,12 @@ private:
             OnRegistered();
         } catch (const RefusedError& e) {
             // The network refused the refresh: the recovery policy counts it
-            // — a refusal with a Retry-After of at least a second makes the
-            // fresh registration the next step, behind the network's wait;
-            // one without gets one more refresh first, a second refusal then
-            // escalates — and the flow is dropped so the next step runs
-            // after the wait.
+            // — a refusal with a Retry-After of at least a second, or a 401
+            // (the refresh throws a challenge as a refusal), makes the fresh
+            // registration the next step, behind any wait the network set; a
+            // refusal with neither gets one more refresh first, a second
+            // refusal then escalates — and the flow is dropped so the next
+            // step runs after the wait.
             Log(std::format("keepalive re-REGISTER failed: {}", e.what()));
             CloseFlowAfterWait();
             RecoveryFailed(imsd::engine::RegRecovery::Failure::Refused, e.retryAfter, "keepalive refresh refused", e.status);
@@ -1770,7 +1787,7 @@ private:
         }
         try {
             RefreshPani();
-            auto [msg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1, reg_.spiUc, reg_.spiUs);
+            auto [msg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1);
             reg_.cseq = used;
             if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
             UpdateRouteAndPpi(msg);

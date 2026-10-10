@@ -60,7 +60,9 @@ export namespace imsd::engine {
     // bring-up, as a pure reducer: the shell supplies the clock and the
     // network, this decides the next step and how long to wait for it. Two
     // kinds of failure reach it. A REFUSAL: the network answered a refresh
-    // (or a fresh REGISTER) with a final other than 200/401. SILENCE: the
+    // with a final other than 200 — a 401, re-authentication, included — or
+    // a fresh registration's protected REGISTER with a final other than 200
+    // (the unprotected one's 401 is its challenge). SILENCE: the
     // flow died and reconnecting through the SA, or the refresh over it,
     // got no answer. Neither is retried for long on the same registration.
     // TS 24.229 5.1.1.4.1 has the UE perform an initial registration after
@@ -79,12 +81,15 @@ export namespace imsd::engine {
     // a fresh registration after two (one 503 may be a momentary hiccup a
     // retried refresh clears); one with such a Retry-After escalates at
     // once — it is the network's considered answer (O2 2026-10-08: the
-    // refresh after the first wait was refused again, 414 s then 772 s).
-    // Silence escalates after two reconnect cycles
+    // refresh after the first wait was refused again, 414 s then 772 s) —
+    // and so does a 401, the network asking to re-authenticate, which imsd
+    // answers with a fresh registration (TS 24.229 5.1.1.5.1's temporary
+    // SAs on the proposed client port are not implemented). Silence
+    // escalates after two reconnect cycles
     // that end without an answer — a TCP connect series whose last attempt
     // was not a local refusal, a bind() the kernel refused, or a refresh
-    // that fails short of a refusal: unanswered, an unusable challenge, a
-    // failed send (the resume at start gives up after two unanswered
+    // that fails short of a refusal: unanswered, a failed send (the resume
+    // at start gives up after two unanswered
     // connects).
     // A fresh registration is the expensive step: an AKA run, a
     // new SA pair, and on KPN a refusal (spi-s=0) while the registration on
@@ -191,7 +196,7 @@ export namespace imsd::engine {
         // cycle; `status` is the refusal's. The backoff paces the next step;
         // a Retry-After of at least a second holds every attempt for its own
         // length (up to RetryAfterMax), whichever is longer, and makes the
-        // next step the fresh registration. A 403 once a fresh
+        // next step the fresh registration, as does a 401. A 403 once a fresh
         // registration is due says the old registration is gone (KPN drops
         // it the moment an initial REGISTER arrives, throttled or not).
         void OnReconnectFailure(double now, Failure f, long retryAfter = 0, int status = 0) {
@@ -204,7 +209,7 @@ export namespace imsd::engine {
             if (f == Failure::Refused) refusals++;
             else silentCycles++;
             if (refusals >= RefusalsBeforeFresh || silentCycles >= SilentCyclesBeforeFresh) fresh = true;
-            if (f == Failure::Refused && retryAfter > 0) fresh = true;
+            if (f == Failure::Refused && (retryAfter > 0 || status == 401)) fresh = true;
             if (status == 403 && fresh) oldGone = true;
             backoffUntil = now + reconnectDelay;
             reconnectDelay = std::min(reconnectDelay * 2, ReconnectDelayMax);
