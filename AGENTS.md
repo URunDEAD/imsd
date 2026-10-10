@@ -1019,6 +1019,12 @@ only the imsd side of its bus choice.
   behaviour, in one sentence how it was tested. A version bump is a commit
   titled `imsd X.Y.Z` that changes only the `Version` constant and has no
   body.
+- **Versioning.** `0.MINOR.PATCH`: the patch number counts releases, fixes
+  and features alike; the minor number moves when a release changes what
+  a user can rely on the daemon for (0.3 added emergency calling), not
+  with the size of a release; the major number stays 0 — what 1.0 would
+  mark is not decided, and it is not an ABI change (§8.1: the ABI is
+  frozen).
 - **No AI attribution trailers.** Commits carry no `Assisted-by:`,
   `Co-Authored-By:` or similar lines, whoever or whatever drafted them.
 - **Signed commits.** Every commit is GPG-signed with the repository's
