@@ -882,9 +882,9 @@ int main() {
         // Retry-After is the network's word: it holds every attempt for its
         // own length, next to the backoff, and a Dial cuts only the backoff
         r.OnReconnectFailure(1000, F::Refused, 90);
-        Check(reconnectAt(r, 1000, 1090), "Retry-After 90 beats the 5-s backoff");
+        Check(r.Fresh() && r.Reconnectable() && freshAt(r, 1000, 1090), "a refusal with a Retry-After escalates at once: the fresh attempt behind the network's wait (O2 2026-10-08), the old SA kept");
         r.OnDial();
-        Check(reconnectAt(r, 1000, 1090), "…and a Dial does not cut it");
+        Check(freshAt(r, 1000, 1090), "…and a Dial does not cut it");
         r.OnReconnectFailure(1090, F::Refused, 3);
         Check(r.Fresh() && freshAt(r, 1090, 1100), "a Retry-After shorter than the backoff does not shorten it");
         r.OnDial();
@@ -957,7 +957,7 @@ int main() {
         Check(ra.freshHoldUntil == 5000 + 3600, "…a day's for an hour: the refusal is heard again then");
         RegRecovery rb;
         rb.OnReconnectFailure(1000, F::Refused, 86400);
-        Check(reconnectAt(rb, 1000, 1000 + 3600), "a refresh's Retry-After is cut to the hour the same");
+        Check(freshAt(rb, 1000, 1000 + 3600), "a refresh's Retry-After is cut to the hour the same, the fresh attempt behind it");
         RegRecovery h;
         h.OnFreshFailure(1000, F::Refused, 60);
         Check(h.freshHoldUntil == 1060, "a refused fresh attempt with Retry-After 60 waits 60 s, not the schedule");

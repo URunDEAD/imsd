@@ -74,9 +74,13 @@ export namespace imsd::engine {
     // fresh registration the network accepted within two seconds (ims
     // ledger F16).
     //
-    // Pacing. Reconnect cycles back off 5 s → 5 min. A refusal escalates
-    // to a fresh registration after two (one 503 may be a momentary
-    // hiccup a retried refresh clears), silence after two reconnect cycles
+    // Pacing. Reconnect cycles back off 5 s → 5 min. A refusal without a
+    // Retry-After of at least a second (none, 0, unparsable) escalates to
+    // a fresh registration after two (one 503 may be a momentary hiccup a
+    // retried refresh clears); one with such a Retry-After escalates at
+    // once — it is the network's considered answer (O2 2026-10-08: the
+    // refresh after the first wait was refused again, 414 s then 772 s).
+    // Silence escalates after two reconnect cycles
     // that end without an answer — a TCP connect series whose last attempt
     // was not a local refusal, a bind() the kernel refused, or a refresh
     // that fails short of a refusal: unanswered, an unusable challenge, a
@@ -185,8 +189,9 @@ export namespace imsd::engine {
 
         // A refused keepalive refresh, or a failed reconnect + refresh
         // cycle; `status` is the refusal's. The backoff paces the next step;
-        // a Retry-After holds every attempt for its own length (up to
-        // RetryAfterMax), whichever is longer. A 403 once a fresh
+        // a Retry-After of at least a second holds every attempt for its own
+        // length (up to RetryAfterMax), whichever is longer, and makes the
+        // next step the fresh registration. A 403 once a fresh
         // registration is due says the old registration is gone (KPN drops
         // it the moment an initial REGISTER arrives, throttled or not).
         void OnReconnectFailure(double now, Failure f, long retryAfter = 0, int status = 0) {
@@ -199,6 +204,7 @@ export namespace imsd::engine {
             if (f == Failure::Refused) refusals++;
             else silentCycles++;
             if (refusals >= RefusalsBeforeFresh || silentCycles >= SilentCyclesBeforeFresh) fresh = true;
+            if (f == Failure::Refused && retryAfter > 0) fresh = true;
             if (status == 403 && fresh) oldGone = true;
             backoffUntil = now + reconnectDelay;
             reconnectDelay = std::min(reconnectDelay * 2, ReconnectDelayMax);

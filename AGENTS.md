@@ -246,18 +246,23 @@ Rules:
   pre-fix build that renewed that closure; the retry on this code, the
   renewal firing, Timer F, the doubling, a SUBSCRIBE `Retry-After`, the
   renew arm and the back-off's survival across a refresh have run nowhere —
-  §3, §7.4); a `Retry-After` on a REGISTER and a `Dial` bringing a recovery
-  step forward (KPN's refusals, all 403, carry none; imsd-ofonod refuses the
-  `Dial` itself and imsd-dialerd forwards it — pinned in `tests/Engine`
-  only); a refused initial or fresh
+  §3, §7.4); a `Retry-After` on a REGISTER has run in the field (one
+  report, a screenshot of 2026-10-08, O2, 0.3.10: a refresh's Retry-After
+  set the next step's time — `in 7 min`, then `in 13 min` — and the
+  refusals counted; the wait's length went unmeasured, the journal lines
+  on the screenshot carry no timestamps; KPN's refusals, all 403, carry
+  none) and a `Dial` bringing a recovery step
+  forward (imsd-ofonod refuses the `Dial` itself and imsd-dialerd forwards
+  it) is pinned in `tests/Engine` only; the escalation by one refused
+  refresh that carries a `Retry-After` is pinned in `tests/Engine` only; a
+  refused initial or fresh
   REGISTER (403, 5xx) at bring-up or in recovery (KPN has only throttled or
   stayed silent — pinned in `tests/Engine` only); the write-off of the old
   registration by a recovery's fresh attempt that fails past the SA setup
   (such attempts are on record only as a bring-up's fatal exit, which does
-  not pass that arm — pinned in `tests/Engine` only); a refused
-  refresh counted
-  towards the escalation, and the escalation by two of them (KPN refuses a
-  refresh only with the 403 that says the registration is gone — pinned in
+  not pass that arm — pinned in `tests/Engine` only); the escalation by
+  two refused refreshes that carry no `Retry-After` (KPN refuses a refresh
+  only with the 403 that says the registration is gone — pinned in
   `tests/Engine` only); of the throttled-attempt chain in recovery (a
   throttled fresh attempt, the old SA retried once meanwhile with the stored
   binding's Contact and refused 403, the deferred attempt accepted at the
@@ -497,7 +502,7 @@ The policy, with its constants:
 | Step | Rule |
 |---|---|
 | Reconnect | Through the existing SA, then refresh. Back-off 5 s → 5 min (`ReconnectDelayMin`/`Max`). |
-| Escalate to a fresh registration | After two refused refreshes (`RefusalsBeforeFresh`) or two reconnect cycles that end without an answer (`SilentCyclesBeforeFresh`) while the modem reports packet service (`PacketServiceUp`: ModemManager's registration and packet-service state, as `ims-pdn-up.sh` reads them). A cycle that fails during a coverage gap is the phone's silence, not the network's: not counted, retried on the local-refusal pace, so a radio gap across a refresh does not escalate into a fresh registration, which KPN refuses while the registration is live and drops it for (§13). New Call-ID, new challenge, new SA pair (`registering fresh (recovery attempt N)`). |
+| Escalate to a fresh registration | After one refused refresh whose `Retry-After` is at least a second (the network's considered answer; a `Retry-After` of 0 or one that does not parse counts as none; O2 2026-10-08: the refresh refused 503 with Retry-After 414 s, the refresh after that wait 503 with Retry-After 772 s), after two refused refreshes without one (`RefusalsBeforeFresh`), or two reconnect cycles that end without an answer (`SilentCyclesBeforeFresh`) while the modem reports packet service (`PacketServiceUp`: ModemManager's registration and packet-service state, as `ims-pdn-up.sh` reads them). A cycle that fails during a coverage gap is the phone's silence, not the network's: not counted, retried on the local-refusal pace, so a radio gap across a refresh does not escalate into a fresh registration, which KPN refuses while the registration is live and drops it for (§13). New Call-ID, new challenge, new SA pair (`registering fresh (recovery attempt N)`). |
 | A refused or throttled fresh attempt | Waits on the **throttle schedule**: 21 min, growing ×1.5 to 60 (`ThrottleMinutesMin`/`Max`). KPN refuses a fresh SA pair on an address whose registration is live (§13), and drops that registration the moment an initial REGISTER arrives. |
 | A silent fresh attempt | Backs off 30 s → 10 min (`FreshDelayMin`/`Max`). |
 | `Retry-After` | Always wins over a shorter wait, honoured up to an hour (`RetryAfterMax`, the schedule's longest wait); a longer one is cut to an hour and the refusal heard again then. On a refused fresh attempt it replaces the schedule's wait, shorter or longer, never below 30 s (`FreshDelayMin`). |
@@ -1001,7 +1006,10 @@ the related code.
   registration's address the attempt is refused and costs the registration.
 - **O2 UK, 2026-09-24:** a refresh refused 21 × 503 over 70 min, then 33
   unanswered reconnect cycles; a fresh registration was accepted in one
-  second. The origin of `RegRecovery`.
+  second. The origin of `RegRecovery`. On 2026-10-08, under 0.3.10 (the
+  first release to log a Retry-After), a refresh was refused 503 with
+  `Retry-After` 414 s and the refresh after that wait 503 with `Retry-After`
+  772 s: the origin of the `Retry-After` escalation.
 - **KPN closes a registration's previous reg-event subscription with
   `noresource`** when a new one replaces it: that end is not renewed.
 - **Modem attach-family forcing** (Odido, O2 UK, Swisscom): an APN-string

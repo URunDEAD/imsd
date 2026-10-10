@@ -1670,9 +1670,11 @@ private:
             OnRegistered();
         } catch (const RefusedError& e) {
             // The network refused the refresh: the recovery policy counts it
-            // (a second refusal means a fresh registration) and the flow is
-            // dropped so the reconnect step retries the refresh after the
-            // wait (Retry-After when given).
+            // — a refusal with a Retry-After of at least a second makes the
+            // fresh registration the next step, behind the network's wait;
+            // one without gets one more refresh first, a second refusal then
+            // escalates — and the flow is dropped so the next step runs
+            // after the wait.
             Log(std::format("keepalive re-REGISTER failed: {}", e.what()));
             CloseFlowAfterWait();
             RecoveryFailed(imsd::engine::RegRecovery::Failure::Refused, e.retryAfter, "keepalive refresh refused", e.status);
