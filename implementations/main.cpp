@@ -126,6 +126,22 @@ void RunOwnXfrmDeletes(const std::vector<std::vector<std::string>>& cmds) {
     }
 }
 
+// The kernel's SA pair when nothing can resume it and no fresh registration
+// replaces it, and whatever else of imsd's own is left (a policy-less state
+// on the UE's address): taken out by exact key, as the SA setup takes imsd's
+// previous pair out (RunOwnXfrmDeletes — nothing else in the kernel is
+// touched, §12), so the next bring-up finds nothing to resume. Run by the
+// no-target bring-up.
+void RemoveDeadPair(std::string_view local) {
+    auto state = RunCapture({"ip", "xfrm", "state"});
+    auto policy = RunCapture({"ip", "xfrm", "policy"});
+    auto cmds = imsd::ipsec::OwnXfrmDeleteCommands(state.out, policy.out, local);
+    if (cmds.empty()) return;
+    if (auto peer = imsd::ipsec::SaPeer(policy.out)) Log(std::format("the SA pair to {} is nothing to resume: removing it", *peer));
+    else Log(std::format("{} xfrm entr{} of imsd's own with no pair to resume: removing them", cmds.size(), cmds.size() == 1 ? "y" : "ies"));
+    RunOwnXfrmDeletes(cmds);
+}
+
 // ---- small text extractors (401 header params, qmicli "completed:") -------
 
 std::optional<std::string> QuotedAfter(std::string_view text, std::string_view key) {
@@ -683,16 +699,16 @@ std::string StatePath() { return EnvOr("STATE_FILE", std::format("{}/imsreg.stat
 // since 0.3.12. The file's values are quoted without escaping; a value
 // with a quote, a backslash or a newline in it (none RFC 3329's token
 // syntax produces) is written empty, and the resume falls back to the SA.
-void PersistState(const RegState& r, const std::string& route, const std::string& ppi, const std::string& aor, const std::string& transport) {
+void PersistState(const RegState& r, const std::string& route, const std::string& ppi, const std::string& aor, const std::string& transport, const std::string& pcscf) {
     std::string ss = r.securityServer.find_first_of("\"\\\n") == std::string::npos ? r.securityServer : std::string();
     std::string j = std::format(
         "{{\"callid\": \"{}\", \"ftag\": \"{}\", \"cseq\": {}, \"spi_uc\": {}, "
         "\"spi_us\": {}, \"expiry\": {}, \"route\": \"{}\", \"ppi\": \"{}\", "
         "\"aor\": \"{}\", \"contact_user\": \"{}\", \"transport\": \"{}\", "
         "\"auth_nonce\": \"{}\", \"auth_cnonce\": \"{}\", \"auth_response\": \"{}\", "
-        "\"security_server\": \"{}\"}}",
+        "\"security_server\": \"{}\", \"pcscf\": \"{}\"}}",
         r.callid, r.ftag, r.cseq, r.spiUc, r.spiUs, r.expiry, route, ppi, aor,
-        r.contactUser, transport, r.authNonce, r.authCnonce, r.authResponse, ss);
+        r.contactUser, transport, r.authNonce, r.authCnonce, r.authResponse, ss, pcscf);
     std::string path = StatePath();
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
@@ -716,7 +732,7 @@ void DumpRaw(std::string_view name, std::string_view msg) {
 }
 
 struct PersistedState {
-    std::optional<std::string> callid, ftag, route, ppi, aor, contactUser, transport, authNonce, authCnonce, authResponse, securityServer;
+    std::optional<std::string> callid, ftag, route, ppi, aor, contactUser, transport, authNonce, authCnonce, authResponse, securityServer, pcscf;
     std::optional<long> cseq, spiUc, spiUs, expiry;
 };
 std::optional<PersistedState> LoadState() {
@@ -738,6 +754,7 @@ std::optional<PersistedState> LoadState() {
     ps.authCnonce = QuotedAfter(s, "\"auth_cnonce\": \"");
     ps.authResponse = QuotedAfter(s, "\"auth_response\": \"");
     ps.securityServer = QuotedAfter(s, "\"security_server\": \"");   // absent in pre-0.3.12 files
+    ps.pcscf = QuotedAfter(s, "\"pcscf\": \"");   // absent in pre-1.0.0 files
     ps.cseq = IntAfter(s, "\"cseq\": ");
     ps.spiUc = IntAfter(s, "\"spi_uc\": ");
     ps.spiUs = IntAfter(s, "\"spi_us\": ");
@@ -832,8 +849,8 @@ void PersistHolds(const imsd::engine::RegRecovery::Held& h, const std::string& p
         else if (std::filesystem::exists(st)) { if (std::FILE* f = std::fopen(path.c_str(), "w")) std::fclose(f); }
         return;
     }
-    std::string j = std::format("{{\"pdn\": \"{}\", \"boot\": \"{}\", \"written_at\": {}, \"hold\": {}, \"fresh_hold\": {}, \"throttle_minutes\": {}, \"old_gone\": {}}}\n",
-                                pdn, BootId(), BootSeconds(), static_cast<long>(std::ceil(h.hold)), static_cast<long>(std::ceil(h.freshHold)), h.throttleMinutes, h.oldGone ? "true" : "false");
+    std::string j = std::format("{{\"pdn\": \"{}\", \"boot\": \"{}\", \"written_at\": {}, \"hold\": {}, \"fresh_hold\": {}, \"throttle_minutes\": {}, \"old_gone\": {}, \"refusals\": {}}}\n",
+                                pdn, BootId(), BootSeconds(), static_cast<long>(std::ceil(h.hold)), static_cast<long>(std::ceil(h.freshHold)), h.throttleMinutes, h.oldGone ? "true" : "false", h.refusals);
     if (std::FILE* f = std::fopen(path.c_str(), "w")) {
         std::fwrite(j.data(), 1, j.size(), f);
         std::fclose(f);
@@ -855,6 +872,7 @@ std::optional<imsd::engine::RegRecovery::Held> LoadHolds(const std::string& pdn)
     h.freshHold = std::max<long>(0, IntAfter(s, "\"fresh_hold\": ").value_or(0) - elapsed);
     h.throttleMinutes = static_cast<int>(IntAfter(s, "\"throttle_minutes\": ").value_or(h.throttleMinutes));
     h.oldGone = s.find("\"old_gone\": true") != std::string::npos;
+    h.refusals = static_cast<int>(IntAfter(s, "\"refusals\": ").value_or(0));
     if (!h.Any()) return std::nullopt;
     return h;
 }
@@ -924,10 +942,11 @@ void PostEvent(std::unique_ptr<Event> ev) {
 class Engine {
 public:
     Engine() {
-        // No baked-in default: the P-CSCF is carrier infrastructure, learned
-        // from the IMS PDN's PCO on a stock stack. Until PCO discovery is
-        // implemented, PCSCF= must be configured (see README).
-        pcscf_ = imsd::util::CanonicalAddr(EnvOr("PCSCF", ""));
+        // The P-CSCF a fresh registration goes to: PCSCF= (no baked-in
+        // default — carrier infrastructure). A resume follows the kernel's
+        // SAs instead (TryResume), whatever this says today.
+        pcscfTarget_ = imsd::util::CanonicalAddr(EnvOr("PCSCF", ""));
+        pcscf_ = pcscfTarget_;
         pcscfPort_ = std::atoi(EnvOr("PCSCF_PORT", "5060").c_str());
         dev_ = EnvOr("DEV", "qmapmux0.0");
         outDir_ = EnvOr("OUT_DIR", StateDir());
@@ -1111,6 +1130,20 @@ private:
     }
 
     void KeepHolds() { PersistHolds(recovery_.Holds(Boot()), pdnLocal_); }
+    // what follows a resume that failed: with a fresh target the fresh
+    // registration, without one the restart's new resume attempt
+    std::string ResumeFailedNext() const { return pcscfTarget_.empty() ? "the restart tries the resume again" : "the next registration is a fresh one"; }
+    // a pair nothing can resume (no state file, the file another attempt's): with a fresh target the fresh registration replaces it; with none BringUp writes it off and takes it out of the kernel
+    std::string ResumeDeadNext() const { return pcscfTarget_.empty() ? "nothing can resume it: the pair is removed" : "resume falls back to fresh"; }
+    // the failed resume's line tail by the engine's verdict: a registration it
+    // wrote off is removed (no fresh target) or replaced by the fresh one; with
+    // no fresh target a resume it gives up (a 401, a refusal with a Retry-After,
+    // the second refusal) is removed too; else what ResumeFailedNext says
+    std::string ResumeFailedTail(const std::string& next) {
+        if (!recovery_.Reconnectable()) return pcscfTarget_.empty() ? "written off by the network: the pair is removed" : "written off by the network: the next registration is a fresh one";
+        if (pcscfTarget_.empty() && recovery_.Fresh()) return "the resume is given up (the engine's rule): the pair is removed";
+        return next;
+    }
 
     // dev/session mode without a modem: process commands so the ABI answers,
     // but there is no SIP socket — a Dial collapses to terminated/error.
@@ -1123,6 +1156,13 @@ private:
 
     // config
     std::string pcscf_, dev_, outDir_, local_, ealgOffer_, mediaBin_;
+    // The P-CSCF a fresh registration goes to (PCSCF=). pcscf_ is the one in
+    // use: the same, or the kernel's SA peer while a resumed registration
+    // made to another one lives (TryResume) — the next fresh registration
+    // moves to the target, and back when it fails before the SA setup
+    // (FreshRecover), as local_ does against pdnLocal_.
+    std::string pcscfTarget_;
+    static constexpr std::string_view NoFreshPcscf = "no P-CSCF for a fresh registration: none configured (PCSCF=)";
     // The PDN's own address (LOCAL, else DetectLocal) — every fresh
     // registration's. local_ differs from it only while a resume runs on the
     // address an older registration was made on (TryResume).
@@ -1210,8 +1250,7 @@ private:
 
     // ---- bring-up: warm resume if an SA + state file exist, else fresh ----
     void BringUp() {
-        if (pcscf_.empty()) throw std::runtime_error("PCSCF not set — configure the carrier's P-CSCF address " "(P-CSCF discovery from the PDN's PCO is not implemented yet)");
-        if (pcscf_.contains(',')) throw std::runtime_error(std::format("PCSCF='{}' must be one address", pcscf_));
+        if (pcscfTarget_.contains(',')) throw std::runtime_error(std::format("PCSCF='{}' must be one address", pcscfTarget_));
         // PCSCF= is accepted in one spelling only: the one `ip` prints (RFC
         // 5952 — what the journal and `ip xfrm` show). Another spelling is
         // refused with the one to use rather than normalised, so the bring-up
@@ -1248,25 +1287,62 @@ private:
         std::string resume = EnvOr("RESUME", "auto");
         // A resume that the network refuses (403 after another process
         // registered fresh for the same IMPI, a stale binding, …) is not
-        // fatal: the fresh registration below replaces its SAs. Only a
-        // failed FRESH registration is.
+        // fatal while there is a fresh target: the fresh registration below
+        // replaces its SAs, and only a failed FRESH registration is. With no
+        // fresh target the bring-up ends as §7.2 step 1 says.
         // The network's word holds at bring-up as it does in recovery: a
         // hold from before this start is waited out before the resume (a
         // refresh's Retry-After) or the fresh registration (a fresh attempt's
         // schedule or Retry-After, a terminated binding's wait), and so is
         // one the resume itself earns — a refusal's Retry-After, a binding
         // a NOTIFY terminated under it.
+        ResumeOutcome outcome = ResumeOutcome::Dead;   // not tried (RESUME=0, or written off before this start): a pair nothing resumes
         if (resume != "0") {
             if (!WaitForPolicy()) throw Stopping{};
             // a registration the network wrote off before this start (the
             // holds carry it) is not resumed: the wait above was the fresh one
-            try { if (recovery_.Reconnectable() && TryResume()) return; }
+            const std::string next = ResumeFailedNext();
+            try { if (recovery_.Reconnectable()) { outcome = TryResume(); if (outcome == ResumeOutcome::Done) return; } }
             catch (const RefusedError& e) {
-                Log(std::format("resume failed: {} — the next registration is a fresh one", e.what()));
+                outcome = ResumeOutcome::Failed;
                 CloseFlowAfterWait();
-                if (e.retryAfter > 0) recovery_.OnReconnectFailure(Boot(), imsd::engine::RegRecovery::Failure::Refused, e.retryAfter, e.status);
+                // the network's word (a Retry-After) reaches the reducer as before;
+                // with no fresh target every refusal does — its count travels in
+                // the holds, so a restart's refusal is the second (§7.4). With a
+                // target a refusal without one feeds nothing: the fresh
+                // registration follows at once, not after a self-imposed backoff
+                // the fresh path would log as the network's hold
+                if (e.retryAfter > 0 || pcscfTarget_.empty()) recovery_.OnReconnectFailure(Boot(), imsd::engine::RegRecovery::Failure::Refused, e.retryAfter, e.status);
+                Log(std::format("resume failed: {} — {}", e.what(), ResumeFailedTail(next)));
             }
-            catch (const std::exception& e) { Log(std::format("resume failed: {} — the next registration is a fresh one", e.what())); CloseFlowAfterWait(); }
+            catch (const std::exception& e) { outcome = ResumeOutcome::Failed; CloseFlowAfterWait(); Log(std::format("resume failed: {} — {}", e.what(), ResumeFailedTail(next))); }
+            // the engine's verdict decides, in one place for both arms: a
+            // registration it wrote off (a 403 once a fresh registration is
+            // due; a binding a NOTIFY terminated under the re-REGISTER wait,
+            // Imsd-Engine.cppm) is nothing to resume any more, and so, with no
+            // fresh target, is one whose resume it gives up (a 401, a refusal
+            // with a Retry-After, the second refusal — RefusalsBeforeFresh,
+            // the count surviving the restart): Dead, taken out below. With a
+            // target the fresh registration follows either way.
+            if (outcome == ResumeOutcome::Failed && (!recovery_.Reconnectable() || (pcscfTarget_.empty() && recovery_.Fresh()))) outcome = ResumeOutcome::Dead;
+        }
+        if (pcscfTarget_.empty()) {
+            // No fresh registration follows, so this is no write-off: a
+            // resumable pair whose attempt failed (a silent connect, an
+            // unanswered or refused refresh — its Retry-After is in the
+            // holds) stays for the restart to resume — unless the engine's
+            // rule wrote the registration off or gave the resume up (a 403 once
+            // fresh is due, a NOTIFY-terminated binding; a 401, a refusal with a
+            // Retry-After, the second refusal — the count travels in the holds;
+            // Dead above); a pair nothing can
+            // resume (its UE address left the link, no state file, the file
+            // another attempt's, written off before this start) is taken out
+            // of the kernel, by exact key — the fresh registration that would
+            // have replaced it does not come — so the next bring-up finds
+            // nothing to resume.
+            if (outcome == ResumeOutcome::Dead) RemoveDeadPair(pdnLocal_);
+            KeepHolds();
+            throw std::runtime_error(std::string(NoFreshPcscf));
         }
         // a resume that failed found the stored SAs unusable (and after a
         // reboot there are none): nothing to reconnect over while a deferred
@@ -1275,14 +1351,36 @@ private:
         portPs_ = 0;
         local_ = pdnLocal_; ctx_.local = local_;
         KeepHolds();
+        pcscf_ = pcscfTarget_;
         if (recovery_.Next(Boot()).at > Boot()) Log(std::format("the network's hold stands; {}", NextStep()));
         if (!WaitForPolicy()) throw Stopping{};
         FreshRegister();
     }
 
-    bool TryResume() {
+    // What a bring-up's resume attempt found: the registration (resumed),
+    // no pair of ours in the kernel, a pair nothing can resume, or a
+    // resumable pair whose attempt failed — worth a retry.
+    enum class ResumeOutcome { Done, None, Dead, Failed };
+
+    ResumeOutcome TryResume() {
         auto state = RunCapture({"ip", "xfrm", "state"});
         auto policy = RunCapture({"ip", "xfrm", "policy"});
+        // The registration was made to whatever P-CSCF the kernel's SAs name
+        // (the SA setup takes imsd's previous pair out), whatever PCSCF= says
+        // today: resume there and move at the next fresh registration — a
+        // fresh one now would cost the registration, on KPN with the
+        // 21-minute refusal. A route to it exists while the netdev lives;
+        // the replace covers a target that changed under a running phone.
+        auto peer = imsd::ipsec::SaPeer(policy.out);
+        if (!peer) return ResumeOutcome::None;
+        bool routePeer = false;
+        if (*peer != pcscf_) {
+            Log(pcscfTarget_.empty()
+                ? std::format("pcscf: resuming on {}, the registration's SA peer (no P-CSCF configured)", *peer)
+                : std::format("pcscf: resuming on {}, the registration's SA peer; the configured P-CSCF is {} — the next fresh registration moves there", *peer, pcscfTarget_));
+            pcscf_ = *peer;
+            routePeer = true;   // routed below, once the SAs are confirmed: a peer named by a pair that is not ours gets no route into the PDN
+        }
         auto sa = imsd::ipsec::ParseExistingSa(state.out, policy.out, pcscf_, local_);
         // The registration may sit on another address of the link: before
         // 0.3.10 imsd registered on the kernel's temporary one (ims ledger
@@ -1304,14 +1402,28 @@ private:
                 break;
             }
         }
-        if (!sa) return false;
+        if (!sa) { Log(std::format("the SA pair to {} has no SA on an address of {}: nothing to resume", pcscf_, dev_)); return ResumeOutcome::Dead; }
+        if (routePeer) RunCmd({"ip", Is6(pcscf_) ? "-6" : "-4", "route", "replace", pcscf_, "dev", dev_});
         auto ps = LoadState();
-        if (!ps || !ps->callid) { Log("no reg state file; resume falls back to fresh"); return false; }
+        if (!ps || !ps->callid) { Log(std::format("no reg state file; {}", ResumeDeadNext())); return ResumeOutcome::Dead; }
+        // A file another attempt left behind — one that got through the SA
+        // setup and did not live to record, to this or another P-CSCF — names
+        // another SA pair than the kernel's (its spi_uc/spi_us; a 0.3.x file
+        // carries them too): its dialog is that attempt's, and a Call-ID
+        // cannot be rebuilt from an SA (the Security-Verify can —
+        // ChooseResumeSecurityVerify).
+        if (imsd::ipsec::FileNamesAnotherPair(ps->spiUc, ps->spiUs, sa->spiUc, sa->spiUs)) {
+            Log(std::format("the state file names another SA pair ({:#x}/{:#x}{}) than the kernel's ({:#x}/{:#x} to {}): another attempt's; {}",
+                            static_cast<std::uint32_t>(*ps->spiUc), static_cast<std::uint32_t>(*ps->spiUs),
+                            ps->pcscf && !ps->pcscf->empty() ? std::format(" to {}", imsd::util::CanonicalAddr(*ps->pcscf)) : std::string(),
+                            sa->spiUc, sa->spiUs, pcscf_, ResumeDeadNext()));
+            return ResumeOutcome::Dead;
+        }
         // The registration's transport is what the P-CSCF knows; a resume
         // must reuse it. A forced policy that disagrees means a fresh start
         // — decided before anything from the file is adopted.
         Transport t = ps->transport.value_or("TCP") == "UDP" ? Transport::Udp : Transport::Tcp;
-        if (sipPolicy_ != "auto" && t != transport_) { Log("state file transport differs from SIP_TRANSPORT; fresh"); return false; }
+        if (sipPolicy_ != "auto" && t != transport_) { Log(std::format("state file transport differs from SIP_TRANSPORT; {}", ResumeFailedNext())); return ResumeOutcome::Failed; }
 
         route_ = ps->route.value_or(std::format("<sip:{};lr>", imsd::util::HostPort(pcscf_, sa->portPs)));
         // No fallback identity: an empty ppi omits P-Preferred-Identity and
@@ -1324,7 +1436,7 @@ private:
         // (ChooseResumeSecurityVerify). The rebuilt entry is KPN's answer to
         // the default offer in the same bytes, not a list such as O2's six,
         // which the RFC has the server answer with a 494; a refused resume
-        // registers fresh.
+        // registers fresh where there is a fresh target (§7.2 step 1 otherwise).
         auto rsv = imsd::ipsec::ChooseResumeSecurityVerify(ps->securityServer.value_or(""), *sa, ealgOffer_);
         ss_ = rsv.value;
         using Source = imsd::ipsec::ResumeSecurityVerify::Source;
@@ -1353,8 +1465,8 @@ private:
         // Local refusals (TIME_WAIT after a restart) keep retrying; two
         // silences mean the flow is not coming back — fresh instead.
         if (!sip_.Connect(local_, PortUc, pcscf_, sa->portPs, transport_, 10, 2)) {
-            Log("resume connect failed; falling back to fresh");
-            return false;
+            Log(std::format("resume connect failed; {}", ResumeFailedNext()));
+            return ResumeOutcome::Failed;
         }
         reg_.callid = *ps->callid;
         reg_.ftag = ps->ftag.value_or("");
@@ -1375,9 +1487,9 @@ private:
         if (auto e = imsd::sip::GrantedExpires(okMsg)) reg_.expiry = *e;
         UpdateRouteAndPpi(okMsg);
         LogBindings(okMsg);
-        PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
+        PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport, pcscf_);
         Log("REGISTERED (resumed + true-refreshed)");
-        return true;
+        return ResumeOutcome::Done;
     }
 
     // The registrar's 200 OK echoes EVERY current binding for the implicit
@@ -1547,11 +1659,15 @@ private:
         reg_.securityServer = ss_;
         reg_.expiry = imsd::sip::GrantedExpires(ok).value_or(0);
         DumpRaw("imsd-register-200.raw", ok);
+        // The Route for everything over this registration is the P-CSCF it
+        // was made at — never a previous one's, after a move from the
+        // resumed peer — unless the 200 carries a Service-Route, which
+        // UpdateRouteAndPpi puts in its place.
+        route_ = std::format("<sip:{};lr>", imsd::util::HostPort(pcscf_, portPs));
         UpdateRouteAndPpi(ok);
         LogBindings(ok);
-        if (route_.empty()) route_ = std::format("<sip:{};lr>", imsd::util::HostPort(pcscf_, portPs));
         ctx_.route = route_; ctx_.ppi = ppi_;
-        PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
+        PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport, pcscf_);
         Log("REGISTERED (fresh)");
     }
 
@@ -1667,7 +1783,11 @@ private:
     }
 
     void UpdateRouteAndPpi(const std::string& okMsg) {
-        auto svc = imsd::sip::Headers(okMsg, "Service-Route");
+        // an empty Service-Route value carries no route: ignored like a
+        // missing header, so the fallback Route the caller set stands
+        auto svcAll = imsd::sip::Headers(okMsg, "Service-Route");
+        decltype(svcAll) svc;
+        for (auto& v : svcAll) if (!v.empty()) svc.push_back(v);
         if (svc.empty()) Log("200: no Service-Route (route stays P-CSCF)");
         if (!svc.empty()) {
             std::string r;
@@ -1749,7 +1869,7 @@ private:
             auto [msg, used] = Reregister(reg_.callid, reg_.ftag, reg_.cseq + 1);
             reg_.cseq = used;
             if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
-            PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
+            PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport, pcscf_);
             Log(std::format("keepalive re-REGISTER ok (cseq {})", used));
             OnRegistered();
         } catch (const RefusedError& e) {
@@ -1860,7 +1980,7 @@ private:
             if (auto e = imsd::sip::GrantedExpires(msg)) reg_.expiry = *e;
             UpdateRouteAndPpi(msg);
             LogBindings(msg);
-            PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport);
+            PersistState(reg_, route_, ppi_, ctx_.aor, ctx_.transport, pcscf_);
             Log("reconnected + re-registered");
             OnRegistered();
         } catch (const RefusedError& e) {
@@ -1913,7 +2033,14 @@ private:
         // a registration resumed on an older address (a pre-0.3.10 temporary
         // one) moves to the PDN's own address here, server ports included;
         // an attempt that fails before the SA setup leaves that registration
-        // standing, so it moves back to it
+        // standing, so it moves back to it — the P-CSCF too, once the address
+        // verdict below says the registration still stands
+        if (pcscfTarget_.empty()) { RequestRestart(std::string(NoFreshPcscf)); return; }
+        std::string fromPcscf = pcscf_;
+        if (pcscf_ != pcscfTarget_) {
+            Log(std::format("the fresh registration moves from P-CSCF {} to {}", pcscf_, pcscfTarget_));
+            pcscf_ = pcscfTarget_;
+        }
         std::string from = local_;
         if (local_ != pdnLocal_) {
             Log(std::format("the fresh registration moves from {} to the PDN's own address {}", local_, pdnLocal_));
@@ -1943,6 +2070,12 @@ private:
                 KeepHolds();   // the verdict outlives a restart like the hold it goes with
                 Log(std::format("{} has left {}: the registration on it is gone; staying on {}; {}", from, dev_, local_, NextStep()));
             }
+        }
+        // after the address verdict: a registration just declared gone has
+        // no P-CSCF to go back to
+        if (!ok && !quit_.load() && recovery_.Reconnectable() && pcscf_ != fromPcscf) {
+            Log(std::format("back to P-CSCF {}: the old registration stands until the next fresh attempt", fromPcscf));
+            pcscf_ = fromPcscf;
         }
     }
 

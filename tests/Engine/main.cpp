@@ -1097,6 +1097,20 @@ int main() {
             n.Restore(5, m.Holds(5));
             Check(!n.Reconnectable() && freshAt(n, 5, 0), "…so the next start registers fresh at once instead of resuming");
             Check(!RegRecovery::Held{0, 0, 21, false}.Any(), "nothing gone, nothing held: nothing to keep");
+            // the refusal count travels: a resume refused without a Retry-After at a start with no fresh target is one
+            // refusal, the restart's is the second — without the travel every restart would be the first (F16's loop)
+            RegRecovery rq;
+            rq.OnReconnectFailure(10, F::Refused, 0, 503);
+            auto hq = rq.Holds(20);
+            Check(hq.Any() && hq.refusals == 1 && !hq.oldGone && hq.hold == 0, "a refusal without a Retry-After is held as a count, nothing else");
+            RegRecovery sq;
+            sq.Restore(100, hq);
+            Check(!sq.Fresh() && sq.Reconnectable(), "the count alone gives nothing up");
+            sq.OnReconnectFailure(100, F::Refused, 0, 503);
+            Check(sq.Fresh() && sq.Reconnectable(), "the second refusal, across the restart, gives the resume up (fresh) without writing the registration off");
+            RegRecovery tq;
+            tq.OnReconnectFailure(10, F::Refused, 0, 401);
+            Check(tq.Fresh() && tq.Reconnectable() && tq.Holds(20).refusals == 1, "a 401 gives the resume up at once; its count travels too");
             RegRecovery x;
             x.Restore(2000, RegRecovery::Held{86400, 86400, 21});
             Check(x.holdUntil == 2000 + 3600 && x.freshHoldUntil == 2000 + 3600, "a restored hold is cut to the hour like the Retry-After it came from");

@@ -19,11 +19,14 @@ SPIs in use, which a reregistration's new SPIs must differ from (and the
 state file falls back to) — and a one-mechanism Security-Server value that
 stands in for the Security-Verify when the state file holds no list for the
 SA pair in the kernel (`ChooseResumeSecurityVerify` decides; since 0.3.12
-the 401's own list is stored there). Since 1.0.0 also
-`OwnXfrmDeleteCommands`: the deletes by exact key of what two rules select —
-the policies carrying imsd's fingerprint and the reqid-1/2 transport-mode ESP
-states in their direction or on the UE's ims-PDN address, whoever installed
-them (§12).
+the 401's own list is stored there). Since 1.0.0 also `SaPeer`: the P-CSCF
+the kernel's pair is to, read from the `dir out` policies that carry imsd's
+fingerprint; `OwnXfrmDeleteCommands`, the deletes by exact key of what two
+rules select — the policies carrying imsd's fingerprint and the reqid-1/2
+transport-mode ESP states in their direction or on the UE's ims-PDN address,
+whoever installed them (§12); and `FileNamesAnotherPair`, whether a state
+file's spi_uc/spi_us name the pair the kernel holds (unknown on either side
+decides nothing).
 
 Pure std C++ (the shell runs the commands and captures the text). Command
 shapes and the parser are pinned by tests/Ipsec.
@@ -461,6 +464,19 @@ export namespace imsd::ipsec {
         return r;
     }
 
+    // Whether a state file was written for the SA pair the kernel holds: the
+    // file's spi_uc/spi_us (the UE's inbound SPIs — drawn per fresh attempt,
+    // kept by a re-REGISTER, written back by a resume) against the pair's. A
+    // file another attempt left behind — one that got through the SA setup
+    // and did not live to record, to this or another P-CSCF — names another
+    // pair, and its dialog is not this pair's. Unknown on either side (a
+    // file from before the keys, a 0 from a missing inbound state) decides
+    // nothing.
+    bool FileNamesAnotherPair(std::optional<long> fileUc, std::optional<long> fileUs, std::uint32_t saUc, std::uint32_t saUs) {
+        if (!fileUc || !fileUs || *fileUc <= 0 || *fileUs <= 0 || saUc == 0 || saUs == 0) return false;
+        return static_cast<std::uint32_t>(*fileUc) != saUc || static_cast<std::uint32_t>(*fileUs) != saUs;
+    }
+
     // Every local address holding an SA to the P-CSCF, once each, in kernel
     // order: where a registration made on another address of the link (the
     // kernel's temporary one, before 0.3.10 — ims ledger F18) still lives.
@@ -473,6 +489,37 @@ export namespace imsd::ipsec {
             if (std::ranges::find(locals, src) == locals.end()) locals.push_back(src);
         }
         return locals;
+    }
+
+    // The P-CSCF the kernel's SAs are to: the one address that a `dir out`
+    // policy of imsd's own with reqid 1 and one with reqid 2 both name
+    // (detail::OwnPolicy: transport mode, the fixed protected port as the
+    // selector's sport — reqid and mode alone are anyone's) — exactly the pair
+    // BuildSetupCommands installs. The state text cannot
+    // tell the two ends apart (the UE is a `dst` there too). A foreign policy
+    // beside the pair (a VPN's: tunnel mode, another destination, whatever
+    // its reqid) changes nothing; a lone policy is not a registration, and
+    // two addresses each carrying both reqids are not one pair to tell
+    // apart: nullopt then, and when there are none.
+    std::optional<std::string> SaPeer(std::string_view policyText) {
+        std::vector<std::string> r1;
+        std::vector<std::string> r2;
+        for (std::string_view b : detail::SrcBlocks(policyText)) {
+            if (b.find("dir out") == std::string_view::npos || !detail::OwnPolicy(b)) continue;
+            auto reqid = detail::ParseDec(detail::TokenAfter(b, "reqid "));
+            std::string_view dstTok = detail::TokenAfter(b, "dst ");
+            const std::string dst = imsd::util::CanonicalAddr(dstTok.substr(0, dstTok.find('/')));
+            if (dst.empty()) continue;
+            std::vector<std::string>& set = *reqid == 1 ? r1 : r2;
+            if (std::ranges::find(set, dst) == set.end()) set.push_back(dst);
+        }
+        std::optional<std::string> peer;
+        for (const std::string& d : r1) {
+            if (std::ranges::find(r2, d) == r2.end()) continue;
+            if (peer) return std::nullopt;
+            peer = d;
+        }
+        return peer;
     }
 
     // The `ip xfrm … delete` argv lists that take the entries two rules select
@@ -489,7 +536,8 @@ export namespace imsd::ipsec {
     // Everything else — a policy-based
     // VPN's tunnel entries, another transport-mode user's on other ports and
     // addresses — stays: the fresh registration's SA setup runs these before
-    // BuildSetupCommands' adds, and flushes nothing (§12). Residual: a
+    // BuildSetupCommands' adds, the dead pair's teardown (RemoveDeadPair,
+    // main.cpp) runs them alone, and neither flushes (§12). Residual: a
     // transport-mode policy with reqid 1 and the UE-side port 45061, or reqid
     // 2 and 45062, alone or paired, carries the fingerprint and goes with the
     // reqid-1/2 transport-mode ESP states in its direction, and a reqid-1/2

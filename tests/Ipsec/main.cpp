@@ -101,6 +101,44 @@ int main() {
         Check(SaLocals(State, "2001:db8::999").empty(), "SaLocals: no SA to that P-CSCF -> none");
     }
 
+    // ---- SaPeer: the P-CSCF the kernel's policies point at
+    {
+        auto peer = SaPeer(Policy);
+        Check(peer && *peer == "2001:db8::105", "SaPeer: the dir-out policies' dst with reqid 1 and 2 agreeing");
+        Check(!SaPeer("").has_value(), "SaPeer: no policies -> none");
+        // a VPN's: tunnel mode, reqid 1, another destination — alone, and beside our pair
+        constexpr std::string_view Vpn = "src 2001:db8::1/128 dst 2001:db8::2/128 \n\tdir out priority 0 \n\ttmpl src 2001:db8::1 dst 2001:db8::2\n\t\tproto esp reqid 1 mode tunnel\n";
+        constexpr std::string_view Vpn4 = "src 192.0.2.10/32 dst 0.0.0.0/0 \n\tdir out priority 383615 ptype main \n\ttmpl src 192.0.2.10 dst 192.0.2.1\n\t\tproto esp reqid 1 mode tunnel\n";
+        Check(!SaPeer(Vpn).has_value(), "SaPeer: a lone reqid-1 policy (a VPN's) is not ours");
+        auto beside = SaPeer(std::string(Policy) + std::string(Vpn));
+        Check(beside && *beside == "2001:db8::105", "SaPeer: our pair beside a VPN's reqid-1 tunnel policy -> ours");
+        auto beside4 = SaPeer(std::string(Vpn4) + std::string(Policy));
+        Check(beside4 && *beside4 == "2001:db8::105", "SaPeer: our pair beside an IPv4 VPN's policy to 0.0.0.0/0 -> ours");
+        // a transport policy to another address beside the pair: one address still carries both reqids
+        const std::string other2 = "src 2001:db8:1111:2222:3333:4444:5555:db43/128 dst 2001:db8::106/128 sport 1 dport 2 \n\tdir out priority 0 \n\ttmpl src 2001:db8:1111:2222:3333:4444:5555:db43 dst 2001:db8::106\n\t\tproto esp reqid 2 mode transport\n";
+        const std::string other1 = "src 2001:db8:1111:2222:3333:4444:5555:db43/128 dst 2001:db8::106/128 sport 3 dport 4 \n\tdir out priority 0 \n\ttmpl src 2001:db8:1111:2222:3333:4444:5555:db43 dst 2001:db8::106\n\t\tproto esp reqid 1 mode transport\n";
+        auto one = SaPeer(std::string(Policy) + other2);
+        Check(one && *one == "2001:db8::105", "SaPeer: a reqid-2 policy to another address beside the pair -> the pair's");
+        Check(SaPeer(std::string(Policy) + other2 + other1) == "2001:db8::105", "SaPeer: another transport-mode reqid 1 + 2 pair beside ours, on other ports -> ours (the protected ports are the fingerprint)");
+        Check(!SaPeer(other2 + other1).has_value(), "SaPeer: a transport-mode reqid 1 + 2 pair on other ports alone -> none (not imsd's)");
+        const std::string ours2 = "src 2001:db8:1111:2222:3333:4444:5555:db43/128 dst 2001:db8::106/128 sport 45062 dport 2 \n\tdir out priority 0 \n\ttmpl src 2001:db8:1111:2222:3333:4444:5555:db43 dst 2001:db8::106\n\t\tproto esp reqid 2 mode transport\n"
+                                 "src 2001:db8:1111:2222:3333:4444:5555:db43/128 dst 2001:db8::106/128 sport 45061 dport 4 \n\tdir out priority 0 \n\ttmpl src 2001:db8:1111:2222:3333:4444:5555:db43 dst 2001:db8::106\n\t\tproto esp reqid 1 mode transport\n";
+        Check(!SaPeer(std::string(Policy) + ours2).has_value(), "SaPeer: two addresses each carrying imsd's fingerprint -> none (not one pair to tell apart)");
+        // the fingerprint alone is not a pair: a reqid-1 policy without its reqid-2 partner, and two fingerprinted policies naming different addresses
+        const std::string lone1 = "src 2001:db8:1111:2222:3333:4444:5555:db43/128 dst 2001:db8::107/128 sport 45061 dport 4 \n\tdir out priority 0 \n\ttmpl src 2001:db8:1111:2222:3333:4444:5555:db43 dst 2001:db8::107\n\t\tproto esp reqid 1 mode transport\n";
+        const std::string apart2 = "src 2001:db8:1111:2222:3333:4444:5555:db43/128 dst 2001:db8::108/128 sport 45062 dport 2 \n\tdir out priority 0 \n\ttmpl src 2001:db8:1111:2222:3333:4444:5555:db43 dst 2001:db8::108\n\t\tproto esp reqid 2 mode transport\n";
+        Check(!SaPeer(lone1).has_value(), "SaPeer: a lone fingerprinted reqid-1 policy (no reqid-2 partner) -> none");
+        Check(!SaPeer(lone1 + apart2).has_value(), "SaPeer: a fingerprinted reqid-1 policy to one address and a fingerprinted reqid-2 policy to another -> none (not one pair)");
+        Check(SaPeer(std::string(Policy) + apart2) == "2001:db8::105", "SaPeer: a fingerprinted reqid-2 policy to another address beside our pair -> the pair's");
+        Check(!SaPeer(std::string(Vpn) + "src 2001:db8::1/128 dst 2001:db8::2/128 \n\tdir out priority 0 \n\ttmpl src 2001:db8::1 dst 2001:db8::2\n\t\tproto esp reqid 2 mode tunnel\n").has_value(), "SaPeer: a tunnel-mode reqid 1 + 2 pair (a VPN's two child SAs) -> none");
+        // transport mode is part of the fingerprint: a tunnel-mode reqid 1 + 2 pair carrying the protected ports is not ours
+        const std::string tunnelOut1 = "src 2001:db8:1111:2222:3333:4444:5555:db43/128 dst 2001:db8::109/128 sport 45061 dport 4 \n\tdir out priority 0 \n\ttmpl src 2001:db8:1111:2222:3333:4444:5555:db43 dst 2001:db8::109\n\t\tproto esp reqid 1 mode tunnel\n";
+        const std::string tunnelOut2 = "src 2001:db8:1111:2222:3333:4444:5555:db43/128 dst 2001:db8::109/128 sport 45062 dport 2 \n\tdir out priority 0 \n\ttmpl src 2001:db8:1111:2222:3333:4444:5555:db43 dst 2001:db8::109\n\t\tproto esp reqid 2 mode tunnel\n";
+        Check(!SaPeer(tunnelOut1 + tunnelOut2).has_value(), "SaPeer: a tunnel-mode reqid 1 + 2 pair carrying the protected ports -> none (transport mode is part of the fingerprint)");
+        Check(SaPeer(std::string(Policy) + tunnelOut1 + tunnelOut2) == "2001:db8::105", "SaPeer: the same beside our pair -> ours");
+        Check(SaPeer(State).has_value() == false, "SaPeer: state text (no dir out) -> none");
+    }
+
     // ---- OwnXfrmDeleteCommands: imsd's own entries out of the kernel by exact key; everything else stays
     {
         const std::string ue = "2001:db8:1111:2222:3333:4444:5555:db43";
@@ -285,6 +323,15 @@ int main() {
         kpn.securityServer = "ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=aes-cbc; spi-c=49889723; spi-s=49889722; port-c=33142; port-s=6000";
         auto k = ChooseResumeSecurityVerify(kpn.securityServer, kpn, "aes-cbc");
         Check(k.source == Source::Stored && k.value == kpn.securityServer && k.mechanisms == 1, "resume: KPN's one-entry list for its pair -> the list, one mechanism");
+    }
+    // ---- a state file another attempt left behind: the file's UE SPIs against the kernel pair's
+    {
+        Check(!FileNamesAnotherPair(0x0526f2c0L, 0x0526f2c1L, 0x0526f2c0, 0x0526f2c1), "file pair: the pair's own SPIs -> the file is this pair's");
+        Check(FileNamesAnotherPair(0x11111111L, 0x22222222L, 0x0526f2c0, 0x0526f2c1), "file pair: other SPIs -> another attempt's");
+        Check(FileNamesAnotherPair(0x0526f2c0L, 0x22222222L, 0x0526f2c0, 0x0526f2c1), "file pair: one SPI differs -> another attempt's");
+        Check(!FileNamesAnotherPair(std::nullopt, std::nullopt, 0x0526f2c0, 0x0526f2c1), "file pair: a file without the keys -> no verdict");
+        Check(!FileNamesAnotherPair(0x11111111L, 0x22222222L, 0, 0x0526f2c1), "file pair: a missing inbound state (0) -> no verdict");
+        Check(!FileNamesAnotherPair(0L, 0L, 0x0526f2c0, 0x0526f2c1), "file pair: zeros in the file -> no verdict");
     }
     // ---- selection rules and syntax corners
     {

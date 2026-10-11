@@ -39,7 +39,7 @@ PipeWire. The verified device/carrier combinations are in the README.
 | `interfaces/Imsd-Sip.cppm` | `imsd::sip` — SIP as a text layer plus TCP framing: header extraction, status codes, the granted lifetime, `ResponseOf` transaction matching. Not a full RFC 3261 parser, deliberately. |
 | `interfaces/Imsd-Sdp.cppm` | `imsd::sdp` — SDP offer/answer: the AMR-WB + AMR + telephone-event offer (optional IR.92 preconditions), the parser the media plane needs, `BuildAnswer` for the terminating side, the `CODECS` override. |
 | `interfaces/Imsd-Aka.cppm` | `imsd::aka` — USIM AKA glue: the AKAv1-MD5 digest (RFC 3310), IMPI/IMPU/realm from IMSI + MCC/MNC, parsers for `qmicli --uim-get-card-status` and `mmcli` output, the AUTHENTICATE APDU and its response. |
-| `interfaces/Imsd-Ipsec.cppm` | `imsd::ipsec` — the two ESP SA pairs (TS 33.203) as `ip xfrm` argv lists, the Security-Server mechanism selection, and the reader that reconstructs SPIs/ports from `ip xfrm state`/`policy` text for a warm resume, and (1.0.0) `OwnXfrmDeleteCommands`, the deletes by exact key of what two rules select — the policies carrying imsd's fingerprint and the reqid-1/2 transport-mode ESP states in their direction or on the UE's ims-PDN address, whoever installed them (§12). |
+| `interfaces/Imsd-Ipsec.cppm` | `imsd::ipsec` — the two ESP SA pairs (TS 33.203) as `ip xfrm` argv lists, the Security-Server mechanism selection, and the reader that reconstructs SPIs/ports from `ip xfrm state`/`policy` text for a warm resume, and (1.0.0) `SaPeer`, the P-CSCF the kernel's pair is to, read from the `dir out` policies that carry imsd's fingerprint, `OwnXfrmDeleteCommands`, the deletes by exact key of what two rules select — the policies carrying imsd's fingerprint and the reqid-1/2 transport-mode ESP states in their direction or on the UE's ims-PDN address, whoever installed them (§12), and `FileNamesAnotherPair`, whether a state file's `spi_uc`/`spi_us` name the kernel's pair (unknown on either side decides nothing). |
 | `interfaces/Imsd-Messages.cppm` | `imsd::msg` — every SIP request and response imsd sends, built from an explicit `Context` and per-request variables so the builders are pure functions; byte-pinned by `tests/Messages`. Also `IsEmergency`. |
 | `interfaces/Imsd-Engine.cppm` | `imsd::engine` — the decisions as pure reducers: `CallMachine` (one call's dialog, returning `Action`s for the shell) and `RegRecovery` (the registration recovery policy, §7.4). |
 | `interfaces/ImsdBus.cppm` | `imsd::bus` — the polkit gate in front of call control, shared by imsd and imsd-ofonod. GLib, so outside `imsd-core`. |
@@ -73,7 +73,9 @@ in every source but the re-exporting `Imsd.cppm`, clang + libc++ + lld.
 The rule behind the split: **`imsd-core` stays GLib-free and free of I/O so
 that every decision in it has a unit test.** New protocol logic goes into a
 partition with a test. The shell (`main.cpp`) holds protocol decisions no
-test reaches — some older than 0.3.10, some added by 0.3.10, 0.3.11, 0.3.12 or 1.0.0: the reg-event
+test reaches — some older than 0.3.10, some added by 0.3.10, 0.3.11, 0.3.12 or 1.0.0: the P-CSCF in
+use (`pcscf_`: the kernel's SA peer at a resume, `PCSCF=` at a fresh
+registration, the move between them and back — §7.2); the reg-event
 subscription schedule (§7.4: its retry
 ladder, Retry-After clamp, Timer F, renewal point and RFC 6665 reasons); the
 registration sequence and its transactions (`AwaitFinal`/`AwaitInitialFinal`:
@@ -92,13 +94,17 @@ refusals and network silence, and the catch sites that sort a failed refresh
 (`FreshRecover`, `DeferBringUp`) into Refused, Silent or Throttled with the
 status, the Retry-After and `saReplaced_`, the bring-up resume's catch (a
 refusal's Retry-After fed as a hold, the old registration written off after
-any failed resume), the `OnLink` read that writes the old registration off
+a failed resume that a fresh registration follows — with no fresh target it
+is kept for the restart to resume, unless the engine's rule ends it — a 401, a refusal with a Retry-After, the
+second refusal across the restart (the count travels in the holds), a 403
+once fresh is due, a NOTIFY-terminated binding: the pair is taken out of the
+kernel like one nothing can resume), the `OnLink` read that writes the old registration off
 when its address has left the netdev (`FreshRecover` after a failed move,
 `AddressGone`), and `PacketServiceUp`'s read of
 ModemManager before a silent cycle is counted;
-and the xfrm deletes the SA setup runs — `OwnXfrmDeleteCommands` builds them
-from the kernel text, with a test; the shell reads that text and runs them
-(§12);
+and the xfrm deletes the SA setup and the dead pair's teardown run —
+`OwnXfrmDeleteCommands` builds them from the kernel text, with a test; the
+shell reads that text and runs them (§12);
 the shell's reaction to a NOTIFY
 terminating our binding (the flow closed at once, or kept under a call and
 closed when the call ends, a reconnect cycle's or the bring-up resume's wait
@@ -227,8 +233,14 @@ What the suites pin:
 - `Aka` — the AKAv1-MD5 digest, identity derivation, the `qmicli`/`mmcli`
   text parsers, the AUTHENTICATE APDU and its response parser.
 - `Ipsec` — the exact `ip xfrm` argv lists for the SA pairs, the
-  Security-Server mechanism selection, the SA reader, and
-  `OwnXfrmDeleteCommands` (our pair's eight deletes byte-exact on
+  Security-Server mechanism selection, the SA reader, the SA peer
+  (`SaPeer`: the one address a reqid-1 and a reqid-2 `dir out` transport
+  policy both name with imsd's protected port as the selector's sport — the
+  fingerprint —, the pair kept beside a VPN's policies;
+  a lone or disagreeing policy names no
+  peer), `FileNamesAnotherPair` (the pair's own SPIs, other SPIs, one
+  differing, no keys, a 0 from a missing inbound state, zeros in the file),
+  and `OwnXfrmDeleteCommands` (our pair's eight deletes byte-exact on
   the fixture in the registered FP6's shape (synthetic addresses and keys), a VPN's tunnel SA and policies beside it
   untouched, another transport-mode user's pair on other ports and addresses
   untouched — its reqid-1 ESP state on the UE's address deleted, its AH state
@@ -338,14 +350,32 @@ Rules:
   socket (a silent call) — a pin naming an account with one ran, 2026-10-04.
   `DetectLocal`'s three-tier address ranking for a run without `LOCAL`
   (§10.1) ran through a fake `ip` (2026-10-05: the phone's listing of the
-  netdev and two cut-down ones). The 1.0.0 arms no bench has reached: the SA
-  setup's deletes with another transport-mode user's pair in the kernel
-  (`tests/Ipsec` only — with a VPN's tunnel policy and tunnel state there,
-  left in place through a fresh registration, they ran on the dev phone,
-  2026-10-12); `RunOwnXfrmDeletes`' line for a delete that failed (`… -> rc
+  netdev and two cut-down ones). The 1.0.0 arms no bench has reached: a
+  fresh registration moving from the resumed SA peer to `PCSCF=` and back
+  when the attempt fails before the SA setup (`FreshRecover`); the fresh-target tail of a state file another attempt left behind (its no-target tail ran on the tip's host build, bench 23f, with a file naming another SA pair; the check itself, `FileNamesAnotherPair`, is pinned in `tests/Ipsec`; the window itself is not staged on the phone); another transport-mode reqid 1 + 2 pair beside ours on other ports, and two
+  addresses each carrying imsd's fingerprint (`tests/Ipsec` only — a VPN's
+  tunnel policy and a transport reqid-1 policy beside the live pair, resumed
+  and kept, and a lone one with
+  no pair of ours, none found, ran on the dev phone, 2026-10-11/12); the SA
+  setup's and the dead pair's deletes with another transport-mode user's pair
+  in the kernel (`tests/Ipsec` only — with a VPN's tunnel policy and tunnel
+  state there, both left in place through a fresh registration and a dead
+  pair's removal, they ran on the dev phone, 2026-10-12); a no-target resume
+  the network refuses (the reducer's side of the count's travel, `Held` →
+  `Restore`, is pinned in `tests/Engine`; the holds file's `refusals` key —
+  `PersistHolds`/`LoadHolds`, shell code — and the shell's giving the pair up
+  on the engine's verdict are unbenched); `FreshRecover`'s restart for want of
+  a fresh target (a resumed no-target registration whose recovery needs a
+  fresh one); an empty `Service-Route` value in the 200, ignored (KPN's 200
+  carries none); a no-target resume whose refresh goes
+  unanswered (the connect case ran on the tip's host build, bench 23f: the
+  pair kept for the restart, `the restart tries the resume again`); `RESUME=0` at a no-target start (BringUp's removal of the untried
+  pair); `RemoveDeadPair`'s
+  no-peer line (`N xfrm entries of imsd's own with no pair to resume:
+  removing them`); `RunOwnXfrmDeletes`' line for a delete that failed (`… -> rc
   N`: an entry gone between the read and the delete); the holds file's `pdn`
-  compare in canonical form (no capture stages a holds file whose `pdn` is
-  spelled unlike `LOCAL`).
+  compare in canonical form (no capture
+  stages a holds file whose `pdn` is spelled unlike `LOCAL`).
 - `imsd-media --selftest` round-trips the RFC 4867 payload packing (both
   formats, both AMR codecs) and the G.711 tables. `MIC_SRC=<file>` (raw s16
   PCM at the codec rate, paced in real time) and `PCM_DUMP=1` are test seams
@@ -438,7 +468,22 @@ a 5-minute registration gate, connect retries). `Restart=on-failure`,
 
 The daemon's own bring-up (`BringUp()` in `main.cpp`):
 
-1. `PCSCF` must be set (no P-CSCF discovery from the PDN's PCO yet).
+1. `PCSCF=` is where a fresh registration goes; a resume needs none — the
+   kernel's SAs name its P-CSCF (step 3). With none set, a bring-up that did
+   not resume fails with `no P-CSCF for a fresh registration: …`, and since
+   no fresh one follows: a resumable pair whose attempt failed (a silent
+   connect, an unanswered refresh, a first refusal without a Retry-After —
+   the refusal count goes to the holds) stays for the restart to resume, unless the engine's rule
+   ends it — a 401, a refusal with a Retry-After or the second refusal
+   (`RefusalsBeforeFresh`; the count travels in the holds, so the restart's
+   refusal is the second) give the resume up, a 403 once a fresh registration
+   is due or a binding a NOTIFY terminated under the attempt write the
+   registration off (`old_gone`) — so the pair counts as one nothing can
+   resume; a pair nothing can resume (its UE address left
+   the link, no state file, a file another attempt left behind, written off before this start or by the engine during the attempt, `RESUME=0`) is taken out of the kernel first (`the SA pair to …
+   is nothing to resume: removing it` — by exact key, what two rules select — the fingerprinted policies and the reqid-1/2 transport-mode ESP states in their direction or on the UE's ims-PDN address, §12), so the next bring-up finds nothing to resume; the holds
+   keep the Retry-After of a refusal and, for a registration the engine wrote
+   off, the write-off — a removed pair needs none.
 2. `qmicli -d qrtr://0 --uim-get-card-status` finds the ready USIM (slot, AID);
    `mmcli -m any` gives the primary SIM path and the IMEI (for the
    `+sip.instance` URN); `mmcli -i <sim>` gives IMSI and MCC/MNC, from which
@@ -449,8 +494,15 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    registration: reconnect through the existing SA and send a refresh
    re-REGISTER (`RESUME via existing SA`, then `REGISTERED (resumed +
    true-refreshed)`). This avoids the network's fresh-SA throttle. `RESUME=0`
-   forces a fresh registration. A resume the network refuses is not fatal: the
-   fresh registration replaces its SAs. The SA reader, the holds file's `pdn`
+   forces a fresh registration where there is a fresh target; with none the
+   untried pair is taken out and the bring-up ends as step 1 says. A resume the network refuses is not fatal while there is a fresh target:
+   the fresh registration follows and replaces its SAs — at once, or after
+   the hold the reducer keeps (a Retry-After the refusal carries, the one
+   refusal that reaches the reducer with a target; a binding a NOTIFY
+   terminated under the resume; a fresh hold kept from before this start);
+   with no target every refusal reaches the reducer,
+   §7.4; with none it is the fatal and the
+   restart (step 1). The SA reader, the holds file's `pdn`
    key, `LOCAL` and `PCSCF` compare addresses in RFC 5952 §4 form
    (`imsd::util::CanonicalAddr`: lower-case hex, leading zeros dropped, the
    longest zero run compressed — what `ip xfrm` prints for a plain IPv6
@@ -468,7 +520,22 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    it. Before 1.0.0 an upper-case, zero-padded or uncompressed `PCSCF=` was
    accepted and, compared as text against `ip xfrm`, matched no SA and
    registered fresh at every restart; an upgraded phone with such a setting
-   stops at bring-up with the spelling to use.
+   stops at bring-up with the spelling to use. A resume follows the kernel's SA peer (`SaPeer`), not
+   `PCSCF=`: a registration made to another P-CSCF than today's setting is
+   resumed there (`pcscf: resuming on …`) and moves at the next fresh
+   registration (`the fresh registration moves from P-CSCF X to Y`; an
+   attempt that fails before the SA setup goes back while the old registration
+   still stands — not written off by its address leaving the link, a NOTIFY
+   that terminated the binding or a 403 once a fresh registration was due:
+   `back to P-CSCF X: …`).
+   A state file written for another SA pair than the kernel's — its
+   `spi_uc`/`spi_us` against the pair's (`FileNamesAnotherPair`), a 0.3.x
+   file's too: an attempt that got through the SA setup and did not live to
+   record, to this or another P-CSCF — is not used; the
+   bring-up registers fresh (with no fresh target: the fatal, step 1). Every fresh registration goes to `PCSCF=`; with
+   none set, a bring-up that cannot resume fails with `no P-CSCF for a fresh
+   registration: …` and a recovery step that needs one restarts the daemon
+   through systemd.
 4. **Fresh registration** otherwise (`FRESH registration`): an unprotected
    REGISTER on `PCSCF_PORT` (UDP, always), the 401 with the AKA challenge and
    the `Security-Server` list, the AKA run over a UIM logical channel
@@ -492,13 +559,15 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    0.3.12, from one whose list `PersistState` wrote empty, or from one
    whose list names another SA pair than the kernel holds (an attempt the
    process did not live to record: its SAs installed, its 200 not
-   written), it sends —
+   written — since 1.0.0 such a file is not resumed at all when its own
+   `spi_uc`/`spi_us` are not the pair's, step 3), it sends —
    on the resume's re-REGISTER, the keepalive re-REGISTERs, the reg-event
    SUBSCRIBE and INVITEs, until its next fresh registration — the one
    entry rebuilt from the SA
    (`Imsd:Ipsec`, which makes the choice): KPN's one-entry answer to the
    default offer in the same bytes, not a list such as O2's six, which RFC 3329 §2.3.1 has the server answer with a
-   494 when it does not mirror its own; a refused resume registers fresh.
+   494 when it does not mirror its own; a refused resume registers fresh (with
+   no fresh target: the fatal and the restart, step 1).
    A 401 to a
    reregistration asks for re-authentication over temporary SAs on the
    proposed ports, which imsd does not implement: it is a refusal and the
@@ -507,7 +576,10 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    in-use SPIs) was refused with 503 (§13).
 
 The state file is JSON: `callid`, `ftag`, `cseq`, `spi_uc`, `spi_us`,
-`expiry`, `route`, `ppi`, `aor`, `contact_user`, `transport`, since 0.3.12
+`expiry`, `route`, `ppi`, `aor`, `contact_user`, `transport`, since 1.0.0
+`pcscf` (the P-CSCF the registration was made to; named in the line that
+reports a file another attempt left behind — the check is the SPIs',
+`FileNamesAnotherPair`), since 0.3.12
 `security_server` (the registration's Security-Verify: the 401's list,
 written empty when it holds a quote, a backslash or a newline; absent,
 empty or naming another SA pair than the kernel's — a file from before
@@ -575,7 +647,8 @@ configures the muxed netdev. Idempotent; a non-zero exit fails the unit.
   step took it); anything else on the IMS
   network (its DNS servers, a traceroute target) needs its own host route
   (`ip -6 route add <addr> dev qmapmux0.0`). imsd installs a host route per
-  media peer itself.
+  media peer itself, and one to the SA peer of a registration it resumes
+  when that differs from the fresh target (§7.2).
 - Opens imsd's protected ports 45061–45062 (TCP and UDP) on `qmapmux*` in
   nftables when a `inet filter` table exists (pmOS's default INPUT chain drops
   inbound on `qmapmux*`, which silently killed every network-initiated
@@ -611,12 +684,12 @@ The policy, with its constants:
 | Step | Rule |
 |---|---|
 | Reconnect | Through the existing SA, then refresh. Back-off 5 s → 5 min (`ReconnectDelayMin`/`Max`). |
-| Escalate to a fresh registration | After one refused refresh whose `Retry-After` is at least a second (the network's considered answer; a `Retry-After` of 0 or one that does not parse counts as none; O2 2026-10-08: the refresh refused 503 with Retry-After 414 s, the refresh after that wait 503 with Retry-After 772 s) or a 401 (re-authentication, which imsd answers with a fresh registration rather than over temporary SAs), after two refused refreshes without one (`RefusalsBeforeFresh`), or two reconnect cycles that end without an answer (`SilentCyclesBeforeFresh`) while the modem reports packet service (`PacketServiceUp`: ModemManager's registration and packet-service state, as `ims-pdn-up.sh` reads them). A cycle that fails during a coverage gap is the phone's silence, not the network's: not counted, retried on the local-refusal pace, so a radio gap across a refresh does not escalate into a fresh registration, which KPN refuses while the registration is live and drops it for (§13). New Call-ID, new challenge, new SA pair (`registering fresh (recovery attempt N)`). |
+| Escalate to a fresh registration | After one refused refresh whose `Retry-After` is at least a second (the network's considered answer; a `Retry-After` of 0 or one that does not parse counts as none; O2 2026-10-08: the refresh refused 503 with Retry-After 414 s, the refresh after that wait 503 with Retry-After 772 s) or a 401 (re-authentication, which imsd answers with a fresh registration rather than over temporary SAs), after two refused refreshes without one (`RefusalsBeforeFresh`), or two reconnect cycles that end without an answer (`SilentCyclesBeforeFresh`) while the modem reports packet service (`PacketServiceUp`: ModemManager's registration and packet-service state, as `ims-pdn-up.sh` reads them). A cycle that fails during a coverage gap is the phone's silence, not the network's: not counted, retried on the local-refusal pace, so a radio gap across a refresh does not escalate into a fresh registration, which KPN refuses while the registration is live and drops it for (§13). New Call-ID, new challenge, new SA pair (`registering fresh (recovery attempt N)`; with no fresh target the daemon restarts instead, §7.2 step 3). |
 | A refused or throttled fresh attempt | Waits on the **throttle schedule**: 21 min, growing ×1.5 to 60 (`ThrottleMinutesMin`/`Max`). KPN refuses a fresh SA pair on an address whose registration is live (§13), and drops that registration the moment an initial REGISTER arrives. |
 | A silent fresh attempt | Backs off 30 s → 10 min (`FreshDelayMin`/`Max`). |
 | `Retry-After` | Always wins over a shorter wait, honoured up to an hour (`RetryAfterMax`, the schedule's longest wait); a longer one is cut to an hour and the refusal heard again then. On a refused fresh attempt it replaces the schedule's wait, shorter or longer, never below 30 s (`FreshDelayMin`). |
 | A 403 | A refusal like the others: never hammered (the schedule), never abandoned (a SIM that is unbarred registers within the hour). |
-| The old registration is gone | A 403 once a fresh registration is due, a fresh attempt that got past the SA setup, a binding the network terminated (reg-event), an older address that left the netdev, or a bring-up whose resume failed: no reconnect over the old SA from then on. Otherwise the existing SA is still retried on the reconnect back-off while a fresh registration is deferred. |
+| The old registration is gone | A 403 once a fresh registration is due, a fresh attempt that got past the SA setup, a binding the network terminated (reg-event), an older address that left the netdev, or a bring-up whose resume failed while a fresh registration follows (with no fresh target a resumable pair whose attempt failed is kept for the restart; a pair nothing can resume — given up or written off by the engine, its address off the link, no state file, a file another attempt left behind, left untried by `RESUME=0` — is taken out of the kernel, §7.2 step 1): no reconnect over the old SA from then on. Otherwise the existing SA is still retried on the reconnect back-off while a fresh registration is deferred. |
 | A `Dial` while unregistered | Brings the next recovery step forward (the reconnect, or the fresh attempt once it is due) — never a wait the network imposed (a `Retry-After`, or the schedule after a refused or throttled fresh attempt). imsd-ofonod refuses a `Dial` then and imsd-dialerd lists no modem. |
 | Success | Resets everything. |
 
@@ -628,12 +701,23 @@ address), `boot` (the boot id), `written_at` (seconds of uptime), `hold`,
 registration is gone: a 403 once a fresh registration is due, an attempt past
 the SA setup, a binding the network terminated, an older address that left
 the netdev, and every bring-up that goes on to register fresh — its resume
-failed or there was nothing to resume) — and `LoadHolds` takes them
+failed or there was nothing to resume; a bring-up with no fresh target
+writes `old_gone` when the engine's rule writes the registration off — a
+403 once a fresh registration is due (one with a Retry-After, or the second
+refusal with the count restored from the holds), a binding a NOTIFY
+terminated under the attempt — and keeps one the holds already carried,
+§7.2 step 1); the reducer's refusal count travels too (`refusals`): a resume
+refused without a Retry-After at a start with no fresh target is one
+refusal, the restart's is the second and `RefusalsBeforeFresh` gives the
+resume up — without it the restart loop would re-REGISTER on the same
+Call-ID every `RestartSec`, the F16 shape — and
+`LoadHolds` takes them
 over at the next start for the same `pdn` and boot id, waiting them out
 before the resume (a refresh's `Retry-After`) or before the fresh
 registration (a fresh attempt's schedule or `Retry-After`, a terminated
 binding's wait); with `old_gone` set the start does not resume over the old SAs at
-all, it waits the fresh hold out and registers fresh — also after a start
+all: with a fresh target it waits the fresh hold out and registers fresh,
+with none it removes the pair and ends as §7.2 step 1 says — also after a start
 during an outage, whose resume and fresh attempt both fail without an answer:
 the next start then registers fresh while the network still holds the old
 registration, which KPN refuses (§13; dev phone 2026-10-04: 21 min where
@@ -663,8 +747,9 @@ for a reason that allows renewal (RFC 6665: `deactivated`, `timeout`,
 earlier subscription's NOTIFY is still read for the binding's state, but its
 end is not ours to renew (KPN closes a registration's previous subscription
 with `noresource` when a new one replaces it). A NOTIFY that **terminates the
-binding** triggers a fresh registration — at once, or after the network's
-`retry-after` (up to an hour); after the call, when one is up (one exception:
+binding** triggers a fresh registration where there is a fresh target (with
+none the daemon restarts instead, §7.2 step 3) — at once, or after the
+network's `retry-after` (up to an hour); after the call, when one is up (one exception:
 a REGISTER wait that still gets its 200 after such a NOTIFY, a call having
 kept the flow, leaves that registration standing). After
 `rejected` and `unregistered` it waits on the refusal schedule, a wait no
@@ -786,9 +871,9 @@ account `user`, its old default.
 
 | Path | Written by | Content |
 |---|---|---|
-| `/etc/imsd.env` | the admin | configuration (§10); `PCSCF=` is required. The apk adds a drop-in with `ConditionPathExists=/etc/imsd.env` (§9.2), so an unconfigured phone does not boot into a failing unit |
+| `/etc/imsd.env` | the admin | configuration (§10); `PCSCF=` is where a fresh registration goes — a resume needs none (§7.2 step 1). The apk adds a drop-in with `ConditionPathExists=/etc/imsd.env` (§9.2), so an unconfigured phone does not boot into a failing unit |
 | `/run/imsd.env` | `ims-pdn-up.sh` | `DEV=`, `LOCAL=` of the connected PDN |
-| `/run/imsd.holds` (`HOLDS_FILE`) | imsd, `imsd-handover.sh` | the network's holds and the schedule's place (§7.4) |
+| `/run/imsd.holds` (`HOLDS_FILE`) | imsd, `imsd-handover.sh` | the network's holds, the schedule's place and the reducer's refusal count (§7.4) |
 | `/run/imsd.handover` | `imsd.post-upgrade` | the InvocationID of the daemon an upgrade replaces, written when no holds file exists (§7.5); consumed by `imsd-handover.sh` |
 | `/run/imsd-ofonod.started` | `imsd-ofono-restart-calls.sh` | marker: imsd-ofonod has started once since boot |
 | `/var/lib/imsd/imsreg.state` (`STATE_FILE`) | imsd | the registration context for a warm resume |
@@ -817,6 +902,16 @@ Lines the operator (and the scripts) look for, all prefixed `imsd: `:
   until the next fresh attempt`, `X has left DEV: the registration on it is
   gone; staying on Y; next: …`, `X is no longer on DEV: the registration on
   it is gone; on the PDN's own address Y now; next: …`.
+- `pcscf: resuming on X, the registration's SA peer; the configured P-CSCF
+  is Y — the next fresh registration moves there` (or `… (no P-CSCF
+  configured)`), `the fresh registration moves from P-CSCF X to Y`, `back to
+  P-CSCF X: the old registration stands until the next fresh attempt`,
+  `no reg state file; resume falls back to fresh` and `the state file names
+  another SA pair (0x…/0x…[ to X]) than the kernel's (0x…/0x… to Y): another
+  attempt's; resume falls back to fresh` (` to X` only when the file records a
+  P-CSCF — a pre-1.0.0 file does not; with no fresh target both end in
+  `nothing can resume it: the pair is removed` instead), `no P-CSCF for a fresh
+  registration: none configured (PCSCF=)`.
 - `PCSCF='…' is not written as ip prints it; use PCSCF=…` (under `bring-up
   FAILED:`) — one accepted spelling of the setting (§7.2 step 3); the
   bring-up script's `ims-pdn-up: PCSCF '…': write the bare address, as ip
@@ -824,6 +919,27 @@ Lines the operator (and the scripts) look for, all prefixed `imsd: `:
   for a bracketed value.
 - `engine fatal: … — exiting for systemd restart`.
 - `reg-event SUBSCRIBE sent`, and the binding's state from NOTIFY.
+- `the SA pair to X is nothing to resume: removing it` — a bring-up with no
+  fresh target that found a pair nothing can resume (§7.2 step 1; `N xfrm
+  entries of imsd's own with no pair to resume: removing them` when the
+  removal finds entries of imsd's own but no pair `SaPeer` can name —
+  policy-less states on the UE's address, a lone or disagreeing fingerprinted
+  policy —, §12); a
+  resumable pair whose attempt failed is kept for the restart (`resume
+  failed: … — the restart tries the resume again`, `resume connect failed;
+  the restart tries the resume again`, `state file transport differs from
+  SIP_TRANSPORT; the restart tries the resume again` — the last at every
+  restart while the forced transport stands; with a fresh target each ends in
+  `the next registration is a fresh one`); a registration the engine's rule
+  wrote off — a 403 once a fresh registration is due, a binding a NOTIFY
+  terminated under the re-REGISTER wait — is removed instead (`resume failed:
+  … — written off by the network: the pair is removed`; with a fresh target
+  `… — written off by the network: the next registration is a fresh one`),
+  and so is a resume
+  the engine gives up with no fresh target — a 401, a refusal with a
+  Retry-After, the second refusal, the count travelling in the holds (`resume
+  failed: … — the resume is given up (the engine's rule): the pair is
+  removed`).
 - `audio session: …` at start and at each call's media start; `CODECS override active: …`.
 - A refused REGISTER or SUBSCRIBE is logged with its status line and
   any `Retry-After` / `Warning` / `Reason` / `Server` headers;
@@ -1102,9 +1218,9 @@ only the imsd side of its bus choice.
   ungated write member, and do not add a root translation daemon that
   forwards calls without gating its own callers through `imsd-bus`.
 - imsd deletes by exact key what two rules select, whoever installed it. A
-  fresh registration's SA setup deletes — `ip xfrm state delete src dst proto
-  esp spi`, `ip xfrm policy delete <selector> dir` — what two rules select
-  (`OwnXfrmDeleteCommands`): a transport-mode policy with reqid 1 or 2 whose
+  fresh registration's SA setup and the dead pair's teardown (`RemoveDeadPair`)
+  delete — `ip xfrm state delete src dst proto esp spi`, `ip xfrm policy
+  delete <selector> dir` — what two rules select (`OwnXfrmDeleteCommands`): a transport-mode policy with reqid 1 or 2 whose
   selector carries the protected port 45061/45062 on the UE side (imsd's
   fingerprint), and a transport-mode reqid-1/2 ESP state running from such a
   policy's source to its destination or anchored on the UE's ims-PDN address
@@ -1128,7 +1244,9 @@ only the imsd side of its bus choice.
   (`DUMP_SIP=0`), and never leave the phone in a commit.
 - The ims PDN is a walled garden: `ims-pdn-up.sh` keeps it from becoming
   the default route and gives the P-CSCF a host route; imsd adds one per
-  call for the media peer (§7.3). Nothing else is routed over it.
+  call for the media peer (§7.3) and, at a resume, one for the registration's
+  SA peer when that differs from the fresh target (§7.2: the script routed
+  only the configured address). Nothing else is routed over it.
   A change that routes anything else over it needs a reason and a bench.
 - The fixed protected ports (45061/45062) are opened in nftables for
   `qmapmux*` only, by the bring-up script.

@@ -103,8 +103,10 @@ export namespace imsd::engine {
     // due it also says the old registration is gone (KPN drops it the
     // moment an initial REGISTER arrives, throttled or not), as does a
     // fresh attempt that got past the SA setup, a binding the network
-    // terminated, and a resume that failed at bring-up (OldGone) — no
-    // reconnect over the old SA from then on. Every wait
+    // terminated, and a bring-up resume that failed while a fresh
+    // registration follows (OldGone; with no fresh target a resumable pair
+    // is kept for the restart, §7.2 step 1) — no reconnect over the old SA
+    // from then on. Every wait
     // is either the self-imposed backoff, which a user's Dial cuts short,
     // or the network's own word (a Retry-After, the schedule after a
     // refused or throttled fresh attempt, a terminated binding's probation
@@ -164,16 +166,18 @@ export namespace imsd::engine {
             double freshHold = 0;
             int throttleMinutes = ThrottleMinutesMin;
             bool oldGone = false;   // the old registration is gone: the next process has nothing to reconnect over
-            // a schedule that has advanced is kept too, until a success resets it, and so is the gone verdict
-            bool Any() const { return hold > 0 || freshHold > 0 || throttleMinutes > ThrottleMinutesMin || oldGone; }
+            int refusals = 0;       // refused reconnects counted so far (RefusalsBeforeFresh): a restart's refusal is the next one, not the first
+            // a schedule that has advanced is kept too, until a success resets it, and so are the gone verdict and the count
+            bool Any() const { return hold > 0 || freshHold > 0 || throttleMinutes > ThrottleMinutesMin || oldGone || refusals > 0; }
         };
-        Held Holds(double now) const { return {std::max(0.0, holdUntil - now), std::max(0.0, freshHoldUntil - now), throttleMinutes, oldGone}; }
+        Held Holds(double now) const { return {std::max(0.0, holdUntil - now), std::max(0.0, freshHoldUntil - now), throttleMinutes, oldGone, refusals}; }
         // A restarted process takes them over; nothing here shortens a
         // hold it already has, or lengthens one past RetryAfterMax.
         void Restore(double now, const Held& h) {
             if (h.hold > 0) holdUntil = std::max(holdUntil, now + std::min(h.hold, static_cast<double>(RetryAfterMax)));
             if (h.freshHold > 0) freshHoldUntil = std::max(freshHoldUntil, now + std::min(h.freshHold, static_cast<double>(RetryAfterMax)));
             throttleMinutes = std::clamp(std::max(throttleMinutes, h.throttleMinutes), ThrottleMinutesMin, ThrottleMinutesMax);
+            refusals = std::max(refusals, h.refusals);
             if (h.oldGone) OldGone();   // no reconnect over SAs the network has written off
         }
 
