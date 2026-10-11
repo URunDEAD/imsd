@@ -20,10 +20,11 @@ ExecStartPre=/usr/libexec/ims-pdn-up.sh
 ExecStartPre=-/usr/libexec/imsd-handover.sh
 TimeoutStartSec=900
 # /run/imsd.env: written by ims-pdn-up.sh (DEV= the connected ims netdev,
-# LOCAL= the PDN address ModemManager assigned to it).
-# /etc/imsd.env: admin configuration — PCSCF= is REQUIRED (the carrier's
-# P-CSCF address; see AGENTS.md §10, or the README) and wins over the
-# runtime-derived values.
+# LOCAL= the PDN address ModemManager assigned to it, PCSCF_DISCOVERED= the
+# P-CSCF list the network put in the PDN's PCO, read from the modem).
+# /etc/imsd.env: admin configuration, none required where discovery finds a
+# P-CSCF (AGENTS.md §10, the README); it wins over the runtime-derived values
+# — PCSCF= overrides discovery.
 EnvironmentFile=-/run/imsd.env
 EnvironmentFile=-/etc/imsd.env
 # registration state (imsreg.state) + media stats live here

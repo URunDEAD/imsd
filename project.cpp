@@ -91,9 +91,10 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
     //                      (org.ofono.*) bridging to imsd, for Phosh and
     //                      GNOME Mobile (GDBus translation plus the imsd-bus
     //                      polkit gate on its callers, no core).
-    //   pcscf            — imsd-pcscf, the P-CSCF reader for the bring-up: one
-    //                      QMI WDS client over a raw QRTR socket (pure std +
-    //                      POSIX, links the core for Imsd:Qmi, no GLib).
+    //   pcscf            — imsd-pcscf, the P-CSCF reader ims-pdn-up.sh runs
+    //                      once the ims PDN is up: one QMI WDS client over a
+    //                      raw QRTR socket (pure std + POSIX, links the core
+    //                      for Imsd:Qmi, no GLib).
     bool wantMedia = false;
     bool wantDialerd = false;
     bool wantOfonod = false;

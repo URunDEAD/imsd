@@ -1192,7 +1192,7 @@ private:
     // (FreshRecover), as local_ does against pdnLocal_.
     std::string pcscfTarget_;
     std::vector<std::string> pcscfCandidates_;
-    static constexpr std::string_view NoFreshPcscf = "no P-CSCF for a fresh registration: none configured (PCSCF=) and none discovered (PCSCF_DISCOVERED empty)";
+    static constexpr std::string_view NoFreshPcscf = "no P-CSCF for a fresh registration: none configured (PCSCF=) and none discovered (PCSCF_DISCOVERED empty — see the ims-pdn-up lines)";
     // The PDN's own address (LOCAL, else DetectLocal) — every fresh
     // registration's. local_ differs from it only while a resume runs on the
     // address an older registration was made on (TryResume).
@@ -1382,10 +1382,9 @@ private:
         local_ = pdnLocal_; ctx_.local = local_;
         KeepHolds();
         pcscf_ = pcscfTarget_;
-        // the target's host route is imsd's own: the bring-up script routes only
-        // the configured address (§7.2 step 3), not a target set in /etc/imsd.env
-        // as PCSCF_DISCOVERED= nor a route lost with the PDN — the same idempotent
-        // replace as a media peer's
+        // the target's host route is imsd's own: the bring-up script routes the
+        // first address of its own read, not a list set in /etc/imsd.env nor a
+        // route lost with the PDN — the same idempotent replace as a media peer's
         RunCmd({"ip", Is6(pcscf_) ? "-6" : "-4", "route", "replace", pcscf_, "dev", dev_});
         if (recovery_.Next(Boot()).at > Boot()) Log(std::format("the network's hold stands; {}", NextStep()));
         if (!WaitForPolicy()) throw Stopping{};

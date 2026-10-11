@@ -23,7 +23,10 @@ and GNOME Mobile — places and receives real VoLTE calls on a commercial
 network through it.
 
 It talks to the modem through ModemManager (`mmcli`) and `qmicli` over QRTR
-(the USIM AKA run goes through a UIM logical channel), installs its security
+(the USIM AKA run goes through a UIM logical channel) and, for the P-CSCF list
+the network put in the ims PDN's PCO, through its own QMI WDS client
+(`imsd-pcscf`, a raw QRTR socket bound to the bearer's mux data port — §13),
+installs its security
 associations with `ip xfrm`, and plays and records audio with the PipeWire
 tools (`pw-play`, `pw-record`). In practice that means a Qualcomm modem on a
 mainline kernel with working WWAN/ModemManager integration, kernel ESP, and
@@ -71,7 +74,7 @@ in every source but the re-exporting `Imsd.cppm`, clang + libc++ + lld.
 | `imsd-media` | executable | `implementations/media.cpp` | `-ldl -lpthread` | The RTP/AMR data plane, spawned once per call. No GLib, no core. A separate process for crash isolation and for the far-end-hangup exit-code contract (§7.6). `-- --product=media`. |
 | `imsd-dialerd` | executable | `implementations/dialerd.cpp` | gio-2.0 | Plasma Mobile integration: a session daemon owning `org.kde.telephony.{CallUtils,DeviceUtils,UssdUtils}`, bridging to imsd. GDBus translation only. A separate process because those are per-user session-bus names a root system daemon cannot own. `-- --product=dialerd`. |
 | `imsd-ofonod` | executable | `implementations/ofonod.cpp` | `imsd-bus`, gio-2.0 | GNOME Calls integration: a system daemon owning `org.ofono`, presenting imsd as an oFono modem. GDBus translation plus the polkit gate on its own callers. `-- --product=ofonod`. |
-| `imsd-pcscf` | executable | `implementations/pcscf.cpp` | `imsd-core` | The P-CSCF reader (standalone in this tree: nothing runs it yet): one QMI WDS client over a raw QRTR socket, bound to the bearer's mux data port, asking for the call's runtime settings. Prints the PCO's P-CSCF list; never sends Start Network or Stop Network (its writes are its own client's mux binding and IP family, §12), and the call stayed connected and the registration stood after it (§13). Built with `-- --product=pcscf`. |
+| `imsd-pcscf` | executable | `implementations/pcscf.cpp` | `imsd-core` | The P-CSCF reader `ims-pdn-up.sh` runs once the ims PDN is up (§7.3): one QMI WDS client over a raw QRTR socket, bound to the bearer's mux data port, asking for the call's runtime settings. Prints the PCO's P-CSCF list; never sends Start Network or Stop Network (its writes are its own client's mux binding and IP family, §12), and the call stayed connected and the registration stood after it (§13). Built with `-- --product=pcscf`. |
 
 The rule behind the split: **`imsd-core` stays GLib-free and free of I/O so
 that every decision in it has a unit test.** New protocol logic goes into a
@@ -255,8 +258,9 @@ What the suites pin:
   other addresses left).
 - `Qmi` — the request bytes `imsd-pcscf` sends (four of the five the probe's,
   byte for byte; Get Profile Settings is the helper's own, answered by the
-  modem on the dev phone in the probe capture's `--profile 2 -v` run — the
-  `profile-pcscf-via-pco` flag line),
+  modem on the dev phone in the probe capture's `--profile 2 -v` run and on the dev phone's bring-up
+  discoveries (the 2026-10-11/12 KPN bench), which pass `--profile` when the
+  ims profile index is known — the `profile-pcscf-via-pco` flag line),
   the parser on the modem's 163-byte Get Current Settings answer in its exact
   TLV shape (addresses re-encoded to `2001:db8::/32`), the OutOfCall answer,
   the IPv4/FQDN list readers on synthetic lists, the tolerance of a count
@@ -390,9 +394,16 @@ Rules:
   pair); `RemoveDeadPair`'s
   no-peer line (`N xfrm entries of imsd's own with no pair to resume:
   removing them`); `RunOwnXfrmDeletes`' line for a delete that failed (`… -> rc
-  N`: an entry gone between the read and the delete); the holds file's `pdn`
-  compare in canonical form (no capture
-  stages a holds file whose `pdn` is spelled unlike `LOCAL`).
+  N`: an entry gone between the read and the delete); the holds file's `pdn` compare in canonical form (no capture
+  stages a holds file whose `pdn` is spelled unlike `LOCAL`); the discovery
+  arms beyond the plain found one — the v4/FQDN `also gave` line, the
+  eight-address cap, the IPv4-only and no-mux-id skips, the comma-list
+  `PCSCF=` refusal, the reader's rc-0 answer without an address — on the mock
+  bench only (S13, S19–S22, S55): KPN's PCO carries
+  two IPv6 addresses and nothing else, so on the real PCO the dev phone
+  reached the found arm alone; the configured skip, the bracketed refusal
+  and, through the `IMSD_PCSCF` seam, the reader's failure and its exit 2 ran
+  on the dev phone too (2026-10-11/12).
 - `imsd-pcscf` ran on the dev phone (KPN) on 2026-10-11 against the live ims
   bearer: the `--mux 1 --profile 2 -v` sequence, a plain run, and `OutOfCall`
   on an unbound mux (the fp6 journal's `2026-10-11-pcscf-pco-probe` capture,
@@ -480,9 +491,12 @@ through `/etc/skel/.config/autostart/org.kde.modem.daemon.desktop`);
 
 `imsd.service` runs two `ExecStartPre=` steps before the daemon:
 
-1. `/usr/libexec/ims-pdn-up.sh` brings the `ims` PDN up through ModemManager
-   (§7.3) and writes `/run/imsd.env` with `DEV=` (the connected netdev) and
-   `LOCAL=` (the PDN address ModemManager assigned).
+1. `/usr/libexec/ims-pdn-up.sh` brings the `ims` PDN up through ModemManager,
+   reads the P-CSCF list the network put in the PDN's PCO (`imsd-pcscf`;
+   skipped when `PCSCF=` is set), gives the first a host route (§7.3) and
+   writes `/run/imsd.env` with `DEV=` (the connected netdev), `LOCAL=` (the
+   PDN address ModemManager assigned) and `PCSCF_DISCOVERED=` (the IPv6 addresses of that list, at most eight,
+   comma-separated in the modem's order; IPv4 entries and names dropped).
 2. `/usr/libexec/imsd-handover.sh` (`ExecStartPre=-`, failure-tolerant) hands
    a pre-0.3.10 daemon's throttle wait over (§7.5).
 
@@ -498,9 +512,8 @@ a 5-minute registration gate, connect retries). `Restart=on-failure`,
 The daemon's own bring-up (`BringUp()` in `main.cpp`):
 
 1. The P-CSCF a fresh registration goes to is `PCSCF=` when set, else the
-   first address of `PCSCF_DISCOVERED=` (a comma-separated IPv6 list read
-   from the environment; nothing in this tree writes it yet, so a bench sets
-   it by hand); the journal says which (`pcscf: configured …` / `pcscf:
+   first address of `PCSCF_DISCOVERED=` (the bring-up's reading of the PDN's
+   PCO, §7.3); the journal says which (`pcscf: configured …` / `pcscf:
    discovered … (using …)`). A resume needs neither: the kernel's SAs name
    its P-CSCF (step 3). With neither, a bring-up that did not resume fails
    with `no P-CSCF for a fresh registration: …`, and since no fresh one
@@ -672,30 +685,48 @@ configures the muxed netdev. Idempotent; a non-zero exit fails the unit.
   walled garden and hang). The RA's prefix and MTU still apply. An RA default
   route already present (an imsd restart) is flushed.
 - Sets the PDN MTU ModemManager reports on the link (1280 on the FP6), adds
-  the address, waits out DAD, and installs a host route to `PCSCF`
-  (`dev <netdev>`, no gateway — a raw-IP netdev without header_ops). The PDN
-  is IPv6-only, so `PCSCF` must be an IPv6 address in RFC 5952 §4 form (§7.2 step 3: what
-  `ip` prints for a plain IPv6 address; an IPv4-mapped address in hex only —
-  a bracketed value is refused here with that hint, an upper-case or
-  uncompressed one by the daemon with the spelling to use once the route
-  step took it); anything else on the IMS
-  network (its DNS servers, a traceroute target) needs its own host route
-  (`ip -6 route add <addr> dev qmapmux0.0`). imsd installs a host route
+  the address and waits out DAD.
+- Resolves the P-CSCF: `PCSCF` when set (one IPv6 address; it wins and
+  discovery is skipped — a list or a non-IPv6 value exits non-zero), else
+  `imsd-pcscf --mux <the netdev's rmnet mux_id> [--profile <index>]` reads
+  the list the network put in the PDN's PCO from the modem (§13; the mux id
+  from `ip -d link show <netdev>`), not for `IMS_IP_TYPE=ipv4`, which the bring-up does not support (it
+  configures only the PDN's IPv6 address). The usable
+  addresses — IPv6; IPv4 ones and names are logged and dropped — are handed
+  over (at most 8) and the first, the daemon's fresh target, gets a host route
+  (`dev <netdev>`, no gateway — a raw-IP netdev without header_ops); imsd
+  routes the P-CSCF it uses itself as well — the fresh target before a fresh
+  registration, the resumed SA peer once its SAs are confirmed (§7.2 steps 3 and
+  4) —, as each call's media peer is. Nothing usable is logged with
+  its cause (`nothing usable (…)`) and is not the script's failure: imsd
+  resumes a registration of its own when it can and stays up on it (a fresh
+  registration later restarts the daemon for want of a target); with nothing
+  to resume it says so and exits, and the unit's restart runs discovery
+  again. Anything else on
+  the IMS network (its DNS servers, a traceroute target) needs its own host
+  route (`ip -6 route add <addr> dev qmapmux0.0`). imsd installs a host route
   per media peer itself, and one to the P-CSCF it registers to or resumes on
   (§7.2 step 3).
 - Opens imsd's protected ports 45061–45062 (TCP and UDP) on `qmapmux*` in
   nftables when a `inet filter` table exists (pmOS's default INPUT chain drops
   inbound on `qmapmux*`, which silently killed every network-initiated
   request after ESP decapsulation). Best-effort.
-- Writes `/run/imsd.env`: `DEV=<netdev>`, `LOCAL=<PDN address>`. imsd
+- Writes `/run/imsd.env`: `DEV=<netdev>`, `LOCAL=<PDN address>`,
+  `PCSCF_DISCOVERED=<list>` (comma-separated in the modem's order; empty when
+  nothing was discovered or `PCSCF` is set), and logs the line it wrote. imsd
   registers on the address the network assigned, not on the kernel's
   temporary SLAAC address from the RA, which the netdev lists first and
   retires after about two days (the SAs and the Contact would go with it).
+  The script never reads `PCSCF_DISCOVERED` from its environment: the unit
+  hands it the previous run's file, and a stale discovered value must not
+  pass for the admin's `PCSCF=`.
 
 Its own settings (read from the environment, else from `/etc/imsd.env` for
 manual runs): `IMS_APN` (default `ims`), `IMS_IP_TYPE` (`ipv6`),
 `IMS_PROFILE_ID` (empty = look up; `none` = connect by APN string),
-`IMS_REG_TIMEOUT` (300), `PCSCF`.
+`IMS_REG_TIMEOUT` (300) and `PCSCF`; from the environment only, `IMSD_PCSCF`
+(the reader's path, default `/usr/libexec/imsd-pcscf` — the mock bench's
+seam).
 
 ### 7.4 Registration recovery (`RegRecovery`, `Imsd-Engine.cppm`)
 
@@ -905,8 +936,8 @@ account `user`, its old default.
 
 | Path | Written by | Content |
 |---|---|---|
-| `/etc/imsd.env` | the admin | configuration (§10); `PCSCF=` is where a fresh registration goes — a resume needs none (§7.2 step 1). The apk adds a drop-in with `ConditionPathExists=/etc/imsd.env` (§9.2), so an unconfigured phone does not boot into a failing unit |
-| `/run/imsd.env` | `ims-pdn-up.sh` | `DEV=`, `LOCAL=` of the connected PDN |
+| `/etc/imsd.env` | the admin | configuration (§10), none required where discovery finds a P-CSCF (§7.3): `PCSCF=` overrides what discovery found, and names the P-CSCF where discovery is skipped or finds none. The apk adds a drop-in with `ConditionPathExists=/etc/imsd.env` (§9.2), so a phone without the file does not start the unit |
+| `/run/imsd.env` | `ims-pdn-up.sh` | `DEV=`, `LOCAL=` of the connected PDN, `PCSCF_DISCOVERED=` the IPv6 addresses of the PCO's P-CSCF list in the modem's order, at most eight (IPv4 entries and names are dropped; empty when the PCO gave no IPv6 P-CSCF, when discovery did not run or failed, or when `PCSCF=` is set) |
 | `/run/imsd.holds` (`HOLDS_FILE`) | imsd, `imsd-handover.sh` | the network's holds, the schedule's place and the reducer's refusal count (§7.4) |
 | `/run/imsd.handover` | `imsd.post-upgrade` | the InvocationID of the daemon an upgrade replaces, written when no holds file exists (§7.5); consumed by `imsd-handover.sh` |
 | `/run/imsd-ofonod.started` | `imsd-ofono-restart-calls.sh` | marker: imsd-ofonod has started once since boot |
@@ -949,7 +980,7 @@ Lines the operator (and the scripts) look for, all prefixed `imsd: `:
   P-CSCF — a pre-1.0.0 file does not; with no fresh target both end in
   `nothing can resume it: the pair is removed` instead), `no P-CSCF for a
   fresh registration: none configured (PCSCF=) and none discovered
-  (PCSCF_DISCOVERED empty)`.
+  (PCSCF_DISCOVERED empty — see the ims-pdn-up lines)`.
 - `PCSCF='…' is not written as ip prints it; use PCSCF=…` (under `bring-up
   FAILED:`) — one accepted spelling of the setting (§7.2 step 3); the
   bring-up script's `ims-pdn-up: PCSCF '…': write the bare address, as ip
@@ -995,8 +1026,12 @@ Lines the operator (and the scripts) look for, all prefixed `imsd: `:
 - `connect: no answer from the P-CSCF N times (…)` when the protected
   connect series ends unanswered.
 
-From the scripts: `ims-pdn-up: …`, `imsd-handover: …`,
-`imsd-ofono-restart-calls: …`.
+From the scripts: `ims-pdn-up: …` — among them `P-CSCF discovered: a, b
+(pco-requested 1, profile-pcscf-via-pco 1)`, `P-CSCF discovery also gave v4 …
+(not usable on the IPv6-only ims PDN)`, `P-CSCF discovery: nothing usable
+(…)`, `P-CSCF X configured: discovery skipped`, `host route to P-CSCF X dev
+Y` (the configured address or the first discovered), `wrote /run/imsd.env: DEV=… LOCAL=… PCSCF_DISCOVERED=…` —,
+`imsd-handover: …`, `imsd-ofono-restart-calls: …`.
 
 ## 8. D-Bus ABI and desktop integration
 
@@ -1220,8 +1255,8 @@ there:
 
 ### 10.3 ims-pdn-up.sh and imsd-ofonod
 
-`IMS_APN`, `IMS_IP_TYPE`, `IMS_PROFILE_ID`, `IMS_REG_TIMEOUT` and `PCSCF` for
-the bring-up script (§7.3). `imsd-ofonod` reads `EMERGENCY_NUMBERS` (from
+`IMS_APN`, `IMS_IP_TYPE`, `IMS_PROFILE_ID`, `IMS_REG_TIMEOUT`, `PCSCF` and
+`IMSD_PCSCF` for the bring-up script (§7.3). `imsd-ofonod` reads `EMERGENCY_NUMBERS` (from
 `/etc/imsd.env` through its unit) and `IMSD_BUS=session|system` to override
 only the imsd side of its bus choice.
 
@@ -1293,15 +1328,17 @@ only the imsd side of its bus choice.
   Security-Server list. Dumps are mode 0600 under the state dir, off by default
   (`DUMP_SIP=0`), and never leave the phone in a commit.
 - The ims PDN is a walled garden: `ims-pdn-up.sh` keeps it from becoming
-  the default route and gives the P-CSCF a host route; imsd adds one per
-  call for the media peer (§7.3) and one for the P-CSCF it registers to or resumes on (§7.2 step 3; the
-  script routes only the configured address). Nothing else is routed over it.
+  the default route and gives the P-CSCF a host route — the configured one,
+  or the first IPv6 address the modem reports from the PCO (the fresh target; at most eight
+  are handed over, IPv4 entries and names dropped); imsd adds one per call for
+  the media peer (§7.3) and one for the P-CSCF it registers to or resumes on
+  (§7.2 step 3). Nothing else is routed over it.
   A change that routes anything else over it needs a reason and a bench.
 - The fixed protected ports (45061/45062) are opened in nftables for
   `qmapmux*` only, by the bring-up script.
 
-- **`imsd-pcscf` holds a QMI WDS client of its own on the modem** (nothing
-  in this tree runs it yet). It binds to the bearer's mux data port and reads
+- **`imsd-pcscf` holds a QMI WDS client of its own on the modem, as root,
+  from `ims-pdn-up.sh`.** It binds to the bearer's mux data port and reads
   the call's runtime settings; it never sends Start Network or Stop Network. Its only writes
   are its own client's mux binding and IP family; the call stayed connected
   and the registration stood after it (§13). One client socket, closed on

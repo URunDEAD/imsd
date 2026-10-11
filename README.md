@@ -18,7 +18,7 @@ Call-capable, both directions: outgoing calls place, answer, carry full-duplex
 AMR-WB audio and tear down. Incoming calls ring, answer and carry media the
 same way, driven end-to-end from a stock dialer over a frozen D-Bus ABI.
 Not there yet: DTMF (`SendDtmf` is a stub), hold/multiparty/call waiting,
-USSD, P-CSCF discovery (the address is configured by hand).
+USSD.
 
 Verified by community members to be fully working:
 
@@ -34,8 +34,7 @@ Verified by community members to be fully working:
 imsd talks to the modem through ModemManager plus `qmicli` over QRTR, installs
 its security associations with `ip xfrm` and plays audio through PipeWire, so
 in practice: a Qualcomm modem on a mainline kernel with working
-WWAN/ModemManager integration, kernel ESP, PipeWire, systemd, polkit and
-your carrier's P-CSCF address.
+WWAN/ModemManager integration, kernel ESP, PipeWire, systemd and polkit.
 
 ## Install and configure
 
@@ -49,17 +48,9 @@ Both can be found in the packages tab:
 https://forgejo.catcrafts.net/Catcrafts/-/packages/alpine/imsd
 ```
 
-Configuration is environment variables in `/etc/imsd.env`; the one setting a fresh registration
-needs is the P-CSCF:
-
-```sh
-# your carrier's P-CSCF address, capture via: `adb shell dumpsys telephony.registry` on Android
-PCSCF=2001:db8::105
-```
-
-The apk's `imsd.service` is enabled by preset and starts at boot once that
-file exists (the condition is checked when the unit starts, so after writing
-the file run `systemctl start imsd`). It first brings the `ims` PDN up through ModemManager, then registers:
+The apk's `imsd.service` is enabled by preset and starts at boot once
+`/etc/imsd.env` exists (`touch /etc/imsd.env` is enough; the condition is checked when
+the unit starts, so after creating the file run `systemctl start imsd`). It first brings the `ims` PDN up through ModemManager, then registers:
 resuming an existing registration when it can, registering fresh otherwise,
 and waiting out whatever the network tells it to wait out. Check on it with:
 
@@ -96,10 +87,13 @@ session and root may place, answer and end calls; an ssh login may not.
 
 ## Full config:
 
+Configuration is environment variables in `/etc/imsd.env`, none are required.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `PCSCF` | *(the first of `PCSCF_DISCOVERED`)* | P-CSCF address (IPv6), exactly one — not a comma-separated list — in RFC 5952 §4 form (lowercase, leading zeros dropped, the longest zero run compressed, no brackets — what `ip` prints for a plain IPv6 address; an IPv4-mapped address only as hex, `::ffff:a00:1` — the dotted spelling RFC 5952 §5 and `ip` use for it is refused); upper case, leading zeros, an uncompressed run or brackets are refused at start with the spelling to use (in the packaged unit the bring-up script refuses brackets first, with the rule), a dotted-quad tail with the rule; before 1.0.0 an upper-case, zero-padded or uncompressed `PCSCF=` matched no SA in `ip xfrm`'s text and registered fresh at every restart — an upgraded phone with such a setting stops at start with the spelling to use. Set, it wins over `PCSCF_DISCOVERED`. It is where a fresh registration goes; a registration resumed from the kernel's SAs stays on the P-CSCF it was made to until its next fresh registration. With neither this nor `PCSCF_DISCOVERED`, a fresh registration fails with a clear error |
-| `PCSCF_DISCOVERED` | *(empty)* | a comma-separated IPv6 P-CSCF list, the first of which is used when `PCSCF` is unset; entries `CanonicalIp6` does not read — an IPv4 address, a name, an IPv6 literal with a zone or a dotted-quad tail (an IPv4-mapped entry in hex only) — are logged and ignored. imsd reads it from its environment; nothing in this tree writes it yet (a bench sets it in `/etc/imsd.env`) |
+| `PCSCF_DISCOVERED` | *(from the PDN's PCO)* | the IPv6 P-CSCF list the network put in the ims PDN's PCO, comma-separated in the order the modem reports it; the first entry `CanonicalIp6` accepts is used when `PCSCF` is unset. The packaged service gets it via `/run/imsd.env` from `ims-pdn-up.sh`, which reads it from the modem with `imsd-pcscf` (at most eight; it routes the first; imsd routes the P-CSCF it uses — the fresh target, the resumed SA peer — itself as well); entries `CanonicalIp6` does not read — an IPv4 address, a name, an IPv6 literal with a zone or a dotted-quad tail (an IPv4-mapped entry in hex only) — are logged and ignored. In `/etc/imsd.env` it is a bench seam |
+| `IMSD_PCSCF` | `/usr/libexec/imsd-pcscf` | the P-CSCF reader `ims-pdn-up.sh` runs — a bench seam (the mock bench's fake reader; a stub through a unit drop-in on the dev phone), from the environment |
 | `PCSCF_PORT` | `5060` | unprotected SIP port for the initial REGISTER |
 | `DEV` | `qmapmux0.0` | ims-PDN netdev; the packaged service passes the real one via `/run/imsd.env` |
 | `LOCAL` | *(auto)* | UE address (compared in RFC 5952 form). The packaged service gets the PDN address ModemManager assigned, via `/run/imsd.env` from `ims-pdn-up.sh`; a manual run prefers a global IPv6 on `DEV` that is neither temporary nor `dynamic` (RA-derived), then any non-temporary one, then the first (the kernel's temporary SLAAC address is listed first, and a registration bound to it is lost when the kernel retires it) |

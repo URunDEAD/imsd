@@ -5,8 +5,11 @@
 #
 # Finds-or-creates the ims bearer via ModemManager, connects it, and
 # configures the muxed netdev with the MM-assigned address (the s34 recipe,
-# automated) and a host route to the P-CSCF — never a default route (F15
-# below). Idempotent — safe to run when the PDN is already up. Runs as
+# automated), reads the P-CSCF list the network put in the PDN's PCO from the
+# modem (imsd-pcscf) unless PCSCF= names one, and gives the configured or
+# the first discovered address (the daemon's fresh target) a host route —
+# never a default route (F15 below). Idempotent — safe to run when the PDN
+# is already up. Runs as
 # ExecStartPre of imsd.service, so imsd only starts once the PDN exists; a
 # nonzero exit fails the unit and systemd retries per Restart/RestartSec.
 #
@@ -22,8 +25,13 @@
 #                    (journal/ims 2026-09-16/17 bench: Odido, O2 UK, Swisscom).
 #   IMS_REG_TIMEOUT  max seconds to wait for network registration before
 #                    connect attempts start counting anyway (default 300)
-#   PCSCF            the P-CSCF address imsd registers with (its own
-#                    required setting); gets the host route over the ims PDN
+#   PCSCF            one P-CSCF address, by hand: it wins over discovery
+#                    (which is then skipped) and gets the host route; unset,
+#                    imsd-pcscf reads the PDN's PCO list from the modem and
+#                    this script hands it to imsd as PCSCF_DISCOVERED= in
+#                    /run/imsd.env, the first of them routed
+#   IMSD_PCSCF       the reader's path (default /usr/libexec/imsd-pcscf) — a
+#                    bench seam, from the environment only (not from the file)
 
 log() { echo "ims-pdn-up: $*"; }
 
@@ -291,31 +299,91 @@ log "$IFACE up, $ADDR/${PREFIX:-64}, ipv6 mtu $(cat "/proc/sys/net/ipv6/conf/$IF
 if [ -n "$(ip -6 route show default dev "$IFACE" 2>/dev/null)" ]; then
     ip -6 route flush default dev "$IFACE" && log "dropped the RA default route on $IFACE"
 fi
-# the P-CSCF is reachable through the ims PDN only: a host route stands in
-# for the default. `dev` without a gateway — a raw-IP netdev without
-# header_ops, so the kernel resolves no neighbours — the shape imsd uses
-# for media peers. The PDN is brought up IPv6-only (the address above), so
-# the P-CSCF must be an IPv6 address; anything else on the IMS network
-# (its DNS servers, a traceroute target) needs its own host route. Without
-# this route imsd cannot reach the P-CSCF, so a failure is the unit's
-# failure.
+# ---- the P-CSCF. PCSCF= when the admin set one (one IPv6 address; it wins
+# and discovery is skipped), else the list the network put in the PDN's PCO,
+# read from the modem by imsd-pcscf: a QMI WDS client bound to this netdev's
+# mux data port — the binding ModemManager gives its own clients, and only
+# such a client is shown the call's settings. The list goes to imsd as
+# PCSCF_DISCOVERED= (its own name: this script inherits the previous run's
+# /run/imsd.env through the unit, so a stale discovered value must never
+# pass for the admin's PCSCF=, and it is never read from the environment
+# here). The PDN is brought up IPv6-only, so only IPv6 addresses are usable;
+# IPv4 ones and names are logged and dropped. Nothing usable is not this
+# script's failure: imsd resumes a registration of its own when it can; with
+# nothing to resume it says so and exits, and the unit's restart runs
+# discovery again.
+# The P-CSCF is reachable through the ims PDN only: a host route stands in
+# for the default — `dev` without a gateway (a raw-IP netdev without
+# header_ops, so the kernel resolves no neighbours), the shape imsd uses for
+# media peers; of a discovered list the first address — the daemon's fresh
+# target — gets one here; imsd routes the P-CSCF it uses itself as well — the
+# fresh target before a fresh registration, the resumed SA peer once its SAs
+# are confirmed — with the same idempotent replace as a call's media peer, so
+# a target this script did not route (a list set in /etc/imsd.env, a route
+# lost with the PDN) is reachable.
+# Anything else on the IMS network (its DNS servers, a traceroute
+# target) needs its own host route. Without the route imsd cannot reach the
+# P-CSCF, so a route failure is the unit's failure.
+route_pcscf() {  # $1 = address
+    OUT=$(ip -6 route replace "$1/128" dev "$IFACE" 2>&1) ||
+        { log "host route to P-CSCF $1 failed: $(squash "$OUT")"; exit 1; }
+    log "host route to P-CSCF $1 dev $IFACE"
+}
 PCSCF=${PCSCF:-$(envval PCSCF)}
+DISCOVERED=
 case "$PCSCF" in
-    '')  log "PCSCF not configured: no P-CSCF host route (imsd needs PCSCF= in /etc/imsd.env)" ;;
+    '')
+        if [ "$IP_TYPE" = ipv4 ]; then
+            log "P-CSCF discovery: not for IMS_IP_TYPE=$IP_TYPE — the bring-up configures only the PDN's IPv6 address"
+        else
+            MUX=$(ip -d link show "$IFACE" 2>/dev/null | sed -n 's/.*rmnet mux_id \([0-9]*\).*/\1/p' | head -n1)
+            if [ -z "$MUX" ]; then
+                log "P-CSCF discovery: no rmnet mux id on $IFACE (ip -d link); set PCSCF="
+            else
+                OUT=$("${IMSD_PCSCF:-/usr/libexec/imsd-pcscf}" --mux "$MUX" ${PROFILE_ID:+--profile "$PROFILE_ID"} --timeout 10 2>&1); rc=$?
+                V6=; SHOWN=; OTHER=; FLAGS=; ERR=; n=0
+                while IFS= read -r line; do
+                    case "$line" in
+                        '') ;;
+                        v4\ *|fqdn\ *) OTHER="${OTHER:+$OTHER }$line" ;;
+                        flag\ *) FLAGS="${FLAGS:+$FLAGS, }${line#flag }" ;;
+                        *[!0-9a-f:]*) ERR="${ERR:+$ERR }$line" ;;
+                        *:*) [ "$n" -ge 8 ] && continue; n=$((n + 1))
+                             V6="${V6:+$V6 }$line"; DISCOVERED="${DISCOVERED:+$DISCOVERED,}$line"; SHOWN="${SHOWN:+$SHOWN, }$line" ;;
+                        *) ERR="${ERR:+$ERR }$line" ;;
+                    esac
+                done <<EOF
+$OUT
+EOF
+                if [ -n "$V6" ]; then
+                    log "P-CSCF discovered: $SHOWN${FLAGS:+ ($FLAGS)}"
+                    [ -n "$OTHER" ] && log "P-CSCF discovery also gave $OTHER (not usable on the IPv6-only ims PDN)"
+                    route_pcscf "${V6%% *}"   # the first: the daemon's fresh target; imsd routes the P-CSCF it uses itself as well (the fresh target, the resumed peer)
+                else
+                    case $rc in
+                        0) log "P-CSCF discovery: nothing usable (imsd-pcscf printed no address${ERR:+: $ERR})" ;;
+                        2) log "P-CSCF discovery: nothing usable (the PCO carried no IPv6 P-CSCF${OTHER:+; it gave $OTHER}${FLAGS:+; $FLAGS})" ;;
+                        *) log "P-CSCF discovery: nothing usable (imsd-pcscf rc $rc${ERR:+: $ERR})" ;;
+                    esac
+                fi
+            fi
+        fi ;;
+    *,*) log "PCSCF '$PCSCF' is a list; one address here (a list is PCSCF_DISCOVERED, the bring-up's)"; exit 1 ;;
     *\[*) log "PCSCF '$PCSCF': write the bare address, as ip prints it (no brackets)"; exit 1 ;;
-    *:*) OUT=$(ip -6 route replace "$PCSCF/128" dev "$IFACE" 2>&1) ||
-             { log "host route to P-CSCF $PCSCF failed: $(squash "$OUT")"; exit 1; }
-         log "host route to P-CSCF $PCSCF dev $IFACE" ;;
+    *:*) log "P-CSCF $PCSCF configured: discovery skipped"; route_pcscf "$PCSCF" ;;
     *)   log "PCSCF '$PCSCF' is not an IPv6 address; the ims PDN is brought up IPv6-only"; exit 1 ;;
 esac
 
-# ---- hand the connected ims netdev and the PDN's own address to imsd
-# (imsd.service reads /run/imsd.env): the daemon carries no baked-in
-# interface name and registers on the address the network assigned — not
-# on the kernel's temporary SLAAC address from the RA, which the netdev
-# lists first and which is deprecated after a day and removed after two
-# (ims ledger F18; the SAs and the Contact would go with it)
-printf 'DEV=%s\nLOCAL=%s\n' "$IFACE" "$ADDR" > /run/imsd.env
+# ---- hand the connected ims netdev, the PDN's own address and the
+# discovered P-CSCF list to imsd (imsd.service reads /run/imsd.env): the
+# daemon carries no baked-in interface name and registers on the address
+# the network assigned — not on the kernel's temporary SLAAC address from
+# the RA, which the netdev lists first and which is deprecated after a day
+# and removed after two (ims ledger F18; the SAs and the Contact would go
+# with it). PCSCF_DISCOVERED= is written on every run, empty when nothing
+# was discovered or PCSCF= is set.
+printf 'DEV=%s\nLOCAL=%s\nPCSCF_DISCOVERED=%s\n' "$IFACE" "$ADDR" "$DISCOVERED" > /run/imsd.env
+log "wrote /run/imsd.env: DEV=$IFACE LOCAL=$ADDR PCSCF_DISCOVERED=$DISCOVERED"
 
 # ---- open the IMS protected ports in the firewall (rung 5b root cause,
 # journal/ims.md s56): pmOS's default nftables INPUT chain is policy-drop and
