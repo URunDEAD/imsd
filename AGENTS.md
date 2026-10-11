@@ -35,7 +35,7 @@ PipeWire. The verified device/carrier combinations are in the README.
 |---|---|
 | `project.cpp` | The canonical build description, for [Crafter Build](https://forgejo.catcrafts.net/Catcrafts/Crafter.Build). Chooses the product by `--product=`. |
 | `interfaces/Imsd.cppm` | The primary module interface of `imsd-core`: `export import`s the seven partitions below. |
-| `interfaces/Imsd-Util.cppm` | `imsd::util` — SIP tokens, IPv6 host/port formatting, hex/base64, MD5 (RFC 1321), the fixed protected ports `PortUc`/`PortUs` (45061/45062). |
+| `interfaces/Imsd-Util.cppm` | `imsd::util` — SIP tokens, IPv6 host/port formatting, the RFC 5952 §4 IPv6 text (`CanonicalIp6`/`CanonicalAddr`; an IPv4-mapped address spelled in hex stays hex, where §5 and `inet_ntop` write it dotted) and the comma-separated address-list parser (`ParseAddressList`), hex/base64, MD5 (RFC 1321), the fixed protected ports `PortUc`/`PortUs` (45061/45062). |
 | `interfaces/Imsd-Sip.cppm` | `imsd::sip` — SIP as a text layer plus TCP framing: header extraction, status codes, the granted lifetime, `ResponseOf` transaction matching. Not a full RFC 3261 parser, deliberately. |
 | `interfaces/Imsd-Sdp.cppm` | `imsd::sdp` — SDP offer/answer: the AMR-WB + AMR + telephone-event offer (optional IR.92 preconditions), the parser the media plane needs, `BuildAnswer` for the terminating side, the `CODECS` override. |
 | `interfaces/Imsd-Aka.cppm` | `imsd::aka` — USIM AKA glue: the AKAv1-MD5 digest (RFC 3310), IMPI/IMPU/realm from IMSI + MCC/MNC, parsers for `qmicli --uim-get-card-status` and `mmcli` output, the AUTHENTICATE APDU and its response. |
@@ -215,7 +215,9 @@ commit of a range (§11), is the project's definition of green.
 
 What the suites pin:
 
-- `Util` — tokens, IPv6 detection and host/port formatting, hex/base64, MD5.
+- `Util` — tokens, IPv6 detection and host/port formatting, the RFC 5952 §4
+  form (the RFC's §4.1–4.2.3 examples, idempotence on `inet_ntop`-shaped
+  text, what is refused), the address-list parser, hex/base64, MD5.
 - `Aka` — the AKAv1-MD5 digest, identity derivation, the `qmicli`/`mmcli`
   text parsers, the AUTHENTICATE APDU and its response parser.
 - `Ipsec` — the exact `ip xfrm` argv lists for the SA pairs, the
