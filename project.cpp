@@ -77,7 +77,7 @@ static std::unique_ptr<Configuration> BusLibrary(std::span<const std::string_vie
 }
 
 extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> args) {
-    // Four executables come out of this repo; which one a build produces is
+    // Five executables come out of this repo; which one a build produces is
     // chosen by `--product=`:
     //   daemon (default) — imsd, the control-plane daemon (GDBus + engine),
     //                      and the unit tests, which link imsd-core.
@@ -91,13 +91,18 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
     //                      (org.ofono.*) bridging to imsd, for Phosh and
     //                      GNOME Mobile (GDBus translation plus the imsd-bus
     //                      polkit gate on its callers, no core).
+    //   pcscf            — imsd-pcscf, the P-CSCF reader for the bring-up: one
+    //                      QMI WDS client over a raw QRTR socket (pure std +
+    //                      POSIX, links the core for Imsd:Qmi, no GLib).
     bool wantMedia = false;
     bool wantDialerd = false;
     bool wantOfonod = false;
+    bool wantPcscf = false;
     for (std::string_view a : args) {
         if (a == "--product=media") wantMedia = true;
         if (a == "--product=dialerd") wantDialerd = true;
         if (a == "--product=ofonod") wantOfonod = true;
+        if (a == "--product=pcscf") wantPcscf = true;
     }
     if (wantOfonod) {
         Configuration ofonod;
@@ -161,11 +166,12 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
     ApplyStandardArgs(*Core, args);
     Core->type = ConfigurationType::LibraryStatic;
     {
-        std::array<fs::path, 8> ifaces = {
+        std::array<fs::path, 9> ifaces = {
             "interfaces/Imsd",
             "interfaces/Imsd-Util",
             "interfaces/Imsd-Aka",
             "interfaces/Imsd-Ipsec",
+            "interfaces/Imsd-Qmi",
             "interfaces/Imsd-Sip",
             "interfaces/Imsd-Sdp",
             "interfaces/Imsd-Messages",
@@ -173,6 +179,23 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
         };
         std::array<fs::path, 0> impls = {};
         Core->GetInterfacesAndImplementations(ifaces, impls);
+    }
+
+    if (wantPcscf) {
+        Configuration pcscf;
+        pcscf.path = "./";
+        pcscf.name = "imsd-pcscf";
+        pcscf.outputName = "imsd-pcscf";
+        ApplyStandardArgs(pcscf, args);
+        pcscf.type = ConfigurationType::Executable;
+        pcscf.dependencies = { Core.get() };
+        {
+            std::array<fs::path, 0> ifaces = {};
+            std::array<fs::path, 1> impls = { "implementations/pcscf" };
+            pcscf.GetInterfacesAndImplementations(ifaces, impls);
+        }
+        LintRules::AddRules(pcscf);
+        return pcscf;
     }
 
     // imsd — the daemon executable: GLib main loop + GDBus service
@@ -197,6 +220,7 @@ extern "C" Configuration CrafterBuildProject(std::span<const std::string_view> a
     cfg.AddTest("Util").Dependencies({ Core.get() });
     cfg.AddTest("Aka").Dependencies({ Core.get() });
     cfg.AddTest("Ipsec").Dependencies({ Core.get() });
+    cfg.AddTest("Qmi").Dependencies({ Core.get() });
     cfg.AddTest("Messages").Dependencies({ Core.get() });
     cfg.AddTest("Engine").Dependencies({ Core.get() });
     cfg.AddTest("Sip").Dependencies({ Core.get() });

@@ -34,7 +34,7 @@ PipeWire. The verified device/carrier combinations are in the README.
 | Path | What it is |
 |---|---|
 | `project.cpp` | The canonical build description, for [Crafter Build](https://forgejo.catcrafts.net/Catcrafts/Crafter.Build). Chooses the product by `--product=`. |
-| `interfaces/Imsd.cppm` | The primary module interface of `imsd-core`: `export import`s the seven partitions below. |
+| `interfaces/Imsd.cppm` | The primary module interface of `imsd-core`: `export import`s the eight partitions below. |
 | `interfaces/Imsd-Util.cppm` | `imsd::util` — SIP tokens, IPv6 host/port formatting, the RFC 5952 §4 IPv6 text (`CanonicalIp6`/`CanonicalAddr`; an IPv4-mapped address spelled in hex stays hex, where §5 and `inet_ntop` write it dotted) and the comma-separated address-list parser (`ParseAddressList`), hex/base64, MD5 (RFC 1321), the fixed protected ports `PortUc`/`PortUs` (45061/45062). |
 | `interfaces/Imsd-Sip.cppm` | `imsd::sip` — SIP as a text layer plus TCP framing: header extraction, status codes, the granted lifetime, `ResponseOf` transaction matching. Not a full RFC 3261 parser, deliberately. |
 | `interfaces/Imsd-Sdp.cppm` | `imsd::sdp` — SDP offer/answer: the AMR-WB + AMR + telephone-event offer (optional IR.92 preconditions), the parser the media plane needs, `BuildAnswer` for the terminating side, the `CODECS` override. |
@@ -42,12 +42,14 @@ PipeWire. The verified device/carrier combinations are in the README.
 | `interfaces/Imsd-Ipsec.cppm` | `imsd::ipsec` — the two ESP SA pairs (TS 33.203) as `ip xfrm` argv lists, the Security-Server mechanism selection, and the reader that reconstructs SPIs/ports from `ip xfrm state`/`policy` text for a warm resume, and (1.0.0) `SaPeer`, the P-CSCF the kernel's pair is to, read from the `dir out` policies that carry imsd's fingerprint, `OwnXfrmDeleteCommands`, the deletes by exact key of what two rules select — the policies carrying imsd's fingerprint and the reqid-1/2 transport-mode ESP states in their direction or on the UE's ims-PDN address, whoever installed them (§12), and `FileNamesAnotherPair`, whether a state file's `spi_uc`/`spi_us` name the kernel's pair (unknown on either side decides nothing). |
 | `interfaces/Imsd-Messages.cppm` | `imsd::msg` — every SIP request and response imsd sends, built from an explicit `Context` and per-request variables so the builders are pure functions; byte-pinned by `tests/Messages`. Also `IsEmergency`. |
 | `interfaces/Imsd-Engine.cppm` | `imsd::engine` — the decisions as pure reducers: `CallMachine` (one call's dialog, returning `Action`s for the shell) and `RegRecovery` (the registration recovery policy, §7.4). |
+| `interfaces/Imsd-Qmi.cppm` | `imsd::qmi` — the QMI WDS request bytes `imsd-pcscf` sends (Bind Mux Data Port, Set IP Family, Get Packet Service Status, Get Current Settings, Get Profile Settings), the message/TLV parser, the P-CSCF list readers (0x22 flag, 0x23 IPv4, 0x24 FQDN, 0x2E IPv6 — the last one libqmi does not model). |
 | `interfaces/ImsdBus.cppm` | `imsd::bus` — the polkit gate in front of call control, shared by imsd and imsd-ofonod. GLib, so outside `imsd-core`. |
 | `implementations/main.cpp` | The `imsd` daemon shell: GLib main loop, GDBus service, sockets, subprocesses, the registration sequence and the run loop that pumps the core. |
 | `implementations/media.cpp` | `imsd-media`, the per-call RTP leg. Pure std + POSIX, dlopen's the AMR codecs. |
+| `implementations/pcscf.cpp` | `imsd-pcscf`, the P-CSCF reader: the AF_QIPCRTR socket, the WDS service lookup and the Bind Mux Data Port / Set IP Family / Get Current Settings sequence around `Imsd:Qmi` (plus Get Profile Settings with `--profile`, Get Packet Service Status with `-v`). std + POSIX + the Linux QRTR UAPI (`<linux/qrtr.h>`), no GLib; never Start/Stop Network. |
 | `implementations/dialerd.cpp` | `imsd-dialerd`, the Plasma Mobile session-bus backend (`org.kde.telephony.*`). |
 | `implementations/ofonod.cpp` | `imsd-ofonod`, the GNOME Calls system-bus backend (`org.ofono`). |
-| `tests/<Suite>/main.cpp` | The seven unit-test suites: `Util`, `Aka`, `Ipsec`, `Messages`, `Engine`, `Sip`, `Sdp`. |
+| `tests/<Suite>/main.cpp` | The eight unit-test suites: `Util`, `Aka`, `Ipsec`, `Qmi`, `Messages`, `Engine`, `Sip`, `Sdp`. |
 | `packaging/` | systemd units, the bring-up and upgrade scripts, D-Bus and polkit policies, presets, the gschema override, `APKBUILD.binary` and the CI helpers (§9). |
 | `.forgejo/workflows/package.yml` | CI: builds the aarch64 apks on every push to `main` and publishes them to the Forgejo Alpine registry (§9.4). |
 | `bin/`, `build/` | crafter-build's outputs and intermediates. Ignored. |
@@ -58,21 +60,24 @@ the subscriber's IMSI/MSISDN and network addresses.
 
 ## 3. Build products
 
-Six products come out of the tree. C++26 modules throughout, `import std;`
+Seven products come out of the tree. C++26 modules throughout, `import std;`
 in every source but the re-exporting `Imsd.cppm`, clang + libc++ + lld.
 
 | Product | Kind | Built from | Links | Notes |
 |---|---|---|---|---|
-| `imsd-core` | static library | the `Imsd` module and its seven partitions | — | Pure `import std` C++, no GLib, no I/O side effects: every message, digest, SA command and call-state decision is here and unit-testable on any dev box without a bus, a modem or a phone. |
+| `imsd-core` | static library | the `Imsd` module and its eight partitions | — | Pure `import std` C++, no GLib, no I/O side effects: every message, digest, SA command and call-state decision is here and unit-testable on any dev box without a bus, a modem or a phone. |
 | `imsd` | executable | `implementations/main.cpp` | `imsd-core`, `imsd-bus`, gio-2.0, pthread | The daemon. Default product. |
 | `imsd-bus` | static library | `interfaces/ImsdBus.cppm` | gio-2.0 | The polkit gate (`net.catcrafts.IMS1.Voice`) imsd and imsd-ofonod both link. A translation daemon that runs as root on the system bus reaches imsd as root, which polkit always allows, so it gates its own callers through this or it is a bypass. |
 | `imsd-media` | executable | `implementations/media.cpp` | `-ldl -lpthread` | The RTP/AMR data plane, spawned once per call. No GLib, no core. A separate process for crash isolation and for the far-end-hangup exit-code contract (§7.6). `-- --product=media`. |
 | `imsd-dialerd` | executable | `implementations/dialerd.cpp` | gio-2.0 | Plasma Mobile integration: a session daemon owning `org.kde.telephony.{CallUtils,DeviceUtils,UssdUtils}`, bridging to imsd. GDBus translation only. A separate process because those are per-user session-bus names a root system daemon cannot own. `-- --product=dialerd`. |
 | `imsd-ofonod` | executable | `implementations/ofonod.cpp` | `imsd-bus`, gio-2.0 | GNOME Calls integration: a system daemon owning `org.ofono`, presenting imsd as an oFono modem. GDBus translation plus the polkit gate on its own callers. `-- --product=ofonod`. |
+| `imsd-pcscf` | executable | `implementations/pcscf.cpp` | `imsd-core` | The P-CSCF reader (standalone in this tree: nothing runs it yet): one QMI WDS client over a raw QRTR socket, bound to the bearer's mux data port, asking for the call's runtime settings. Prints the PCO's P-CSCF list; never sends Start Network or Stop Network (its writes are its own client's mux binding and IP family, §12), and the call stayed connected and the registration stood after it (§13). Built with `-- --product=pcscf`. |
 
 The rule behind the split: **`imsd-core` stays GLib-free and free of I/O so
 that every decision in it has a unit test.** New protocol logic goes into a
-partition with a test. The shell (`main.cpp`) holds protocol decisions no
+partition with a test. The shell (`main.cpp`; from 1.0.0 also `pcscf.cpp`'s
+QRTR control lookup and its matching of answers by type, transaction and
+message id) holds protocol decisions no
 test reaches — some older than 0.3.10, some added by 0.3.10, 0.3.11, 0.3.12 or 1.0.0: the P-CSCF in
 use (`pcscf_`: the kernel's SA peer at a resume, `PCSCF=` at a fresh
 registration, the move between them and back — §7.2); the reg-event
@@ -146,7 +151,8 @@ crafter-build                       # bin/imsd-<target>-<march>-<mtune>-<id>/ims
 crafter-build -- --product=media    # bin/imsd-media-…/imsd-media
 crafter-build -- --product=dialerd  # bin/imsd-dialerd-…/imsd-dialerd
 crafter-build -- --product=ofonod   # bin/imsd-ofonod-…/imsd-ofonod
-crafter-build test                  # the seven unit-test suites
+crafter-build -- --product=pcscf    # bin/imsd-pcscf-…/imsd-pcscf
+crafter-build test                  # the eight unit-test suites
 crafter-build lint                  # the house-style rules (§4.2, §6)
 ```
 
@@ -184,9 +190,9 @@ crafter-build format          # apply the transform rules in place
 
 Six rules read the AST (`naming`, `no-char-pointer`, `const-local`,
 `constexpr-constant`, `fixed-width-types`, `single-declaration`) and need the
-module PCMs: build the four programs and the tests first. With crafter-build
-2.1.0 they still do not run on 2 of the 18 files, `implementations/main.cpp`
-among them (`'type_traits' file not found`).
+module PCMs: build the five programs and the tests first. With crafter-build
+2.1.0 they still do not run on every file — `implementations/main.cpp` is
+among the misses (`'type_traits' file not found`).
 
 ### 4.3 Cross-compiling for a phone (aarch64 Alpine / postmarketOS)
 
@@ -202,7 +208,7 @@ crafter-build -- --target=aarch64-alpine-linux-musl \
 `make-sysroot.sh` needs no root, qemu or device: it downloads
 `apk-tools-static` and the Alpine keys and populates a minimal rootfs (musl,
 libc++ with its std module source, glib and their headers, compiler-rt,
-libunwind, gcc for its
+libunwind, linux-headers for `imsd-pcscf`'s `<linux/qrtr.h>`, gcc for its
 `crtbeginS.o`/libgcc, which clang's `*-alpine-linux-musl` driver links
 against). In a cross build `project.cpp` does not ask the host's pkg-config
 (it would answer for the wrong architecture); it adds `-I=/usr/include/glib-2.0`
@@ -218,11 +224,11 @@ releases. This is the flow CI runs (§9.4).
 
 ## 5. Tests
 
-`crafter-build test` runs the seven suites. Each suite
+`crafter-build test` runs the eight suites. Each suite
 is a plain `main()` with a `Check(bool, message)` counter: failures print
 `FAIL: …`, success prints `<Suite>: all tests passed`, and the exit status is
-the failure count for six suites — non-zero short of a multiple of 256 — and
-1 for `Engine`. `crafter-build test` ending in `7 passed`, on every
+the failure count for seven suites — non-zero short of a multiple of 256 — and
+1 for `Engine`. `crafter-build test` ending in `8 passed`, on every
 commit of a range (§11), is the project's definition of green.
 
 What the suites pin:
@@ -246,6 +252,16 @@ What the suites pin:
   untouched — its reqid-1 ESP state on the UE's address deleted, its AH state
   left —, a policy-less state on the UE's address deleted, one between
   other addresses left).
+- `Qmi` — the request bytes `imsd-pcscf` sends (four of the five the probe's,
+  byte for byte; Get Profile Settings is the helper's own, answered by the
+  modem on the dev phone in the probe capture's `--profile 2 -v` run — the
+  `profile-pcscf-via-pco` flag line),
+  the parser on the modem's 163-byte Get Current Settings answer in its exact
+  TLV shape (addresses re-encoded to `2001:db8::/32`), the OutOfCall answer,
+  the IPv4/FQDN list readers on synthetic lists, the tolerance of a count
+  that disagrees with a length, short and overrunning buffers, the
+  packet-service-status and profile PCSCF-via-PCO readers (present and absent
+  TLVs) and the error names (OutOfCall, NoEffect, an unknown code as `?`).
 - `Messages` — every outgoing SIP message byte-for-byte, cross-generated from
   the Python reference stack imsd replaced.
 - `Sip` — the text layer's edge cases (empty header values, line anchoring,
@@ -376,6 +392,16 @@ Rules:
   N`: an entry gone between the read and the delete); the holds file's `pdn`
   compare in canonical form (no capture
   stages a holds file whose `pdn` is spelled unlike `LOCAL`).
+- `imsd-pcscf` ran on the dev phone (KPN) on 2026-10-11 against the live ims
+  bearer: the `--mux 1 --profile 2 -v` sequence, a plain run, and `OutOfCall`
+  on an unbound mux (the fp6 journal's `2026-10-11-pcscf-pco-probe` capture,
+  `04-…`). Not reached on hardware: exit 2 (a PCO without an IPv6 list), an
+  error answer to Bind Mux Data Port or Set IP Family, a lookup that finds no
+  WDS service, the answer timeout, skipped strays and indications, the
+  lookup's second send to a local node other than 1, and the `v4`/`fqdn`
+  output lines (`tests/Qmi` pins their parsing on synthetic TLVs only). The
+  QRTR control lookup and the matching of answers by type, transaction and
+  message id are shell code (`pcscf.cpp`) no test reaches.
 - `imsd-media --selftest` round-trips the RFC 4867 payload packing (both
   formats, both AMR codecs) and the G.711 tables. `MIC_SRC=<file>` (raw s16
   PCM at the codec rate, paced in real time) and `PCM_DUMP=1` are test seams
@@ -394,11 +420,13 @@ suppress a rule where a file needs it; nearly every source file disables
 `fixed-width-types`.
 
 The tree was written under an earlier, project-local copy of the rules and
-does not pass the shared ones yet: `crafter-build lint` reports 72 findings
-(2026-10-06) — `naming` 44 (constants and statics are PascalCase here, the
-shared rule wants camelCase), `const-local` 10 (a rule the copy did not
-have), `single-declaration` 2 (not reported under the copy), `format-concat`
-13 and `wrap-join` 3 (as under the copy). CI does not run lint.
+does not pass the shared ones yet: `crafter-build lint` reports findings in
+most files — `naming` first (constants and statics are PascalCase here, the
+shared rule wants camelCase), then `format-concat`, `const-local`,
+`wrap-join`, `single-declaration` and `no-char-pointer` (`const-local` and
+`single-declaration` the copy did not report) — and the count moves (72 on
+2026-10-06, before the Qmi files; 108 in 16 of 20 files on the tree that
+added them, 2026-10-13). CI does not run lint.
 
 Beyond the rules:
 
@@ -1133,7 +1161,7 @@ Crafter.Build Flatpak (`net.catcrafts.CrafterBuild//stable` from
 flatpak.catcrafts.net — the branch Crafter.Build publishes from its release
 tags, where `beta` follows every push to its master; the build log names its
 commit) and llvm/abuild, builds
-the sysroot, cross-compiles the four products, runs the suite natively inside
+the sysroot, cross-compiles the five products, runs the suite natively inside
 the Flatpak, wraps the result with `APKBUILD.binary`, and the publish step
 uploads the apks to the Forgejo Alpine registry
 (`…/api/packages/Catcrafts/alpine/edge/fp6`) with `PACKAGE_TOKEN`. The
@@ -1198,7 +1226,7 @@ only the imsd side of its bus choice.
   not override the identity from the environment.
 - **One change, one commit; a fix goes into the commit that introduced the
   problem** while a range is unpublished (rebase), never as a follow-up on
-  top. Every commit of a range builds and passes the seven suites on its own.
+  top. Every commit of a range builds and passes the eight suites on its own.
 - **Keep `make-bin-tarball.sh`'s file list and `APKBUILD.binary`'s
   `package()` in sync** when a packaged file is added.
 - **The README and this file follow the code in the same commit.** A new
@@ -1250,6 +1278,13 @@ only the imsd side of its bus choice.
   A change that routes anything else over it needs a reason and a bench.
 - The fixed protected ports (45061/45062) are opened in nftables for
   `qmapmux*` only, by the bring-up script.
+
+- **`imsd-pcscf` holds a QMI WDS client of its own on the modem** (nothing
+  in this tree runs it yet). It binds to the bearer's mux data port and reads
+  the call's runtime settings; it never sends Start Network or Stop Network. Its only writes
+  are its own client's mux binding and IP family; the call stayed connected
+  and the registration stood after it (§13). One client socket, closed on
+  exit (the service lookup's own socket closes when the lookup ends).
 
 ## 13. Carrier and platform facts the code relies on
 
@@ -1306,3 +1341,17 @@ the related code.
   every name the receiver owns (the `org.ofono.conf` detail).
 - **The phone's wall clock reads 1970 until the first NTP sync**; anything
   that ages a journal line uses the monotonic or boot clock.
+- **A WDS client bound to the bearer's mux data port, with IP family 6 set,
+  reads the call's runtime settings; one that sent neither the binding nor Set IP Family got
+  `OutOfCall`.** ModemManager owns the ims
+  bearer's call and never asks the modem for the P-CSCF fields; a second
+  client that does Bind Mux Data Port (the netdev's `rmnet mux_id`, endpoint
+  embedded/1 for the `ipa` driver — ModemManager's own binding), Set IP
+  Family 6 and Get Current Settings gets them: TLV 0x22 = 1, the IPv6 list
+  in TLV 0x2E (two addresses on KPN), no IPv4 list, an empty FQDN list. Get Current Settings from a client that sent neither
+  Bind Mux Data Port nor Set IP Family answered `OutOfCall` (the control run),
+  as did a client bound to a mux with no call (`--mux 7`). The bearer stayed
+  connected and the registration stood afterwards (dev phone,
+  2026-10-11; the fp6 journal's `2026-10-11-pcscf-pco-probe` capture).
+  libqmi does not model 0x2E and qmicli cannot print any of it, hence
+  `imsd-pcscf`.

@@ -91,6 +91,7 @@ crafter-build -- $XTARGET
 crafter-build -- --product=media $XTARGET
 crafter-build -- --product=dialerd $XTARGET
 crafter-build -- --product=ofonod $XTARGET
+crafter-build -- --product=pcscf $XTARGET
 crafter-build test
 
 # --- bundle + package

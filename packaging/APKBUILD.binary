@@ -45,6 +45,7 @@ package() {
     cd "$srcdir/imsd-$pkgver"
     install -Dm755 imsd "$pkgdir"/usr/bin/imsd
     install -Dm755 imsd-media "$pkgdir"/usr/libexec/imsd-media
+    install -Dm755 imsd-pcscf "$pkgdir"/usr/libexec/imsd-pcscf
     install -Dm755 imsd-dialerd "$pkgdir"/usr/bin/imsd-dialerd
     install -Dm755 ims-pdn-up.sh "$pkgdir"/usr/libexec/ims-pdn-up.sh
     install -Dm755 imsd-handover.sh "$pkgdir"/usr/libexec/imsd-handover.sh

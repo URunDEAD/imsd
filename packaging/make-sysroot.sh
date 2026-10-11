@@ -4,7 +4,8 @@
 # make-sysroot.sh — build an Alpine aarch64 sysroot for cross-compiling imsd.
 #
 # Downloads apk-tools-static + the Alpine signing keys from the CDN and
-# populates a minimal rootfs (musl, libc++, glib and their headers) that
+# populates a minimal rootfs (musl, libc++, glib and their headers, the Linux
+# UAPI headers) that
 # clang can use via --sysroot. No root, no qemu, no device needed:
 #
 #   packaging/make-sysroot.sh [dir]        # default: ~/.cache/imsd/sysroot-aarch64-alpine
@@ -22,8 +23,10 @@ ARCH=aarch64
 # none): crafter-build compiles the sysroot's own copy first. --upgrade below
 # is for a run over an existing sysroot: added alone beside libc++ 22,
 # llvm-runtimes 23's source did not compile against its headers; upgraded
-# with it, it did.
-PKGS="musl-dev libc++ libc++-dev llvm-runtimes glib-dev compiler-rt llvm-libunwind-dev gcc"
+# with it, it did. linux-headers is in it for <linux/qrtr.h>, which
+# imsd-pcscf's QRTR socket needs (the sysroot had it only as another
+# package's dependency before).
+PKGS="musl-dev libc++ libc++-dev llvm-runtimes glib-dev compiler-rt llvm-libunwind-dev gcc linux-headers"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
