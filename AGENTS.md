@@ -103,14 +103,23 @@ refusals and network silence, and the catch sites that sort a failed refresh
 (`FreshRecover`, `DeferBringUp`) into Refused, Silent or Throttled with the
 status, the Retry-After and `saReplaced_`, the bring-up resume's catch (a
 refusal's Retry-After fed as a hold, the old registration written off after
-a failed resume that a fresh registration follows — with no fresh target it
-is kept for the restart to resume, unless the engine's rule ends it — a 401, a refusal with a Retry-After, the
-second refusal across the restart (the count travels in the holds), a 403
-once fresh is due, a NOTIFY-terminated binding: the pair is taken out of the
-kernel like one nothing can resume), the `OnLink` read that writes the old registration off
+a failed resume that a fresh registration follows; with no fresh target only
+a pair nothing can resume is written off — a 403 once fresh is due or a
+binding a NOTIFY terminated under the attempt counts as one by the engine's
+rule, and so does a resume it gives up: a 401, a refusal with a Retry-After,
+the second refusal, the count travelling in the holds (`Reconnectable()` and
+`Fresh()`, decided once after both catch arms) — and taken out of the kernel,
+§7.2 step 1), the `OnLink` read that writes the old registration off
 when its address has left the netdev (`FreshRecover` after a failed move,
 `AddressGone`), and `PacketServiceUp`'s read of
-ModemManager before a silent cycle is counted;
+ModemManager before a silent cycle is counted; the no-target reads and
+reactions (1.0.0): the kernel text behind `SaPeer`, the holds' `old_gone`
+and the script's `PCSCF_DISCOVERY=` — whether a pair is resumable (`SaPeer`
+finds one and the holds' `old_gone` does not write it off: `!peer ||
+writtenOff` in `main()`) and the choice of the idle or the fatal are shell
+code — at `main()`'s idle before the bus name (a pair the holds wrote off
+taken out of the kernel on the way) and at the no-target bring-up's write-off
+of a dead pair, its removal and the idle or the fatal that follows (§7.3);
 and the xfrm deletes the SA setup and the dead pair's teardown run —
 `OwnXfrmDeleteCommands` builds them from the kernel text, with a test; the
 shell reads that text and runs them (§12);
@@ -373,37 +382,52 @@ Rules:
   (§10.1) ran through a fake `ip` (2026-10-05: the phone's listing of the
   netdev and two cut-down ones). The 1.0.0 arms no bench has reached: a
   fresh registration moving from the resumed SA peer to `PCSCF=` and back
-  when the attempt fails before the SA setup (`FreshRecover`); the fresh-target tail of a state file another attempt left behind (its no-target tail ran on the tip's host build, bench 23f, with a file naming another SA pair; the check itself, `FileNamesAnotherPair`, is pinned in `tests/Ipsec`; the window itself is not staged on the phone); another transport-mode reqid 1 + 2 pair beside ours on other ports, and two
-  addresses each carrying imsd's fingerprint (`tests/Ipsec` only — a VPN's
-  tunnel policy and a transport reqid-1 policy beside the live pair, resumed
-  and kept, and a lone one with
+  when the attempt fails before the SA setup (`FreshRecover`); the
+  fresh-target tail of a state file another attempt left behind (its no-target
+  tail ran on the tip's host build, bench 23f, with a file naming another SA
+  pair; the check itself, `FileNamesAnotherPair`, is pinned in `tests/Ipsec`;
+  the window itself is not staged on the phone); another transport-mode reqid 1 + 2 pair
+  beside ours on other ports, and two addresses each carrying imsd's
+  fingerprint (`tests/Ipsec` only — a VPN's tunnel policy and a transport
+  reqid-1 policy beside the live pair, resumed and kept, and a lone one with
   no pair of ours, none found, ran on the dev phone, 2026-10-11/12); the SA
-  setup's and the dead pair's deletes with another transport-mode user's pair
-  in the kernel (`tests/Ipsec` only — with a VPN's tunnel policy and tunnel
-  state there, both left in place through a fresh registration and a dead
-  pair's removal, they ran on the dev phone, 2026-10-12); a no-target resume
-  the network refuses (the reducer's side of the count's travel, `Held` →
-  `Restore`, is pinned in `tests/Engine`; the holds file's `refusals` key —
-  `PersistHolds`/`LoadHolds`, shell code — and the shell's giving the pair up
-  on the engine's verdict are unbenched); `FreshRecover`'s restart for want of
-  a fresh target (a resumed no-target registration whose recovery needs a
-  fresh one); an empty `Service-Route` value in the 200, ignored (KPN's 200
-  carries none); a no-target resume whose refresh goes
-  unanswered (the connect case ran on the tip's host build, bench 23f: the
-  pair kept for the restart, `the restart tries the resume again`); `RESUME=0` at a no-target start (BringUp's removal of the untried
-  pair); `RemoveDeadPair`'s
-  no-peer line (`N xfrm entries of imsd's own with no pair to resume:
-  removing them`); `RunOwnXfrmDeletes`' line for a delete that failed (`… -> rc
-  N`: an entry gone between the read and the delete); the holds file's `pdn` compare in canonical form (no capture
-  stages a holds file whose `pdn` is spelled unlike `LOCAL`); the discovery
-  arms beyond the plain found one — the v4/FQDN `also gave` line, the
-  eight-address cap, the IPv4-only and no-mux-id skips, the comma-list
+  setup's and the dead pair's deletes with
+  another transport-mode user's pair in the kernel (`tests/Ipsec` only — with
+  a VPN's tunnel policy and tunnel state there, both left in place through a
+  fresh registration and a dead pair's removal, they ran on the dev phone,
+  2026-10-12); a no-target resume the network refuses (the reducer's side of
+  the count's travel, `Held` → `Restore`, is pinned in `tests/Engine`; the
+  holds file's `refusals` key — `PersistHolds`/`LoadHolds`, shell code — and
+  the shell's giving the pair up on the engine's verdict are unbenched);
+  `FreshRecover`'s restart for want of a fresh target (a resumed no-target
+  registration whose recovery needs a fresh one); an empty `Service-Route`
+  value in the 200, ignored (KPN's 200 carries none); a no-target resume
+  whose refresh goes unanswered (the connect case ran on the tip's host
+  build, bench 23f: the pair kept for the restart, `the restart tries the
+  resume again`); `RESUME=0` at a no-target start
+  (BringUp's removal of the untried pair — the same deletes ran before the
+  bus name on the host's kernel, a holds write-off in front of imsd's pair,
+  2026-10-13); `RemoveDeadPair`'s no-peer line (`N xfrm entries of imsd's own
+  with no pair to resume: removing them`); `RunOwnXfrmDeletes`'
+  line for a delete that failed (`… -> rc N`: an entry gone between the read
+  and the delete); the holds file's `pdn` compare in canonical form (no
+  capture stages a holds file whose `pdn` is spelled unlike `LOCAL`); the
+  discovery arms beyond the plain found one — the v4/FQDN `also gave` line,
+  the eight-address cap, the IPv4-only and no-mux-id skips, the comma-list
   `PCSCF=` refusal, the reader's rc-0 answer without an address — on the mock
-  bench only (S13, S19–S22, S55): KPN's PCO carries
-  two IPv6 addresses and nothing else, so on the real PCO the dev phone
-  reached the found arm alone; the configured skip, the bracketed refusal
-  and, through the `IMSD_PCSCF` seam, the reader's failure and its exit 2 ran
-  on the dev phone too (2026-10-11/12).
+  bench only (S13, S19–S22, S55): KPN's PCO carries two IPv6 addresses and nothing else, so on the
+  real PCO the dev phone reached the found arm alone; the configured skip, the
+  bracketed refusal and, through the `IMSD_PCSCF` seam, the reader's failure
+  and its exit 2 ran on the dev phone too (2026-10-11/12); the script's idle arms (no SIM, a refused ims PDN) with the
+  refusal count's reset by a coverage gap, a timeout and a transient cause,
+  the no-coverage and locked-SIM retries and the APN-string connect of a
+  modem without the profile, on the mock bench only (a SIM-out boot would
+  reach the no-SIM idle alone; the others need a SIM-in run against a refusing
+  network, an outage, a locked SIM, a modem without the profile) — the daemon's `idle:` exit for
+  the script's keys ran on the host build (2026-10-12, exit 0), its own idle
+  (nothing to register to), the discovery-failed exit 1, `main()`'s removal
+  of a pair the holds wrote off and `imsd-ofonod` starting without waiting
+  for imsd on the dev phone (2026-10-12).
 - `imsd-pcscf` ran on the dev phone (KPN) on 2026-10-11 against the live ims
   bearer: the `--mux 1 --profile 2 -v` sequence, a plain run, and `OutOfCall`
   on an unbound mux (the fp6 journal's `2026-10-11-pcscf-pco-probe` capture,
@@ -438,7 +462,10 @@ shared rule wants camelCase), then `format-concat`, `const-local`,
 `wrap-join`, `single-declaration` and `no-char-pointer` (`const-local` and
 `single-declaration` the copy did not report) — and the count moves (72 on
 2026-10-06, before the Qmi files; 108 in 16 of 20 files on the tree that
-added them, 2026-10-13). CI does not run lint.
+added them, 2026-10-13; 109 on the 1.0.0 tree, 2026-10-13: `naming` 69,
+`format-concat` 23, `const-local` 10, `wrap-join` 3, `single-declaration` 2,
+`no-char-pointer` 1 and `if-single-line` 1, the last new since). CI does not
+run lint.
 
 Beyond the rules:
 
@@ -495,8 +522,11 @@ through `/etc/skel/.config/autostart/org.kde.modem.daemon.desktop`);
    reads the P-CSCF list the network put in the PDN's PCO (`imsd-pcscf`;
    skipped when `PCSCF=` is set), gives the first a host route (§7.3) and
    writes `/run/imsd.env` with `DEV=` (the connected netdev), `LOCAL=` (the
-   PDN address ModemManager assigned) and `PCSCF_DISCOVERED=` (the IPv6 addresses of that list, at most eight,
-   comma-separated in the modem's order; IPv4 entries and names dropped).
+   PDN address ModemManager assigned), `PCSCF_DISCOVERED=` (the IPv6 addresses of
+   that list, at most eight, comma-separated in the modem's order; IPv4 entries
+   and names dropped) and `PCSCF_DISCOVERY=` (how it came to be:
+   found, none, failed or skipped, §7.3) — or `IMSD_IDLE=<reason>` alone when
+   the bring-up found nothing to do (§7.3).
 2. `/usr/libexec/imsd-handover.sh` (`ExecStartPre=-`, failure-tolerant) hands
    a pre-0.3.10 daemon's throttle wait over (§7.5).
 
@@ -515,20 +545,26 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    first address of `PCSCF_DISCOVERED=` (the bring-up's reading of the PDN's
    PCO, §7.3); the journal says which (`pcscf: configured …` / `pcscf:
    discovered … (using …)`). A resume needs neither: the kernel's SAs name
-   its P-CSCF (step 3). With neither, a bring-up that did not resume fails
-   with `no P-CSCF for a fresh registration: …`, and since no fresh one
-   follows: a resumable pair whose attempt failed (a silent
+   its P-CSCF (step 3). With neither, a bring-up that did not resume ends in
+   the fatal `no P-CSCF for a fresh registration: …` and the restart's retry
+   when the resume merely failed or the discovery did (`PCSCF_DISCOVERY=failed`,
+   §7.3), else in the clean `idle: no P-CSCF …` exit (§7.3) — and since no
+   fresh one follows, a resumable pair whose attempt failed (a silent
    connect, an unanswered refresh, a first refusal without a Retry-After —
-   the refusal count goes to the holds) stays for the restart to resume, unless the engine's rule
-   ends it — a 401, a refusal with a Retry-After or the second refusal
-   (`RefusalsBeforeFresh`; the count travels in the holds, so the restart's
-   refusal is the second) give the resume up, a 403 once a fresh registration
-   is due or a binding a NOTIFY terminated under the attempt write the
-   registration off (`old_gone`) — so the pair counts as one nothing can
-   resume; a pair nothing can resume (its UE address left the link, no state file, a file another attempt left behind, written off before this start or by the engine during the attempt, `RESUME=0`) is taken out of the kernel first (`the SA pair to …
-   is nothing to resume: removing it` — by exact key, what two rules select — the fingerprinted policies and the reqid-1/2 transport-mode ESP states in their direction or on the UE's ims-PDN address, §12), so the next bring-up finds nothing to resume; the holds
-   keep the Retry-After of a refusal and, for a registration the engine wrote
-   off, the write-off — a removed pair needs none.
+   the refusal count goes to the holds) is not written off and stays for the
+   restart to resume, unless the
+   engine's rule ends it: a 401, a refusal with a Retry-After or the second
+   refusal (`RefusalsBeforeFresh`; the count travels in the holds, so the
+   restart's refusal is the second) give the resume up, a 403 once a fresh
+   registration is due or a binding a NOTIFY terminated under the attempt
+   write the registration off — either way the pair counts as one nothing
+   can resume. A pair nothing can resume (its UE address left the link, no
+   state file, a file another attempt left behind, written off before this start or
+   given up by the engine during the attempt) is written off (`old_gone` in the holds — written as
+   well for a pair `RESUME=0` leaves untried) and taken
+   out of the kernel first (`the SA pair to … is nothing to resume: removing
+   it` — by exact key, what two rules select — the fingerprinted policies and the reqid-1/2 transport-mode ESP states in their direction or on the UE's ims-PDN address, §12), so the next bring-up
+   finds nothing to resume.
 2. `qmicli -d qrtr://0 --uim-get-card-status` finds the ready USIM (slot, AID);
    `mmcli -m any` gives the primary SIM path and the IMEI (for the
    `+sip.instance` URN); `mmcli -i <sim>` gives IMSI and MCC/MNC, from which
@@ -547,7 +583,7 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    terminated under the resume; a fresh hold kept from before this start);
    with no target every refusal reaches the reducer,
    §7.4; with none it is the fatal and the
-   restart (step 1). The SA reader, the holds file's `pdn`
+   restart, or the idle (step 1). The SA reader, the holds file's `pdn`
    key, `LOCAL` and `PCSCF` compare addresses in RFC 5952 §4 form
    (`imsd::util::CanonicalAddr`: lower-case hex, leading zeros dropped, the
    longest zero run compressed — what `ip xfrm` prints for a plain IPv6
@@ -578,10 +614,12 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    `spi_uc`/`spi_us` against the pair's (`FileNamesAnotherPair`), a 0.3.x
    file's too: an attempt that got through the SA setup and did not live to
    record, to this or another P-CSCF — is not used; the
-   bring-up registers fresh (with no fresh target: the fatal, step 1). Every fresh registration goes to `PCSCF=`, else the first
-   entry of `PCSCF_DISCOVERED=` that `CanonicalIp6` accepts; with neither, a bring-up that cannot resume fails
-   with `no P-CSCF for a fresh registration: …` and a recovery step that
-   needs one restarts the daemon through systemd.
+   bring-up registers fresh (with no fresh target: the fatal or the idle, step 1). Every fresh registration goes to `PCSCF=`, else the first
+   entry of `PCSCF_DISCOVERED=` that `CanonicalIp6` accepts; with neither, a bring-up that cannot resume ends as
+   step 1 says (the fatal after a resumable pair's failed attempt or a failed
+   discovery, else the clean `idle: no P-CSCF …` exit — a resume the engine
+   gave up or wrote off included) and a recovery step that needs one
+   restarts the daemon through systemd.
 4. **Fresh registration** otherwise (`FRESH registration`): the target's host
    route (imsd's own `ip -6 route replace`; step 3 says which target), an
    unprotected REGISTER on `PCSCF_PORT` (UDP, always), the 401 with the AKA challenge and
@@ -614,7 +652,7 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    (`Imsd:Ipsec`, which makes the choice): KPN's one-entry answer to the
    default offer in the same bytes, not a list such as O2's six, which RFC 3329 §2.3.1 has the server answer with a
    494 when it does not mirror its own; a refused resume registers fresh (with
-   no fresh target: the fatal and the restart, step 1).
+   no fresh target: the fatal and the restart, or the idle, step 1).
    A 401 to a
    reregistration asks for re-authentication over temporary SAs on the
    proposed ports, which imsd does not implement: it is a refusal and the
@@ -662,6 +700,59 @@ configures the muxed netdev. Idempotent; a non-zero exit fails the unit.
 - Waits up to 120 s for a modem, then gates the connect attempts on network
   registration (`IMS_REG_TIMEOUT`, default 300 s): some carriers attach ~2 min
   after boot.
+- Idles instead of retrying when there is nothing to do: a modem in the
+  `failed` state with a SIM reason (`sim-missing`, `esim-without-profiles`,
+  `sim-error`), checked once the modem appears and again while waiting for
+  registration, writes `IMSD_IDLE=no-sim` to `/run/imsd.env` and exits 0; a
+  profile-indexed connect series refused ten times in a row — each a
+  persistent 3GPP cause in ModemManager's typed error
+  (`ServiceOptionNotSubscribed`, `MissingOrUnknownApn`,
+  `OperatorDeterminedBarring`, `ServiceOptionNotAuthorizedInPlmn`,
+  `UserAuthenticationFailed`, `ServiceOptionNotSupported`, `Ipv4OnlyAllowed`,
+  `Ipv6OnlyAllowed`) with packet service at the time — writes
+  `IMSD_IDLE=no-ims-pdn` (the line carrying the last error). The script's own
+  rule, stricter than the daemon's `PacketServiceUp`: a refusal counts only
+  while the modem reads `registered`, `connecting` or `connected` with packet
+  service not `detached`; any other read (`searching`, `disconnecting`,
+  `unknown`, an unanswered `mmcli`), a D-Bus timeout, `esm-proc-timeout`, a
+  transient cause (`InsufficientResources`, `ServiceOptionOutOfOrder`,
+  `NetworkFailureActivation`) or any other error starts the count again, as a
+  coverage gap does — an outage must not idle VoLTE until the next boot. Installing the package and inserting a
+  SIM is the opt-in: `/etc/imsd.env` holds overrides only and its existence
+  changes nothing here (before 1.0.0 the apk's drop-in made it the switch for
+  the whole unit, §9.2). imsd reads the key, logs `idle: …` and exits 0;
+  `Restart=on-failure` leaves a clean exit alone, so the unit stays inactive
+  until the next boot, a `systemctl start imsd` or a start of `imsd-ofonod`,
+  whose `Wants=imsd.service` starts an idle imsd again (the Phosh image: an
+  `imsd-ofono` upgrade, its own restart after a crash) — one attempt per
+  boot, or per such start. What is not a fact keeps the retry: ten failures
+  without coverage — the network found only at the end or lost on the way —
+  exit 1 like a disabled radio, as do a SIM still waiting for its PIN (the
+  modem `locked`), a modem whose final profile list has no ims APN (the
+  APN-string connect is tried; a connected APN-string bearer — a run whose
+  lookup failed at boot — is reused and its registration resumed) and an
+  APN-string series, which a walled carrier's modem refuses locally.
+  The dead end after the PDN is up is the daemon's own, decided in `main()`
+  before it takes the bus name with the same clean exit: nothing to register
+  to — no `PCSCF=` and nothing discovered: `PCSCF_DISCOVERY=none` (no IPv6
+  P-CSCF read from the PCO — the reader's exit 2: the list absent, empty,
+  unreadable, or IPv4/FQDN entries only), `skipped` (a netdev without an rmnet
+  mux id) or no `PCSCF_DISCOVERY=` at all (a manual run) —
+  and no registration of its own to resume (`SaPeer` finds no pair, or the
+  holds for this PDN and boot say `old_gone`):
+  `idle: no P-CSCF — none configured (PCSCF=), none discovered (see the
+  ims-pdn-up lines) — and nothing to resume; set PCSCF= in /etc/imsd.env to
+  name one`; a pair the holds wrote off is taken out of the
+  kernel by exact key on the way (`the SA pair to … is nothing to resume:
+  removing it`, §12), so no start of this boot finds it. The no-target
+  bring-up decides the same after its resume attempt: a resumable pair whose attempt failed keeps the fatal
+  and the restart; a dead pair is written off, taken out of the kernel (§12)
+  and the daemon idles (`RequestIdle`). A reader that did not answer
+  (`PCSCF_DISCOVERY=failed`) is no fact: the daemon exits 1 instead — before
+  the bus name with `no P-CSCF: discovery failed … — exiting for systemd
+  restart`, from the no-target bring-up with `bring-up FAILED: no P-CSCF for a
+  fresh registration: …` and `engine fatal: … — exiting for systemd restart` —
+  and the unit's restart runs discovery again.
 - Never creates or connects a bearer while the modem is `disabled` — its
   radio is off (airplane mode): a modem still disabled after the wait, or
   disabled when an attempt is due, makes the script exit non-zero (`modem …
@@ -698,11 +789,18 @@ configures the muxed netdev. Idempotent; a non-zero exit fails the unit.
   routes the P-CSCF it uses itself as well — the fresh target before a fresh
   registration, the resumed SA peer once its SAs are confirmed (§7.2 steps 3 and
   4) —, as each call's media peer is. Nothing usable is logged with
-  its cause (`nothing usable (…)`) and is not the script's failure: imsd
-  resumes a registration of its own when it can and stays up on it (a fresh
-  registration later restarts the daemon for want of a target); with nothing
-  to resume it says so and exits, and the unit's restart runs discovery
-  again. Anything else on
+  its cause (`nothing usable (…)`), is not the script's failure, and is told
+  apart in the hand-off: `PCSCF_DISCOVERY=none` when the reader found no IPv6
+  P-CSCF in the PCO (its exit 2: the list absent, empty or unreadable —
+  `tests/Qmi` pins the tolerant read) — a fact of this PDN: a registration of imsd's own that
+  can be resumed is resumed and stays up (a fresh registration later restarts
+  the daemon for want of a target, and that start runs discovery again), a
+  bring-up that did not resume ends in the daemon's clean idle (`idle: no
+  P-CSCF …`, the idle rule above) or, after a resumable pair's failed
+  attempt, in the fatal and the restart; `PCSCF_DISCOVERY=failed` when the
+  reader did not answer (an error, a timeout, nothing printed) — no fact: a
+  daemon with nothing to resume exits 1 and the unit's restart runs
+  discovery again. Anything else on
   the IMS network (its DNS servers, a traceroute target) needs its own host
   route (`ip -6 route add <addr> dev qmapmux0.0`). imsd installs a host route
   per media peer itself, and one to the P-CSCF it registers to or resumes on
@@ -713,7 +811,10 @@ configures the muxed netdev. Idempotent; a non-zero exit fails the unit.
   request after ESP decapsulation). Best-effort.
 - Writes `/run/imsd.env`: `DEV=<netdev>`, `LOCAL=<PDN address>`,
   `PCSCF_DISCOVERED=<list>` (comma-separated in the modem's order; empty when
-  nothing was discovered or `PCSCF` is set), and logs the line it wrote. imsd
+  nothing was discovered or `PCSCF` is set) and `PCSCF_DISCOVERY=found|none|failed|skipped`
+  (how the list came to be: the PCO's answer, the reader's failure, or
+  discovery not run — `PCSCF=` set, `IMS_IP_TYPE=ipv4`, no rmnet mux id), and
+  logs the line it wrote. imsd
   registers on the address the network assigned, not on the kernel's
   temporary SLAAC address from the RA, which the netdev lists first and
   retires after about two days (the SAs and the Contact would go with it).
@@ -721,12 +822,13 @@ configures the muxed netdev. Idempotent; a non-zero exit fails the unit.
   hands it the previous run's file, and a stale discovered value must not
   pass for the admin's `PCSCF=`.
 
-Its own settings (read from the environment, else from `/etc/imsd.env` for
-manual runs): `IMS_APN` (default `ims`), `IMS_IP_TYPE` (`ipv6`),
-`IMS_PROFILE_ID` (empty = look up; `none` = connect by APN string),
-`IMS_REG_TIMEOUT` (300) and `PCSCF`; from the environment only, `IMSD_PCSCF`
-(the reader's path, default `/usr/libexec/imsd-pcscf` — the mock bench's
-seam).
+Its own settings (read from the environment, else from the file `IMSD_ENV`
+names, `/etc/imsd.env` by default, for manual runs): `IMS_APN` (default
+`ims`), `IMS_IP_TYPE` (`ipv6`), `IMS_PROFILE_ID` (empty = look up; `none` =
+connect by APN string), `IMS_REG_TIMEOUT` (300) and `PCSCF`; from the
+environment only, `IMSD_PCSCF` (the reader's path, default
+`/usr/libexec/imsd-pcscf` — the mock bench's seam) and `IMSD_ENV` (the
+configuration file's path — the bench's seam too).
 
 ### 7.4 Registration recovery (`RegRecovery`, `Imsd-Engine.cppm`)
 
@@ -754,7 +856,7 @@ The policy, with its constants:
 | A silent fresh attempt | Backs off 30 s → 10 min (`FreshDelayMin`/`Max`). |
 | `Retry-After` | Always wins over a shorter wait, honoured up to an hour (`RetryAfterMax`, the schedule's longest wait); a longer one is cut to an hour and the refusal heard again then. On a refused fresh attempt it replaces the schedule's wait, shorter or longer, never below 30 s (`FreshDelayMin`). |
 | A 403 | A refusal like the others: never hammered (the schedule), never abandoned (a SIM that is unbarred registers within the hour). |
-| The old registration is gone | A 403 once a fresh registration is due, a fresh attempt that got past the SA setup, a binding the network terminated (reg-event), an older address that left the netdev, or a bring-up whose resume failed while a fresh registration follows (with no fresh target a resumable pair whose attempt failed is kept for the restart; a pair nothing can resume — given up or written off by the engine, its address off the link, no state file, a file another attempt left behind, left untried by `RESUME=0` — is taken out of the kernel, §7.2 step 1): no reconnect over the old SA from then on. Otherwise the existing SA is still retried on the reconnect back-off while a fresh registration is deferred. |
+| The old registration is gone | A 403 once a fresh registration is due, a fresh attempt that got past the SA setup, a binding the network terminated (reg-event), an older address that left the netdev, or a bring-up whose resume failed while a fresh registration follows (with no fresh target a resumable pair whose attempt failed is kept for the restart; a pair nothing can resume — given up or written off by the engine, its address off the link, no state file, a file another attempt left behind, left untried by `RESUME=0` — is written off and taken out of the kernel, §7.2 step 1): no reconnect over the old SA from then on. Otherwise the existing SA is still retried on the reconnect back-off while a fresh registration is deferred. |
 | A `Dial` while unregistered | Brings the next recovery step forward (the reconnect, or the fresh attempt once it is due) — never a wait the network imposed (a `Retry-After`, or the schedule after a refused or throttled fresh attempt). imsd-ofonod refuses a `Dial` then and imsd-dialerd lists no modem. |
 | Success | Resets everything. |
 
@@ -767,10 +869,10 @@ registration is gone: a 403 once a fresh registration is due, an attempt past
 the SA setup, a binding the network terminated, an older address that left
 the netdev, and every bring-up that goes on to register fresh — its resume
 failed or there was nothing to resume; a bring-up with no fresh target
-writes `old_gone` when the engine's rule writes the registration off — a
-403 once a fresh registration is due (one with a Retry-After, or the second
-refusal with the count restored from the holds), a binding a NOTIFY
-terminated under the attempt — and keeps one the holds already carried,
+writes `old_gone` when nothing can be resumed — a pair nothing can resume: its UE
+address left the link, no state file, a file another attempt left behind, written
+off before this start, given up or written off by the engine during the
+attempt, left untried by `RESUME=0` — never for a pair kept for the restart,
 §7.2 step 1); the reducer's refusal count travels too (`refusals`): a resume
 refused without a Retry-After at a start with no fresh target is one
 refusal, the restart's is the second and `RefusalsBeforeFresh` gives the
@@ -812,9 +914,10 @@ for a reason that allows renewal (RFC 6665: `deactivated`, `timeout`,
 earlier subscription's NOTIFY is still read for the binding's state, but its
 end is not ours to renew (KPN closes a registration's previous subscription
 with `noresource` when a new one replaces it). A NOTIFY that **terminates the
-binding** triggers a fresh registration where there is a fresh target (with
-none the daemon restarts instead, §7.2 step 3) — at once, or after the
-network's `retry-after` (up to an hour); after the call, when one is up (one exception:
+binding** triggers a fresh registration where there is a fresh target (with none a
+running daemon restarts, and a bring-up whose resume the NOTIFY ended idles
+— exit 1 instead when `PCSCF_DISCOVERY=failed` — §7.2 steps 1 and 3) — at
+once, or after the network's `retry-after` (up to an hour); after the call, when one is up (one exception:
 a REGISTER wait that still gets its 200 after such a NOTIFY, a call having
 kept the flow, leaves that registration standing). After
 `rejected` and `unregistered` it waits on the refusal schedule, a wait no
@@ -842,7 +945,21 @@ or goes on waiting out a hold the network had set (§7.4) — or, with an
 upper-case, zero-padded or uncompressed `PCSCF=` (accepted until 0.3.12),
 stops at bring-up with the spelling to use (§7.2 step 3). A stopped unit
 keeps no marker and `enqueue-marked` leaves it stopped (dev phone, systemd
-262~rc3, 2026-10-03).
+262~rc3, 2026-10-03) — so a phone that never had `/etc/imsd.env` (the unit
+never started before 1.0.0) keeps its stopped unit through the upgrade and
+starts at its next boot, registering where §7.3's rule lets it — unless `imsd-ofonod`
+runs there (the Phosh image, `imsd-ofono`): the upgrade restarts that daemon,
+and its `Wants=imsd.service` starts imsd at once (`enqueue-marked` queues the
+marked unit's try-restart, systemd collapses it to a restart for a running
+unit, and a restart job pulls in a start job for each `Wants=` — systemd
+262~rc3, `job_type_collapse` and `transaction_add_job_and_dependencies`; dev
+phone 2026-10-11: a stopped imsd was started in the same second an
+`imsd-ofonod` restart began, two seconds after it had been stopped, and
+resumed) — without waiting for it:
+since 1.0.0 `imsd-ofonod.service` has no `After=imsd.service` (that restart
+would otherwise wait behind the ims PDN bring-up — the whole `ExecStartPre`, up to `TimeoutStartSec=900`), so GNOME
+Calls' backend starts at once and republishes when imsd's name appears (`OnImsdAppeared`; dev
+phone 2026-10-12, bench 30).
 
 A daemon older than 0.3.10 kept its bring-up throttle wait in memory only, so
 the restart registered fresh at once instead of waiting the schedule out.
@@ -936,8 +1053,8 @@ account `user`, its old default.
 
 | Path | Written by | Content |
 |---|---|---|
-| `/etc/imsd.env` | the admin | configuration (§10), none required where discovery finds a P-CSCF (§7.3): `PCSCF=` overrides what discovery found, and names the P-CSCF where discovery is skipped or finds none. The apk adds a drop-in with `ConditionPathExists=/etc/imsd.env` (§9.2), so a phone without the file does not start the unit |
-| `/run/imsd.env` | `ims-pdn-up.sh` | `DEV=`, `LOCAL=` of the connected PDN, `PCSCF_DISCOVERED=` the IPv6 addresses of the PCO's P-CSCF list in the modem's order, at most eight (IPv4 entries and names are dropped; empty when the PCO gave no IPv6 P-CSCF, when discovery did not run or failed, or when `PCSCF=` is set) |
+| `/etc/imsd.env` | the admin | configuration (§10), none required since 1.0.0 where discovery finds a P-CSCF (§7.3): `PCSCF=` overrides what discovery found, and names the P-CSCF where discovery is skipped or finds none; the file's existence changes nothing. Before 1.0.0 the apk's drop-in `ConditionPathExists=/etc/imsd.env` made it the switch for the whole unit (§9.2) |
+| `/run/imsd.env` | `ims-pdn-up.sh` | `DEV=`, `LOCAL=` of the connected PDN, `PCSCF_DISCOVERED=` the IPv6 addresses of the PCO's P-CSCF list in the modem's order, at most eight (IPv4 entries and names are dropped; empty when the PCO gave no IPv6 P-CSCF, when discovery did not run or failed, or when `PCSCF=` is set), `PCSCF_DISCOVERY=found|none|failed|skipped` (how the list came to be: the PCO's answer, the reader's failure, or discovery not run); or `IMSD_IDLE=no-sim` / `no-ims-pdn` alone when the bring-up found nothing to do (§7.3; the daemon decides the dead end after the PDN is up itself) |
 | `/run/imsd.holds` (`HOLDS_FILE`) | imsd, `imsd-handover.sh` | the network's holds, the schedule's place and the reducer's refusal count (§7.4) |
 | `/run/imsd.handover` | `imsd.post-upgrade` | the InvocationID of the daemon an upgrade replaces, written when no holds file exists (§7.5); consumed by `imsd-handover.sh` |
 | `/run/imsd-ofonod.started` | `imsd-ofono-restart-calls.sh` | marker: imsd-ofonod has started once since boot |
@@ -1026,11 +1143,26 @@ Lines the operator (and the scripts) look for, all prefixed `imsd: `:
 - `connect: no answer from the P-CSCF N times (…)` when the protected
   connect series ends unanswered.
 
-From the scripts: `ims-pdn-up: …` — among them `P-CSCF discovered: a, b
+- `idle: no SIM — nothing to do; systemctl start imsd when that changes`
+  (or `idle: no ims PDN from the network — …` from `IMSD_IDLE`; `idle: no
+  P-CSCF — none configured (PCSCF=), none discovered (see the ims-pdn-up
+  lines) — and nothing to resume; set PCSCF= in /etc/imsd.env to name one —
+  …` the daemon's own, before the bus name or
+  from the no-target bring-up), then exit 0; `no P-CSCF: discovery failed
+  (see the ims-pdn-up lines) and nothing to resume — exiting for systemd
+  restart`, exit 1, when the reader did not answer (`PCSCF_DISCOVERY=failed`).
+
+From the scripts: `ims-pdn-up: …` — among them `no SIM (sim-missing): not
+bringing the ims PDN up — systemctl start imsd once one is in`, `bearer
+connect refused 10 times in a row by profile index with packet service and a
+persistent cause (last: …): no ims PDN for this SIM here — systemctl start
+imsd to try again`, `wrote
+/run/imsd.env: IMSD_IDLE=…`, `P-CSCF discovered: a, b
 (pco-requested 1, profile-pcscf-via-pco 1)`, `P-CSCF discovery also gave v4 …
 (not usable on the IPv6-only ims PDN)`, `P-CSCF discovery: nothing usable
 (…)`, `P-CSCF X configured: discovery skipped`, `host route to P-CSCF X dev
-Y` (the configured address or the first discovered), `wrote /run/imsd.env: DEV=… LOCAL=… PCSCF_DISCOVERED=…` —,
+Y` (the configured address or the first discovered), `wrote
+/run/imsd.env: DEV=… LOCAL=… PCSCF_DISCOVERED=… PCSCF_DISCOVERY=…` —,
 `imsd-handover: …`, `imsd-ofono-restart-calls: …`.
 
 ## 8. D-Bus ABI and desktop integration
@@ -1176,11 +1308,31 @@ unit's sequencing is only tested under systemd.
 ### 9.2 What the package installs and enables
 
 `imsd.service` is enabled by preset (`80-imsd.preset`, plus the
-`multi-user.target.wants` link) and gated by a drop-in
-`ConditionPathExists=/etc/imsd.env`, so VoLTE survives reboots without a
-manual `systemctl enable` and an unconfigured phone does not boot into a
-failing unit. `imsd-ofonod.service` is enabled the same way by `imsd-ofono`.
-All of that is the apk's doing (`APKBUILD.binary`'s `package()`).
+`multi-user.target.wants` link), so VoLTE survives reboots without a manual
+`systemctl enable`. Since 1.0.0 there is no condition on `/etc/imsd.env`:
+the P-CSCF comes from the PDN's PCO, so the unit starts on every phone with
+the package — installing it and inserting a SIM is the opt-in; the file holds
+overrides only — and a phone with nothing to do (no SIM, no ims PDN from the
+network, no P-CSCF in the PCO and nothing to resume) exits cleanly and stays
+inactive (§7.3)
+rather than failing and restarting. `systemctl mask --now imsd` opts out: a
+plain `disable` removes only the [Install] links, and `imsd-ofonod`'s static
+`Wants=imsd.service` (the Phosh image) pulls a disabled imsd back in at every
+boot and at its every restart (dev phone 2026-10-11, the fp6 journal's
+`2026-10-11-0400-bench-kpn` capture: an `imsd-ofonod` restart started a
+stopped and, in the control run, a disabled imsd); the mask
+held through an `imsd-ofonod` restart and a reboot on the dev phone
+(2026-10-11). `systemctl unmask imsd` opts back in. `imsd-ofonod` does not
+wait for imsd (no `After=imsd.service` since 1.0.0, §7.5).
+Until 0.3.12 the apk shipped a drop-in `ConditionPathExists=/etc/imsd.env`;
+the upgrade removes it, and an upgraded phone that never had the file starts
+imsd at its next boot — or during the upgrade itself where `imsd-ofonod`
+runs (§7.5) — and registers where §7.3's rule lets it. `imsd-ofonod.service` is enabled the same way by
+`imsd-ofono`.
+The preset, the `multi-user.target.wants` link and the drop-in no longer
+shipped are the apk's doing (`APKBUILD.binary`'s `package()`); the idle, the
+`Wants=` pull-in and the opt-out are the bring-up script's and the daemon's,
+systemd's and the admin's.
 The main package hides kde-telephony's `modem-daemon` autostart for accounts
 created after it is installed (`/etc/skel/.config/autostart/org.kde.modem.daemon.desktop`)
 because `imsd-dialerd` owns those names.
@@ -1222,8 +1374,8 @@ bump commit titled `imsd X.Y.Z` that changes only the `Version` constant.
 
 Everything is environment variables. The packaged unit reads
 `/run/imsd.env` (from `ims-pdn-up.sh`) and then `/etc/imsd.env` (the user's,
-wins on conflict). The variables are user documentation: the tables and the
-minimum `/etc/imsd.env` are in the README.
+wins on conflict; optional since 1.0.0). The variables are user
+documentation: the tables are in the README.
 
 ### 10.1 imsd
 
@@ -1234,13 +1386,14 @@ requires updating the firewall rules `ims-pdn-up.sh` installs. `PCSCF` and
 and again by the engine): the first is one address in RFC 5952 form (§7.2 step 3: another spelling is
 refused at bring-up), and wins, the second a comma-separated IPv6 list whose
 first entry `CanonicalIp6` accepts is the fresh target otherwise (an IPv4
-address, a name, a literal with a zone or a dotted-quad tail is logged and
-skipped). A resume goes to the kernel's SA
+address, a name, a literal with a zone or a dotted-quad tail is skipped — logged by the
+engine when the daemon goes on to register, not by the idle before the bus
+name). A resume goes to the kernel's SA
 peer whatever they say (and routes it itself); beyond the resume's `pcscf:`
 line, having a fresh target decides what a refused or failed resume
 leads to — the fresh registration (a refusal without a Retry-After is not
-counted) or, with none, the pair kept for the restart or removed (§7.2
-step 1) — and a comma-separated `PCSCF=` stops the bring-up before the
+counted) or, with none, the pair kept for the restart, removed, or the idle
+(§7.2 step 1) — and a comma-separated `PCSCF=` stops the bring-up before the
 resume.
 
 ### 10.2 imsd-media (per call, set through imsd's environment)
@@ -1255,8 +1408,10 @@ there:
 
 ### 10.3 ims-pdn-up.sh and imsd-ofonod
 
-`IMS_APN`, `IMS_IP_TYPE`, `IMS_PROFILE_ID`, `IMS_REG_TIMEOUT`, `PCSCF` and
-`IMSD_PCSCF` for the bring-up script (§7.3). `imsd-ofonod` reads `EMERGENCY_NUMBERS` (from
+`IMS_APN`, `IMS_IP_TYPE`, `IMS_PROFILE_ID`, `IMS_REG_TIMEOUT`, `PCSCF`,
+`IMSD_PCSCF` and `IMSD_ENV` (the configuration file's path, a bench seam) for
+the bring-up script (§7.3); `IMSD_IDLE` and `PCSCF_DISCOVERY` are the
+script's word to the daemon, not settings. `imsd-ofonod` reads `EMERGENCY_NUMBERS` (from
 `/etc/imsd.env` through its unit) and `IMSD_BUS=session|system` to override
 only the imsd side of its bus choice.
 
@@ -1275,7 +1430,11 @@ only the imsd side of its bus choice.
   what a user can rely on the daemon for (0.3 added emergency calling), not
   with the size of a release; the major number moves when a release changes
   what an installed phone does without being asked, and it is not an ABI
-  change (§8.1: the ABI is frozen).
+  change (§8.1: the ABI is frozen). 1.0.0 is the first to move it: the unit
+  starts on every phone with the package, with no file to write, and
+  registers where `PCSCF=` names the P-CSCF or, on the FP6's `qmapmux0.0`
+  (KPN, the one device and network it ran on), where the reader gets the
+  PCO's IPv6 list.
 - **No AI attribution trailers.** Commits carry no `Assisted-by:`,
   `Co-Authored-By:` or similar lines, whoever or whatever drafted them.
 - **Signed commits.** Every commit is GPG-signed with the repository's

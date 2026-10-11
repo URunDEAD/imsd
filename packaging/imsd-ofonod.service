@@ -11,7 +11,9 @@ Documentation=https://forgejo.catcrafts.net/Catcrafts/imsd
 # — Plasma Mobile uses imsd-dialerd instead. Both may run at once (different
 # buses, different consumers), but a real ofonod must not.
 Conflicts=ofono.service
-After=imsd.service
+# Wants, not After: imsd starts on every phone since 1.0.0 and its start runs
+# the ims PDN bring-up (the whole ExecStartPre, up to TimeoutStartSec=900);
+# this backend starts at once and republishes when imsd's name appears (OnImsdAppeared)
 Wants=imsd.service
 
 [Service]

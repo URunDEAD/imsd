@@ -48,17 +48,6 @@ Both can be found in the packages tab:
 https://forgejo.catcrafts.net/Catcrafts/-/packages/alpine/imsd
 ```
 
-The apk's `imsd.service` is enabled by preset and starts at boot once
-`/etc/imsd.env` exists (`touch /etc/imsd.env` is enough; the condition is checked when
-the unit starts, so after creating the file run `systemctl start imsd`). It first brings the `ims` PDN up through ModemManager, then registers:
-resuming an existing registration when it can, registering fresh otherwise,
-and waiting out whatever the network tells it to wait out. Check on it with:
-
-```sh
-journalctl -u imsd -f
-busctl --system call net.catcrafts.IMS1 /net/catcrafts/IMS1 net.catcrafts.IMS1 GetStatus
-```
-
 ## Dialers
 
 imsd itself is desktop-agnostic: everything a dialer needs is on the system
@@ -91,8 +80,8 @@ Configuration is environment variables in `/etc/imsd.env`, none are required.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PCSCF` | *(the first of `PCSCF_DISCOVERED`)* | P-CSCF address (IPv6), exactly one — not a comma-separated list — in RFC 5952 §4 form (lowercase, leading zeros dropped, the longest zero run compressed, no brackets — what `ip` prints for a plain IPv6 address; an IPv4-mapped address only as hex, `::ffff:a00:1` — the dotted spelling RFC 5952 §5 and `ip` use for it is refused); upper case, leading zeros, an uncompressed run or brackets are refused at start with the spelling to use (in the packaged unit the bring-up script refuses brackets first, with the rule), a dotted-quad tail with the rule; before 1.0.0 an upper-case, zero-padded or uncompressed `PCSCF=` matched no SA in `ip xfrm`'s text and registered fresh at every restart — an upgraded phone with such a setting stops at start with the spelling to use. Set, it wins over `PCSCF_DISCOVERED`. It is where a fresh registration goes; a registration resumed from the kernel's SAs stays on the P-CSCF it was made to until its next fresh registration. With neither this nor `PCSCF_DISCOVERED`, a fresh registration fails with a clear error |
-| `PCSCF_DISCOVERED` | *(from the PDN's PCO)* | the IPv6 P-CSCF list the network put in the ims PDN's PCO, comma-separated in the order the modem reports it; the first entry `CanonicalIp6` accepts is used when `PCSCF` is unset. The packaged service gets it via `/run/imsd.env` from `ims-pdn-up.sh`, which reads it from the modem with `imsd-pcscf` (at most eight; it routes the first; imsd routes the P-CSCF it uses — the fresh target, the resumed SA peer — itself as well); entries `CanonicalIp6` does not read — an IPv4 address, a name, an IPv6 literal with a zone or a dotted-quad tail (an IPv4-mapped entry in hex only) — are logged and ignored. In `/etc/imsd.env` it is a bench seam |
+| `PCSCF` | *(the first of `PCSCF_DISCOVERED`)* | P-CSCF address (IPv6), exactly one — not a comma-separated list — in RFC 5952 §4 form (lowercase, leading zeros dropped, the longest zero run compressed, no brackets — what `ip` prints for a plain IPv6 address; an IPv4-mapped address only as hex, `::ffff:a00:1` — the dotted spelling RFC 5952 §5 and `ip` use for it is refused); upper case, leading zeros, an uncompressed run or brackets are refused at start with the spelling to use (in the packaged unit the bring-up script refuses brackets first, with the rule), a dotted-quad tail with the rule; before 1.0.0 an upper-case, zero-padded or uncompressed `PCSCF=` matched no SA in `ip xfrm`'s text and registered fresh at every restart — an upgraded phone with such a setting stops at start with the spelling to use. Set, it wins over `PCSCF_DISCOVERED`. It is where a fresh registration goes; a registration resumed from the kernel's SAs stays on the P-CSCF it was made to until its next fresh registration. With neither this nor `PCSCF_DISCOVERED` there is no fresh registration: a phone with nothing to resume idles (`idle: no P-CSCF …`), unless a resume failed with its pair still resumable, or the reader did not answer (`PCSCF_DISCOVERY=failed`): those exit non-zero for systemd's restart |
+| `PCSCF_DISCOVERED` | *(from the PDN's PCO)* | the IPv6 P-CSCF list the network put in the ims PDN's PCO, comma-separated in the order the modem reports it; the first entry `CanonicalIp6` accepts is used when `PCSCF` is unset. The packaged service gets it via `/run/imsd.env` from `ims-pdn-up.sh`, which reads it from the modem with `imsd-pcscf` (at most eight; it routes the first; imsd routes the P-CSCF it uses — the fresh target, the resumed SA peer — itself as well); entries `CanonicalIp6` does not read — an IPv4 address, a name, an IPv6 literal with a zone or a dotted-quad tail (an IPv4-mapped entry in hex only) — are ignored (logged by the engine when the daemon goes on to register); `PCSCF_DISCOVERY=found|none|failed|skipped` beside it says how the list came to be — `failed` (the reader did not answer) makes a daemon with nothing to resume exit 1 for the restart instead of idling. In `/etc/imsd.env` it is a bench seam |
 | `IMSD_PCSCF` | `/usr/libexec/imsd-pcscf` | the P-CSCF reader `ims-pdn-up.sh` runs — a bench seam (the mock bench's fake reader; a stub through a unit drop-in on the dev phone), from the environment |
 | `PCSCF_PORT` | `5060` | unprotected SIP port for the initial REGISTER |
 | `DEV` | `qmapmux0.0` | ims-PDN netdev; the packaged service passes the real one via `/run/imsd.env` |
@@ -111,6 +100,7 @@ Configuration is environment variables in `/etc/imsd.env`, none are required.
 | `DUMP_SIP` | `0` | `1` writes raw REGISTER-200/SUBSCRIBE-200 dumps, the last refused REGISTER or SUBSCRIBE final (`imsd-register-fail.raw`, `imsd-subscribe-fail.raw`), the last inbound INVITE (`imsd-invite-in.raw`) and the last outgoing INVITE (`imsd-invite-out.raw`), mode 0600, for debugging — they contain your IMSI/MSISDN and addresses. A refused REGISTER or SUBSCRIBE is logged with its status line and any Retry-After / Warning / Reason / Server headers |
 | `DUMP_DIR`, `OUT_DIR` | state dir | where dumps / per-call media stats land |
 | `IMSD_MEDIA` | *(auto)* | path to `imsd-media` (default: next to `imsd`, else `/usr/libexec/imsd-media`) |
+| `IMSD_ENV` | `/etc/imsd.env` | the configuration file's path — a bench seam for manual runs of `ims-pdn-up.sh` (the packaged unit reads `/etc/imsd.env` through `EnvironmentFile=`). The file's existence changes nothing |
 
 The protected client/server ports are fixed at 45061/45062
 (`imsd::util::PortUc`/`PortUs`) — changing them in source also requires

@@ -10,8 +10,10 @@
 # the first discovered address (the daemon's fresh target) a host route —
 # never a default route (F15 below). Idempotent — safe to run when the PDN
 # is already up. Runs as
-# ExecStartPre of imsd.service, so imsd only starts once the PDN exists; a
-# nonzero exit fails the unit and systemd retries per Restart/RestartSec.
+# ExecStartPre of imsd.service, so imsd starts once the PDN exists — or once
+# this script has written IMSD_IDLE= and exited 0 with nothing to do, when
+# imsd logs the idle and exits cleanly (idle_exit below); a nonzero exit
+# fails the unit and systemd retries per Restart/RestartSec.
 #
 # Configuration, via the unit's EnvironmentFile /etc/imsd.env (also read
 # directly so manual runs behave the same):
@@ -32,6 +34,9 @@
 #                    /run/imsd.env, the first of them routed
 #   IMSD_PCSCF       the reader's path (default /usr/libexec/imsd-pcscf) — a
 #                    bench seam, from the environment only (not from the file)
+#   IMSD_ENV         the configuration file's path (default /etc/imsd.env) —
+#                    a bench seam. The file is optional (overrides only); its
+#                    existence changes nothing
 
 log() { echo "ims-pdn-up: $*"; }
 
@@ -52,9 +57,15 @@ bearer_paths() {
 # `enabled` with the modem still in low power; switching the radio back on
 # then no longer brings the modem up (dev phone 2026-10-06).
 radio_off() { [ "$(modem_state)" = disabled ]; }
+# A locked SIM (a PIN not entered yet) is the same kind of state the user
+# controls: the modem registers once the PIN is in, so like a disabled radio
+# it exits non-zero and the unit's restart tries again.
+sim_locked() { [ "$(modem_state)" = locked ]; }
+unlock_required() { kv -m "$MODEM" | sed -n 's/^modem\.generic\.unlock-required *: *//p'; }
 
+IMSD_ENV=${IMSD_ENV:-/etc/imsd.env}
 envval() {  # $1 = key — for manual runs; under systemd the vars are inherited
-    sed -n "s/^$1=//p" /etc/imsd.env 2>/dev/null | tail -n1 | tr -d '"'
+    sed -n "s/^$1=//p" "$IMSD_ENV" 2>/dev/null | tail -n1 | tr -d '"'
 }
 IP_TYPE=${IMS_IP_TYPE:-$(envval IMS_IP_TYPE)}
 IP_TYPE=${IP_TYPE:-ipv6}
@@ -74,6 +85,44 @@ while :; do
     sleep 2
 done
 log "modem $MODEM"
+
+# ---- nothing to do: a clean exit, not a retry loop. imsd reads IMSD_IDLE=
+# from /run/imsd.env, logs it and exits 0, which Restart=on-failure leaves
+# alone — the unit stays inactive until the next boot, a `systemctl start
+# imsd` or a start of imsd-ofonod (its Wants=imsd.service, the Phosh image).
+# Installing the package and inserting a SIM is the opt-in; no configuration
+# file changes what follows. The dead ends are facts: no SIM (the modem's
+# `failed` state with a SIM reason; final until ModemManager re-probes;
+# checked here and while waiting for registration below), a profile-indexed
+# connect series refused ten times in a row — each a persistent 3GPP cause
+# in ModemManager's typed error (not subscribed, unknown APN, barred, not
+# authorised in this PLMN, authentication failed, the service option not
+# supported, the wrong PDN type), with packet service; counted only while the
+# modem reads registered, connecting or connected with packet service not
+# detached — any other read, a timeout or a transient cause starts the count
+# again — and — the daemon's own, with the same clean exit — a
+# bring-up that ends with no P-CSCF (none configured, the PCO names none)
+# and no registration of imsd's own to resume. One attempt per boot (or per
+# such imsd-ofonod start). What is not a fact exits 1 like a disabled radio
+# and the restart retries: ten failures without coverage, a SIM still waiting
+# for its PIN, a modem without an ims profile (the APN-string connect is
+# tried), an APN-string series (the modem's own wall under an IPv4 attach,
+# F6), a P-CSCF reader that did not answer (PCSCF_DISCOVERY=failed, below).
+idle_exit() {  # $1 = key, $2 = log text
+    log "$2"
+    printf 'IMSD_IDLE=%s\n' "$1" > /run/imsd.env
+    log "wrote /run/imsd.env: IMSD_IDLE=$1"
+    exit 0
+}
+sim_check() {
+    [ "$(modem_state)" = failed ] || return 0
+    REASON=$(kv -m "$MODEM" | sed -n 's/^modem\.generic\.state-failed-reason *: *//p')
+    case "$REASON" in
+        sim-missing|esim-without-profiles|sim-error)
+            idle_exit no-sim "no SIM ($REASON): not bringing the ims PDN up — systemctl start imsd once one is in" ;;
+    esac
+}
+sim_check
 
 # ---- the ims profile index (WDS profile list), unless configured. The
 # lookup itself can fail while ModemManager is still enabling the modem; a
@@ -175,12 +224,16 @@ if [ -z "$BEARER" ]; then
     waited=0 last=
     while :; do
         STATE=$(modem_state)
-        case "$STATE" in registered|connecting|connected) break ;; esac
+        case "$STATE" in registered|connecting|connected) break ;; failed) sim_check ;; esac
         [ "$STATE" != "$last" ] && log "waiting for registration (state: ${STATE:-unknown})"
         last=$STATE
         if [ "$waited" -ge "$REG_TIMEOUT" ]; then
             if [ "$STATE" = disabled ]; then
                 log "modem still disabled after $REG_TIMEOUT s (radio off): not connecting"
+                exit 1
+            fi
+            if [ "$STATE" = locked ]; then
+                log "SIM locked ($(unlock_required)) after $REG_TIMEOUT s: not connecting until the PIN is entered"
                 exit 1
             fi
             log "not registered after $REG_TIMEOUT s — attempting anyway"
@@ -208,10 +261,31 @@ if [ -z "$BEARER" ]; then
 fi
 
 n=0
+REFUSED=0   # connects refused in a row, each a persistent 3GPP cause with the modem registered/connecting/connected and packet service not detached (stricter than the daemon's PacketServiceUp)
 while [ -z "$BEARER" ]; do
     n=$((n + 1))
-    [ "$n" -gt 10 ] && { log "bearer connect failed after 10 attempts"; exit 1; }
+    if [ "$n" -gt 10 ]; then
+        # only a profile-indexed series the network refused says anything
+        # about it: an APN-string series (a lookup that kept failing, a late
+        # registration) meets the modem's own wall under an IPv4 attach (F6),
+        # which the restart's fresh lookup gets past, and a failure without
+        # packet service is a coverage gap, not a refusal — counted only while
+        # the modem reads registered, connecting or connected with packet
+        # service not `detached` (a CS-registered modem still attaching) and
+        # only for a persistent 3GPP cause in ModemManager's typed error; any
+        # other read, `disconnecting`, `unknown` or an unanswered mmcli among
+        # them, and a timeout or a transient cause, reset it — stricter than
+        # the daemon's PacketServiceUp, which counts an unknown state as
+        # service — so the
+        # count is of refusals in a row, each with packet service at the time,
+        # never one state read after the series: a series that failed without
+        # coverage and found the network at its end exits 1 like any other,
+        # and the restart retries on the attached modem
+        [ -z "$PROFILE_ID" ] || [ "$REFUSED" -lt 10 ] || idle_exit no-ims-pdn "bearer connect refused 10 times in a row by profile index with packet service and a persistent cause (last: $(squash "$OUT")): no ims PDN for this SIM here — systemctl start imsd to try again"
+        log "bearer connect failed after 10 attempts (modem state: $(modem_state), last: $(squash "$OUT"))"; exit 1
+    fi
     radio_off && { log "modem disabled (radio off): not connecting"; exit 1; }
+    sim_locked && { log "SIM locked ($(unlock_required)): not connecting until the PIN is entered"; exit 1; }
     B=$(find_ims_bearer no)   # reuse a stale disconnected ims bearer of this run's shape
     if [ -z "$B" ]; then
         if [ -n "$PROFILE_ID" ]; then
@@ -225,6 +299,7 @@ while [ -z "$BEARER" ]; do
             log "created bearer $B ($SPEC)"
         else
             log "create-bearer attempt $n failed: $(squash "$OUT"); retrying in 10 s"
+            REFUSED=0   # not the network's answer to a connect
             sleep 10
             continue
         fi
@@ -232,7 +307,24 @@ while [ -z "$BEARER" ]; do
     if OUT=$(mmcli -b "$B" --connect 2>&1); then
         BEARER=$B
     else
-        log "connect attempt $n failed (state: $(modem_state)): $(squash "$OUT"); retrying in 10 s"
+        ST=$(modem_state); PS=$(packet_state)
+        log "connect attempt $n failed (state: ${ST:-unknown}, packet service: ${PS:-unknown}): $(squash "$OUT"); retrying in 10 s"
+        # a refusal is the network's answer, as ModemManager types it: a
+        # persistent 3GPP cause — not subscribed, unknown APN, barred, not
+        # authorised in this PLMN, authentication failed, the service option
+        # not supported, the wrong PDN type for this attach — with the modem
+        # attached. A timeout (D-Bus, esm-proc-timeout), a transient cause
+        # (insufficient resources, out of order, a network failure) or any
+        # other error starts the count again, as a read without packet service
+        # does: an outage must not idle VoLTE until the next boot
+        PERSISTENT=
+        case "$OUT" in
+            *MobileEquipment.ServiceOptionNotSubscribed:*|*MobileEquipment.MissingOrUnknownApn:*|*MobileEquipment.OperatorDeterminedBarring:*|*MobileEquipment.ServiceOptionNotAuthorizedInPlmn:*|*MobileEquipment.UserAuthenticationFailed:*|*MobileEquipment.ServiceOptionNotSupported:*|*MobileEquipment.Ipv4OnlyAllowed:*|*MobileEquipment.Ipv6OnlyAllowed:*) PERSISTENT=1 ;;
+        esac
+        case "$ST" in
+            registered|connecting|connected) if [ "$PS" = detached ] || [ -z "$PERSISTENT" ]; then REFUSED=0; else REFUSED=$((REFUSED + 1)); fi ;;
+            *) REFUSED=0 ;;
+        esac
         case "$OUT" in *call-already-present*)
             # the PDN is up on a bearer this run did not recognise (ip-type or
             # APN spelling); use it rather than ask the modem for a second one
@@ -309,9 +401,15 @@ fi
 # pass for the admin's PCSCF=, and it is never read from the environment
 # here). The PDN is brought up IPv6-only, so only IPv6 addresses are usable;
 # IPv4 ones and names are logged and dropped. Nothing usable is not this
-# script's failure: imsd resumes a registration of its own when it can; with
-# nothing to resume it says so and exits, and the unit's restart runs
-# discovery again.
+# script's failure, and PCSCF_DISCOVERY= in the hand-off tells the daemon
+# which kind it was: `none` — the PCO carried no IPv6 P-CSCF (the reader's
+# exit 2), a fact: a registration of imsd's own that can be resumed is
+# resumed and stays up, else the daemon idles (its `idle:` exit; after a
+# resumable pair's failed attempt the fatal and the restart) — or `failed` —
+# the reader did not answer (an error, a timeout, nothing printed), no fact:
+# a daemon with nothing to resume exits 1 and the unit's restart runs
+# discovery again. `found` and `skipped` (PCSCF= set, an IPv4-only PDN, no
+# rmnet mux id) are the other two values.
 # The P-CSCF is reachable through the ims PDN only: a host route stands in
 # for the default — `dev` without a gateway (a raw-IP netdev without
 # header_ops, so the kernel resolves no neighbours), the shape imsd uses for
@@ -331,6 +429,7 @@ route_pcscf() {  # $1 = address
 }
 PCSCF=${PCSCF:-$(envval PCSCF)}
 DISCOVERED=
+DISCOVERY=skipped
 case "$PCSCF" in
     '')
         if [ "$IP_TYPE" = ipv4 ]; then
@@ -340,6 +439,7 @@ case "$PCSCF" in
             if [ -z "$MUX" ]; then
                 log "P-CSCF discovery: no rmnet mux id on $IFACE (ip -d link); set PCSCF="
             else
+                DISCOVERY=failed
                 OUT=$("${IMSD_PCSCF:-/usr/libexec/imsd-pcscf}" --mux "$MUX" ${PROFILE_ID:+--profile "$PROFILE_ID"} --timeout 10 2>&1); rc=$?
                 V6=; SHOWN=; OTHER=; FLAGS=; ERR=; n=0
                 while IFS= read -r line; do
@@ -356,13 +456,14 @@ case "$PCSCF" in
 $OUT
 EOF
                 if [ -n "$V6" ]; then
+                    DISCOVERY=found
                     log "P-CSCF discovered: $SHOWN${FLAGS:+ ($FLAGS)}"
                     [ -n "$OTHER" ] && log "P-CSCF discovery also gave $OTHER (not usable on the IPv6-only ims PDN)"
                     route_pcscf "${V6%% *}"   # the first: the daemon's fresh target; imsd routes the P-CSCF it uses itself as well (the fresh target, the resumed peer)
                 else
                     case $rc in
                         0) log "P-CSCF discovery: nothing usable (imsd-pcscf printed no address${ERR:+: $ERR})" ;;
-                        2) log "P-CSCF discovery: nothing usable (the PCO carried no IPv6 P-CSCF${OTHER:+; it gave $OTHER}${FLAGS:+; $FLAGS})" ;;
+                        2) DISCOVERY=none; log "P-CSCF discovery: nothing usable (the PCO carried no IPv6 P-CSCF${OTHER:+; it gave $OTHER}${FLAGS:+; $FLAGS})" ;;
                         *) log "P-CSCF discovery: nothing usable (imsd-pcscf rc $rc${ERR:+: $ERR})" ;;
                     esac
                 fi
@@ -381,9 +482,17 @@ esac
 # the RA, which the netdev lists first and which is deprecated after a day
 # and removed after two (ims ledger F18; the SAs and the Contact would go
 # with it). PCSCF_DISCOVERED= is written on every run, empty when nothing
-# was discovered or PCSCF= is set.
-printf 'DEV=%s\nLOCAL=%s\nPCSCF_DISCOVERED=%s\n' "$IFACE" "$ADDR" "$DISCOVERED" > /run/imsd.env
-log "wrote /run/imsd.env: DEV=$IFACE LOCAL=$ADDR PCSCF_DISCOVERED=$DISCOVERED"
+# was discovered or PCSCF= is set; PCSCF_DISCOVERY= says how it came to be
+# (found, none, failed, skipped — above).
+# The dead end after the PDN is up — nothing to register to (no PCSCF=,
+# nothing discovered, no registration of imsd's own in the kernel to resume)
+# — is the daemon's to decide (its `idle:` exit before it takes the bus name,
+# §7.3): it knows the fresh target, the kernel's SA pair and the holds, and
+# PCSCF_DISCOVERY= tells it whether an empty list is the PCO's answer (none:
+# the idle) or the reader's failure (failed: exit 1, the restart runs
+# discovery again). The hand-off is written on every run.
+printf 'DEV=%s\nLOCAL=%s\nPCSCF_DISCOVERED=%s\nPCSCF_DISCOVERY=%s\n' "$IFACE" "$ADDR" "$DISCOVERED" "$DISCOVERY" > /run/imsd.env
+log "wrote /run/imsd.env: DEV=$IFACE LOCAL=$ADDR PCSCF_DISCOVERED=$DISCOVERED PCSCF_DISCOVERY=$DISCOVERY"
 
 # ---- open the IMS protected ports in the firewall (rung 5b root cause,
 # journal/ims.md s56): pmOS's default nftables INPUT chain is policy-drop and

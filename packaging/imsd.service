@@ -21,7 +21,9 @@ ExecStartPre=-/usr/libexec/imsd-handover.sh
 TimeoutStartSec=900
 # /run/imsd.env: written by ims-pdn-up.sh (DEV= the connected ims netdev,
 # LOCAL= the PDN address ModemManager assigned to it, PCSCF_DISCOVERED= the
-# P-CSCF list the network put in the PDN's PCO, read from the modem).
+# P-CSCF list the network put in the PDN's PCO, read from the modem,
+# PCSCF_DISCOVERY= how that list came to be: found, none, failed, skipped;
+# or IMSD_IDLE=<reason> alone when the bring-up found nothing to do).
 # /etc/imsd.env: admin configuration, none required where discovery finds a
 # P-CSCF (AGENTS.md §10, the README); it wins over the runtime-derived values
 # — PCSCF= overrides discovery.

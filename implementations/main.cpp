@@ -118,7 +118,8 @@ std::string RedactKeys(const std::vector<std::string>& argv) {
 // OwnXfrmDeleteCommands list — never `ip xfrm … flush`: another IPsec user's
 // entries, a policy-based VPN's, stay, §12); a delete that fails (an entry
 // gone between the read and the delete) is logged and the rest go on. At
-// file scope, as LoadHolds and PersistHolds are.
+// file scope, as LoadHolds and PersistHolds are: the Engine and main() both
+// run it (main() through RemoveDeadPair).
 void RunOwnXfrmDeletes(const std::vector<std::vector<std::string>>& cmds) {
     for (auto& cmd : cmds) {
         int rc = RunCmd(cmd);
@@ -131,7 +132,7 @@ void RunOwnXfrmDeletes(const std::vector<std::vector<std::string>>& cmds) {
 // on the UE's address): taken out by exact key, as the SA setup takes imsd's
 // previous pair out (RunOwnXfrmDeletes — nothing else in the kernel is
 // touched, §12), so the next bring-up finds nothing to resume. Run by the
-// no-target bring-up.
+// no-target bring-up and by main()'s idle before the bus name.
 void RemoveDeadPair(std::string_view local) {
     auto state = RunCapture({"ip", "xfrm", "state"});
     auto policy = RunCapture({"ip", "xfrm", "policy"});
@@ -308,6 +309,17 @@ std::string FreshPcscfFromEnv(std::vector<std::string>* discovered = nullptr, st
     if (!configured.empty()) return configured;
     return list.empty() ? std::string() : list.front();
 }
+
+// The no-target bring-up's two outcomes, told apart by the script's word in
+// /run/imsd.env (§7.3). The PCO naming no P-CSCF is a fact
+// (PCSCF_DISCOVERY=none): a daemon with nothing to resume idles on it until
+// a boot or a start. A reader that did not answer is not
+// (PCSCF_DISCOVERY=failed): exit 1, and the unit's restart runs discovery
+// again. Nothing here depends on a configuration file existing — installing
+// the package and inserting a SIM is the opt-in.
+bool DiscoveryFailed() { return EnvOr("PCSCF_DISCOVERY", "") == "failed"; }
+constexpr std::string_view NoPcscfIdleText = "no P-CSCF — none configured (PCSCF=), none discovered (see the ims-pdn-up lines) — and nothing to resume; set PCSCF= in /etc/imsd.env to name one";
+constexpr std::string_view NoPcscfDiscoveryFailed = "no P-CSCF: discovery failed (see the ims-pdn-up lines) and nothing to resume";
 
 // ---- sockaddr helper ------------------------------------------------------
 socklen_t MakeAddr(std::string_view ip, int port, sockaddr_storage& ss) {
@@ -792,11 +804,11 @@ struct StatusSnapshot {
 
 // engine -> main-loop event
 struct Event {
-    enum class Type { Added, State, Deleted, Registration, Status, Fatal } type;
+    enum class Type { Added, State, Deleted, Registration, Status, Fatal, Idle } type;
     CallInfo info;                 // Added
     std::string uni, state, reason;  // State/Deleted
     StatusSnapshot status;         // Registration/Status
-    std::string text;              // Fatal
+    std::string text;              // Fatal, Idle
 };
 
 GDBusConnection* DbusConn = nullptr;
@@ -942,6 +954,12 @@ gboolean OnIdleEvent(gpointer data) {
         case Event::Type::Fatal:
             Log(std::format("engine fatal: {} — exiting for systemd restart", ev->text));
             FatalExit = true;   // non-zero exit, or Restart=on-failure never fires
+            g_main_loop_quit(MainLoop);
+            break;
+        case Event::Type::Idle:
+            // nothing to do (§7.3): a clean exit, which Restart=on-failure
+            // leaves alone
+            Log(std::format("idle: {} — nothing to do; systemctl start imsd when that changes", ev->text));
             g_main_loop_quit(MainLoop);
             break;
     }
@@ -1357,22 +1375,27 @@ private:
             if (outcome == ResumeOutcome::Failed && (!recovery_.Reconnectable() || (pcscfTarget_.empty() && recovery_.Fresh()))) outcome = ResumeOutcome::Dead;
         }
         if (pcscfTarget_.empty()) {
-            // No fresh registration follows, so this is no write-off: a
-            // resumable pair whose attempt failed (a silent connect, an
+            // No fresh registration follows, so a resumable pair is not written
+            // off: one whose attempt failed (a silent connect, an
             // unanswered or refused refresh — its Retry-After is in the
-            // holds) stays for the restart to resume — unless the engine's
-            // rule wrote the registration off or gave the resume up (a 403 once
-            // fresh is due, a NOTIFY-terminated binding; a 401, a refusal with a
-            // Retry-After, the second refusal — the count travels in the holds;
-            // Dead above); a pair nothing can
-            // resume (its UE address left the link, no state file, the file
-            // another attempt's, written off before this start) is taken out
-            // of the kernel, by exact key — the fresh registration that would
-            // have replaced it does not come — so the next bring-up finds
-            // nothing to resume.
-            if (outcome == ResumeOutcome::Dead) RemoveDeadPair(pdnLocal_);
+            // holds) stays for the restart to resume (the fatal and the
+            // retry) — unless the engine's rule wrote the registration off or
+            // gave the resume up (a 403 once fresh is due, a NOTIFY-terminated
+            // binding; a 401, a refusal with a Retry-After, the second refusal —
+            // the count travels in the holds; Dead above); a pair nothing can
+            // resume (its UE address left the link, no
+            // state file, the file another attempt's, written off before this
+            // start) is written off and taken out of the kernel by exact key
+            // — the fresh registration that would have replaced it does not
+            // come — so the next bring-up finds nothing to resume, and the
+            // daemon idles (RequestIdle: a clean exit, §7.3): the PCO named no
+            // P-CSCF and nothing is configured, a fact until a boot or a
+            // start. A discovery that FAILED (the reader did not answer) is
+            // no fact: the fatal, and the restart runs it again.
+            if (outcome == ResumeOutcome::Dead) { recovery_.OldGone(); RemoveDeadPair(pdnLocal_); }
             KeepHolds();
-            throw std::runtime_error(std::string(NoFreshPcscf));
+            if (outcome == ResumeOutcome::Failed || DiscoveryFailed()) throw std::runtime_error(std::string(NoFreshPcscf));
+            RequestIdle(std::string(NoPcscfIdleText)); throw Stopping{};
         }
         // a resume that failed found the stored SAs unusable (and after a
         // reboot there are none): nothing to reconnect over while a deferred
@@ -2169,6 +2192,16 @@ private:
         PostEvent(std::move(ev));
     }
 
+    // Leave cleanly: nothing to do (§7.3); the
+    // unit stays inactive until the next boot, a `systemctl start imsd` or a
+    // start of imsd-ofonod (its Wants=imsd.service, the Phosh image).
+    void RequestIdle(const std::string& why) {
+        quit_.store(true);
+        auto ev = std::make_unique<Event>();
+        ev->type = Event::Type::Idle; ev->text = why;
+        PostEvent(std::move(ev));
+    }
+
     // After a registration succeeds — bring-up, a keepalive refresh, a
     // reconnect + refresh, or a fresh recovery: the status (a signal only
     // when it changes), the timers, the recovery policy, the reg-event
@@ -2708,6 +2741,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // The bring-up found nothing to do (IMSD_IDLE= in /run/imsd.env — the
+    // script's arms: no SIM, a refused ims PDN): say so and
+    // leave cleanly. Restart=on-failure leaves a clean exit alone, so the
+    // unit stays inactive until the next boot, a manual start or a start of
+    // imsd-ofonod (its Wants=imsd.service).
+    if (std::string idle = EnvOr("IMSD_IDLE", ""); !idle.empty()) {
+        Log(std::format("idle: {} — nothing to do; systemctl start imsd when that changes",
+                        idle == "no-sim" ? "no SIM" : idle == "no-ims-pdn" ? "no ims PDN from the network" : idle));
+        return 0;
+    }
+
     std::string dev = EnvOr("DEV", "qmapmux0.0");
     std::string local = EnvOr("LOCAL", "");
     if (local.empty()) {
@@ -2720,6 +2764,28 @@ int main(int argc, char** argv) {
     local = imsd::util::CanonicalAddr(local);
     std::string freshPcscf = FreshPcscfFromEnv();
     Log(std::format("LOCAL={} P-CSCF=[{}]:{}", local, freshPcscf.empty() ? "(none)" : freshPcscf, EnvOr("PCSCF_PORT", "5060")));
+    // The daemon's own dead end, decided here, before the bus name, so the
+    // exit is clean and the unit stays inactive (§7.3): nothing to register
+    // to — no PCSCF=, nothing discovered — and no registration of its own to
+    // resume (SaPeer finds no pair, or the holds' write-off for this PDN and
+    // boot says it cannot). The script decides the dead ends only it can see
+    // (no SIM, a refused ims PDN). A discovery that failed is no dead end:
+    // exit 1, and the unit's restart runs it again.
+    if (!session && freshPcscf.empty()) {
+        auto policy = RunCapture({"ip", "xfrm", "policy"});
+        auto holds = LoadHolds(local);
+        auto peer = imsd::ipsec::SaPeer(policy.out);
+        const bool writtenOff = holds && holds->oldGone;
+        if (!peer || writtenOff) {
+            // a pair the holds wrote off before this start is nothing to
+            // resume: taken out of the kernel here, as the no-target bring-up
+            // takes a dead pair out (§7.2 step 1), so no start of this boot
+            // finds it — the holds keep the write-off
+            if (peer && writtenOff) RemoveDeadPair(local);
+            if (DiscoveryFailed()) { Log(std::format("{} — exiting for systemd restart", NoPcscfDiscoveryFailed)); return 1; }
+            Log(std::format("idle: {} — nothing to do; systemctl start imsd when that changes", NoPcscfIdleText)); return 0;
+        }
+    }
     if (!session) LogAudioSession();
     imsd::bus::AuthorizeCalls = !session;
 
