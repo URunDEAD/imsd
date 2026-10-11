@@ -835,7 +835,7 @@ std::optional<imsd::engine::RegRecovery::Held> LoadHolds(const std::string& pdn)
     char buf[512]; std::size_t n;
     while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
     std::fclose(f);
-    if (QuotedAfter(s, "\"pdn\": \"").value_or("") != pdn) return std::nullopt;
+    if (imsd::util::CanonicalAddr(QuotedAfter(s, "\"pdn\": \"").value_or("")) != imsd::util::CanonicalAddr(pdn)) return std::nullopt;
     if (QuotedAfter(s, "\"boot\": \"").value_or("") != BootId()) return std::nullopt;
     long elapsed = BootSeconds() - IntAfter(s, "\"written_at\": ").value_or(0);
     imsd::engine::RegRecovery::Held h;
@@ -915,7 +915,7 @@ public:
         // No baked-in default: the P-CSCF is carrier infrastructure, learned
         // from the IMS PDN's PCO on a stock stack. Until PCO discovery is
         // implemented, PCSCF= must be configured (see README).
-        pcscf_ = EnvOr("PCSCF", "");
+        pcscf_ = imsd::util::CanonicalAddr(EnvOr("PCSCF", ""));
         pcscfPort_ = std::atoi(EnvOr("PCSCF_PORT", "5060").c_str());
         dev_ = EnvOr("DEV", "qmapmux0.0");
         outDir_ = EnvOr("OUT_DIR", StateDir());
@@ -956,7 +956,7 @@ public:
         }
     }
 
-    void SetLocal(std::string l) { local_ = l; pdnLocal_ = std::move(l); }
+    void SetLocal(std::string l) { local_ = imsd::util::CanonicalAddr(l); pdnLocal_ = local_; }
     void SetDevMode(bool d) { devMode_ = d; }
     const std::string& Local() const { return local_; }
 
@@ -1199,6 +1199,15 @@ private:
     // ---- bring-up: warm resume if an SA + state file exist, else fresh ----
     void BringUp() {
         if (pcscf_.empty()) throw std::runtime_error("PCSCF not set — configure the carrier's P-CSCF address " "(P-CSCF discovery from the PDN's PCO is not implemented yet)");
+        if (pcscf_.contains(',')) throw std::runtime_error(std::format("PCSCF='{}' must be one address", pcscf_));
+        // PCSCF= is accepted in one spelling only: the one `ip` prints (RFC
+        // 5952 — what the journal and `ip xfrm` show). Another spelling is
+        // refused with the one to use rather than normalised, so the bring-up
+        // script, which routes the value as typed, and the daemon agree on it.
+        if (std::string raw = EnvOr("PCSCF", ""); !raw.empty()) {
+            auto canon = imsd::util::CanonicalIp6(raw);
+            if (!canon || *canon != raw) throw std::runtime_error(std::format("PCSCF='{}' is not written as ip prints it; use PCSCF={}", raw, canon.value_or("<one bare IPv6 address, RFC 5952 form>")));
+        }
         auto card = RunCapture({"qmicli", "-d", "qrtr://0", "--uim-get-card-status"});
         auto sel = imsd::aka::ParseCardStatus(card.out);
         if (!sel) throw std::runtime_error("no ready USIM found");
@@ -2518,7 +2527,8 @@ int main(int argc, char** argv) {
         std::println(std::cerr, "imsd: no global IPv6 on {} — is the ims PDN up?", dev);
         return 1;
     }
-    Log(std::format("LOCAL={} P-CSCF=[{}]:{}", local, EnvOr("PCSCF", "(unset)"), EnvOr("PCSCF_PORT", "5060")));
+    local = imsd::util::CanonicalAddr(local);
+    Log(std::format("LOCAL={} P-CSCF=[{}]:{}", local, imsd::util::CanonicalAddr(EnvOr("PCSCF", "(unset)")), EnvOr("PCSCF_PORT", "5060")));
     if (!session) LogAudioSession();
     imsd::bus::AuthorizeCalls = !session;
 

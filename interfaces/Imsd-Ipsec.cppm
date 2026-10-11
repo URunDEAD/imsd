@@ -374,23 +374,28 @@ export namespace imsd::ipsec {
     //   state: (src==LOCAL,dst==P): reqid1->spiPs reqid2->spiPc
     //          (src==P,dst==LOCAL): reqid1->spiUc reqid2->spiUs
     //   policy: dir out, reqid1->portPs=dport, reqid2->portPc=dport
+    // Addresses are compared in RFC 5952 form on both sides (the kernel prints
+    // that form; PCSCF=/LOCAL= arrive in any spelling), so the spelling in
+    // /etc/imsd.env can no longer hide a registration's SAs.
     // Returns nullopt unless spiPs, spiPc, portPs, portPc are all found.
     std::optional<ExistingSa> ParseExistingSa(std::string_view stateText, std::string_view policyText, std::string_view pcscf, std::string_view local) {
+        const std::string p = imsd::util::CanonicalAddr(pcscf);
+        const std::string l = imsd::util::CanonicalAddr(local);
         ExistingSa sa;
         bool havePs = false;
         bool havePc = false;
         bool havePortPs = false;
         bool havePortPc = false;
         for (std::string_view b : detail::SrcBlocks(stateText)) {
-            std::string_view src = detail::TokenAfter(b, "src ");
-            std::string_view dst = detail::TokenAfter(b, "dst ");
+            const std::string src = imsd::util::CanonicalAddr(detail::TokenAfter(b, "src "));
+            const std::string dst = imsd::util::CanonicalAddr(detail::TokenAfter(b, "dst "));
             auto spi = detail::ParseHex32(detail::TokenAfter(b, "spi "));
             auto reqid = detail::ParseDec(detail::TokenAfter(b, "reqid "));
             if (!spi || !reqid) continue;
-            if (src == local && dst == pcscf && *reqid == 1) { sa.spiPs = *spi; havePs = true; }
-            if (src == local && dst == pcscf && *reqid == 2) { sa.spiPc = *spi; havePc = true; }
-            if (src == pcscf && dst == local && *reqid == 1) sa.spiUc = *spi;
-            if (src == pcscf && dst == local && *reqid == 2) sa.spiUs = *spi;
+            if (src == l && dst == p && *reqid == 1) { sa.spiPs = *spi; havePs = true; }
+            if (src == l && dst == p && *reqid == 2) { sa.spiPc = *spi; havePc = true; }
+            if (src == p && dst == l && *reqid == 1) sa.spiUc = *spi;
+            if (src == p && dst == l && *reqid == 2) sa.spiUs = *spi;
         }
         for (std::string_view b : detail::SrcBlocks(policyText)) {
             if (b.find("dir out") == std::string_view::npos) continue;
@@ -438,11 +443,12 @@ export namespace imsd::ipsec {
     // order: where a registration made on another address of the link (the
     // kernel's temporary one, before 0.3.10 — ims ledger F18) still lives.
     std::vector<std::string> SaLocals(std::string_view stateText, std::string_view pcscf) {
+        const std::string p = imsd::util::CanonicalAddr(pcscf);
         std::vector<std::string> locals;
         for (std::string_view b : detail::SrcBlocks(stateText)) {
-            std::string_view src = detail::TokenAfter(b, "src ");
-            if (src.empty() || detail::TokenAfter(b, "dst ") != pcscf) continue;
-            if (std::ranges::find(locals, src) == locals.end()) locals.emplace_back(src);
+            const std::string src = imsd::util::CanonicalAddr(detail::TokenAfter(b, "src "));
+            if (src.empty() || imsd::util::CanonicalAddr(detail::TokenAfter(b, "dst ")) != p) continue;
+            if (std::ranges::find(locals, src) == locals.end()) locals.push_back(src);
         }
         return locals;
     }

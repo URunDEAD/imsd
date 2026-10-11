@@ -6,8 +6,10 @@
 # trigger restarts every unit marked needs-restart (enqueue-marked). A
 # changed bus policy is live the moment apk writes it (dbus-broker-launch
 # reloads on its own), so it must not be left facing the old daemon. The
-# restart resumes the registration over its existing SAs, or goes on
-# waiting when the network had imsd wait; a call in progress ends.
+# restart resumes the registration over its existing SAs, goes on waiting
+# when the network had imsd wait, or — an upper-case, zero-padded or uncompressed PCSCF=,
+# accepted until 0.3.12 — stops at bring-up with the spelling to use; a
+# call in progress ends.
 #
 # Also installed as imsd.post-install: `apk del imsd` removes the files
 # and leaves the daemon running, so a later `apk add` of the package is

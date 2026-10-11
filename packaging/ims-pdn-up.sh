@@ -302,6 +302,7 @@ fi
 PCSCF=${PCSCF:-$(envval PCSCF)}
 case "$PCSCF" in
     '')  log "PCSCF not configured: no P-CSCF host route (imsd needs PCSCF= in /etc/imsd.env)" ;;
+    *\[*) log "PCSCF '$PCSCF': write the bare address, as ip prints it (no brackets)"; exit 1 ;;
     *:*) OUT=$(ip -6 route replace "$PCSCF/128" dev "$IFACE" 2>&1) ||
              { log "host route to P-CSCF $PCSCF failed: $(squash "$OUT")"; exit 1; }
          log "host route to P-CSCF $PCSCF dev $IFACE" ;;

@@ -73,7 +73,7 @@ in every source but the re-exporting `Imsd.cppm`, clang + libc++ + lld.
 The rule behind the split: **`imsd-core` stays GLib-free and free of I/O so
 that every decision in it has a unit test.** New protocol logic goes into a
 partition with a test. The shell (`main.cpp`) holds protocol decisions no
-test reaches — some older than 0.3.10, some added by 0.3.10, 0.3.11 or 0.3.12: the reg-event
+test reaches — some older than 0.3.10, some added by 0.3.10, 0.3.11, 0.3.12 or 1.0.0: the reg-event
 subscription schedule (§7.4: its retry
 ladder, Retry-After clamp, Timer F, renewal point and RFC 6665 reasons); the
 registration sequence and its transactions (`AwaitFinal`/`AwaitInitialFinal`:
@@ -101,7 +101,9 @@ closed when the call ends, a reconnect cycle's or the bring-up resume's wait
 ended by it — the reducer's verdict is pinned, the reaction is not); and the
 holds file's codec (`PersistHolds`/`LoadHolds`: aging by boot seconds, the
 pdn/boot match, defaults for absent keys — proven on the phone only, captures
-45- and 70- of 2026-09-25-polkit-voice). For the schedule, a reducer next to
+45- and 70- of 2026-09-25-polkit-voice; the `pdn` compare in canonical form on
+both sides (1.0.0) is unbenched: no capture stages a holds file whose `pdn` is
+spelled unlike `LOCAL`). For the schedule, a reducer next to
 `RegRecovery`, with a Subscription-State parser in `Imsd:Sip` pinned by
 `tests/Sip`, is the follow-up that moves it; a pure format/parse pair in
 `Imsd:Engine` is the holds file's.
@@ -431,7 +433,25 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    re-REGISTER (`RESUME via existing SA`, then `REGISTERED (resumed +
    true-refreshed)`). This avoids the network's fresh-SA throttle. `RESUME=0`
    forces a fresh registration. A resume the network refuses is not fatal: the
-   fresh registration replaces its SAs.
+   fresh registration replaces its SAs. The SA reader, the holds file's `pdn`
+   key, `LOCAL` and `PCSCF` compare addresses in RFC 5952 §4 form
+   (`imsd::util::CanonicalAddr`: lower-case hex, leading zeros dropped, the
+   longest zero run compressed — what `ip xfrm` prints for a plain IPv6
+   address; an IPv4-mapped address is read in that hex form only, never with
+   the dotted tail `ip` prints), and `PCSCF=` is accepted in that one spelling
+   only: upper case, leading zeros or an uncompressed run are refused at
+   bring-up with the one to use (`PCSCF='…' is not written as ip prints it;
+   use PCSCF=…`), a dotted-quad tail with the rule but no spelling, a
+   bracketed value by the bring-up script with the rule (`write the bare
+   address, as ip prints it (no brackets)`), a comma-separated `PCSCF=` (a
+   list) with its own message (`must be one address`; in the packaged unit the
+   bring-up script, which runs first, fails a list before the daemon sees it)
+   — one spelling, so the
+   bring-up script, which routes the value as typed, and the daemon agree on
+   it. Before 1.0.0 an upper-case, zero-padded or uncompressed `PCSCF=` was
+   accepted and, compared as text against `ip xfrm`, matched no SA and
+   registered fresh at every restart; an upgraded phone with such a setting
+   stops at bring-up with the spelling to use.
 4. **Fresh registration** otherwise (`FRESH registration`): an unprotected
    REGISTER on `PCSCF_PORT` (UDP, always), the 401 with the AKA challenge and
    the `Security-Server` list, the AKA run over a UIM logical channel
@@ -531,7 +551,11 @@ configures the muxed netdev. Idempotent; a non-zero exit fails the unit.
 - Sets the PDN MTU ModemManager reports on the link (1280 on the FP6), adds
   the address, waits out DAD, and installs a host route to `PCSCF`
   (`dev <netdev>`, no gateway — a raw-IP netdev without header_ops). The PDN
-  is IPv6-only, so `PCSCF` must be an IPv6 address; anything else on the IMS
+  is IPv6-only, so `PCSCF` must be an IPv6 address in RFC 5952 §4 form (§7.2 step 3: what
+  `ip` prints for a plain IPv6 address; an IPv4-mapped address in hex only —
+  a bracketed value is refused here with that hint, an upper-case or
+  uncompressed one by the daemon with the spelling to use once the route
+  step took it); anything else on the IMS
   network (its DNS servers, a traceroute target) needs its own host route
   (`ip -6 route add <addr> dev qmapmux0.0`). imsd installs a host route per
   media peer itself.
@@ -647,7 +671,9 @@ packages' `post-upgrade`/`post-install` scripts mark the units
 `daemon-reload` when the unit is not-found because its file was just
 reinstalled) and pmOS's systemd trigger runs `enqueue-marked`. A call in
 progress ends. The restart resumes the registration over its existing SAs,
-or goes on waiting out a hold the network had set (§7.4). A stopped unit
+or goes on waiting out a hold the network had set (§7.4) — or, with an
+upper-case, zero-padded or uncompressed `PCSCF=` (accepted until 0.3.12),
+stops at bring-up with the spelling to use (§7.2 step 3). A stopped unit
 keeps no marker and `enqueue-marked` leaves it stopped (dev phone, systemd
 262~rc3, 2026-10-03).
 
@@ -774,6 +800,11 @@ Lines the operator (and the scripts) look for, all prefixed `imsd: `:
   until the next fresh attempt`, `X has left DEV: the registration on it is
   gone; staying on Y; next: …`, `X is no longer on DEV: the registration on
   it is gone; on the PDN's own address Y now; next: …`.
+- `PCSCF='…' is not written as ip prints it; use PCSCF=…` (under `bring-up
+  FAILED:`) — one accepted spelling of the setting (§7.2 step 3); the
+  bring-up script's `ims-pdn-up: PCSCF '…': write the bare address, as ip
+  prints it (no brackets)` (its own prefix: a script line) is the same rule
+  for a bracketed value.
 - `engine fatal: … — exiting for systemd restart`.
 - `reg-event SUBSCRIBE sent`, and the binding's state from NOTIFY.
 - `audio session: …` at start and at each call's media start; `CODECS override active: …`.

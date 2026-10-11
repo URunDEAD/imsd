@@ -78,6 +78,18 @@ int main() {
         Check(sa && sa->spiPc == 0x0526f2c1u, "spi_pc (UE->P reqid2)");
         Check(sa && sa->securityServer == "ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=aes-cbc; " "spi-c=86438593; spi-s=86438592; port-c=33421; port-s=6000", "reconstructed Security-Server value");
     }
+    // the environment's spelling must not matter: upper case, uncompressed,
+    // bracketed — the kernel prints RFC 5952 form and both sides are
+    // canonicalised before the compare
+    {
+        auto sa = ParseExistingSa(State, Policy, "2001:DB8::105", "2001:DB8:1111:2222:3333:4444:5555:DB43");
+        Check(sa && sa->spiPs == 0x0526f2c0u && sa->portPs == 6000, "ParseExistingSa: upper-case spellings find the SAs");
+        auto sa2 = ParseExistingSa(State, Policy, "[2001:0db8:0000:0000:0000:0000:0000:0105]", "2001:db8:1111:2222:3333:4444:5555:db43");
+        Check(sa2 && sa2->spiPc == 0x0526f2c1u, "ParseExistingSa: uncompressed, bracketed P-CSCF finds the SAs");
+        Check(!ParseExistingSa(State, Policy, "2001:db8::106", "2001:db8:1111:2222:3333:4444:5555:db43"), "ParseExistingSa: another P-CSCF still finds nothing");
+        auto locals = SaLocals(State, "2001:DB8:0:0:0:0:0:105");
+        Check(locals.size() == 1 && locals[0] == "2001:db8:1111:2222:3333:4444:5555:db43", "SaLocals: any spelling of the P-CSCF, canonical locals out");
+    }
     // incomplete input -> nullopt
     Check(!ParseExistingSa("src a dst b\n\tspi 0x1 reqid 1 mode transport\n", "", "b", "a").has_value(), "missing pieces -> nullopt");
     {
