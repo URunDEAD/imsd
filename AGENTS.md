@@ -79,8 +79,9 @@ partition with a test. The shell (`main.cpp`; from 1.0.0 also `pcscf.cpp`'s
 QRTR control lookup and its matching of answers by type, transaction and
 message id) holds protocol decisions no
 test reaches — some older than 0.3.10, some added by 0.3.10, 0.3.11, 0.3.12 or 1.0.0: the P-CSCF in
-use (`pcscf_`: the kernel's SA peer at a resume, `PCSCF=` at a fresh
-registration, the move between them and back — §7.2); the reg-event
+use (`pcscf_`: the kernel's SA peer at a resume, `PCSCF=` or the first of
+`PCSCF_DISCOVERED=` at a fresh registration, the move between them and back —
+§7.2); the reg-event
 subscription schedule (§7.4: its retry
 ladder, Retry-After clamp, Timer F, renewal point and RFC 6665 reasons); the
 registration sequence and its transactions (`AwaitFinal`/`AwaitInitialFinal`:
@@ -496,10 +497,14 @@ a 5-minute registration gate, connect retries). `Restart=on-failure`,
 
 The daemon's own bring-up (`BringUp()` in `main.cpp`):
 
-1. `PCSCF=` is where a fresh registration goes; a resume needs none — the
-   kernel's SAs name its P-CSCF (step 3). With none set, a bring-up that did
-   not resume fails with `no P-CSCF for a fresh registration: …`, and since
-   no fresh one follows: a resumable pair whose attempt failed (a silent
+1. The P-CSCF a fresh registration goes to is `PCSCF=` when set, else the
+   first address of `PCSCF_DISCOVERED=` (a comma-separated IPv6 list read
+   from the environment; nothing in this tree writes it yet, so a bench sets
+   it by hand); the journal says which (`pcscf: configured …` / `pcscf:
+   discovered … (using …)`). A resume needs neither: the kernel's SAs name
+   its P-CSCF (step 3). With neither, a bring-up that did not resume fails
+   with `no P-CSCF for a fresh registration: …`, and since no fresh one
+   follows: a resumable pair whose attempt failed (a silent
    connect, an unanswered refresh, a first refusal without a Retry-After —
    the refusal count goes to the holds) stays for the restart to resume, unless the engine's rule
    ends it — a 401, a refusal with a Retry-After or the second refusal
@@ -507,8 +512,7 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    refusal is the second) give the resume up, a 403 once a fresh registration
    is due or a binding a NOTIFY terminated under the attempt write the
    registration off (`old_gone`) — so the pair counts as one nothing can
-   resume; a pair nothing can resume (its UE address left
-   the link, no state file, a file another attempt left behind, written off before this start or by the engine during the attempt, `RESUME=0`) is taken out of the kernel first (`the SA pair to …
+   resume; a pair nothing can resume (its UE address left the link, no state file, a file another attempt left behind, written off before this start or by the engine during the attempt, `RESUME=0`) is taken out of the kernel first (`the SA pair to …
    is nothing to resume: removing it` — by exact key, what two rules select — the fingerprinted policies and the reqid-1/2 transport-mode ESP states in their direction or on the UE's ims-PDN address, §12), so the next bring-up finds nothing to resume; the holds
    keep the Retry-After of a refusal and, for a registration the engine wrote
    off, the write-off — a removed pair needs none.
@@ -550,7 +554,8 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    registered fresh at every restart; an upgraded phone with such a setting
    stops at bring-up with the spelling to use. A resume follows the kernel's SA peer (`SaPeer`), not
    `PCSCF=`: a registration made to another P-CSCF than today's setting is
-   resumed there (`pcscf: resuming on …`) and moves at the next fresh
+   resumed there (`pcscf: resuming on …`; imsd routes that peer itself once
+   `ParseExistingSa` confirms the SAs) and moves at the next fresh
    registration (`the fresh registration moves from P-CSCF X to Y`; an
    attempt that fails before the SA setup goes back while the old registration
    still stands — not written off by its address leaving the link, a NOTIFY
@@ -560,12 +565,13 @@ The daemon's own bring-up (`BringUp()` in `main.cpp`):
    `spi_uc`/`spi_us` against the pair's (`FileNamesAnotherPair`), a 0.3.x
    file's too: an attempt that got through the SA setup and did not live to
    record, to this or another P-CSCF — is not used; the
-   bring-up registers fresh (with no fresh target: the fatal, step 1). Every fresh registration goes to `PCSCF=`; with
-   none set, a bring-up that cannot resume fails with `no P-CSCF for a fresh
-   registration: …` and a recovery step that needs one restarts the daemon
-   through systemd.
-4. **Fresh registration** otherwise (`FRESH registration`): an unprotected
-   REGISTER on `PCSCF_PORT` (UDP, always), the 401 with the AKA challenge and
+   bring-up registers fresh (with no fresh target: the fatal, step 1). Every fresh registration goes to `PCSCF=`, else the first
+   entry of `PCSCF_DISCOVERED=` that `CanonicalIp6` accepts; with neither, a bring-up that cannot resume fails
+   with `no P-CSCF for a fresh registration: …` and a recovery step that
+   needs one restarts the daemon through systemd.
+4. **Fresh registration** otherwise (`FRESH registration`): the target's host
+   route (imsd's own `ip -6 route replace`; step 3 says which target), an
+   unprotected REGISTER on `PCSCF_PORT` (UDP, always), the 401 with the AKA challenge and
    the `Security-Server` list, the AKA run over a UIM logical channel
    (`--uim-open-logical-channel`, `--uim-send-apdu`), the SA pair installed
    with `ip xfrm`, the protected REGISTER over the negotiated transport
@@ -674,9 +680,9 @@ configures the muxed netdev. Idempotent; a non-zero exit fails the unit.
   uncompressed one by the daemon with the spelling to use once the route
   step took it); anything else on the IMS
   network (its DNS servers, a traceroute target) needs its own host route
-  (`ip -6 route add <addr> dev qmapmux0.0`). imsd installs a host route per
-  media peer itself, and one to the SA peer of a registration it resumes
-  when that differs from the fresh target (§7.2).
+  (`ip -6 route add <addr> dev qmapmux0.0`). imsd installs a host route
+  per media peer itself, and one to the P-CSCF it registers to or resumes on
+  (§7.2 step 3).
 - Opens imsd's protected ports 45061–45062 (TCP and UDP) on `qmapmux*` in
   nftables when a `inet filter` table exists (pmOS's default INPUT chain drops
   inbound on `qmapmux*`, which silently killed every network-initiated
@@ -930,16 +936,20 @@ Lines the operator (and the scripts) look for, all prefixed `imsd: `:
   until the next fresh attempt`, `X has left DEV: the registration on it is
   gone; staying on Y; next: …`, `X is no longer on DEV: the registration on
   it is gone; on the PDN's own address Y now; next: …`.
-- `pcscf: resuming on X, the registration's SA peer; the configured P-CSCF
-  is Y — the next fresh registration moves there` (or `… (no P-CSCF
-  configured)`), `the fresh registration moves from P-CSCF X to Y`, `back to
-  P-CSCF X: the old registration stands until the next fresh attempt`,
-  `no reg state file; resume falls back to fresh` and `the state file names
+- `pcscf: configured X` / `pcscf: configured X; discovery gave Y, Z (ignored:
+  PCSCF= wins)` / `pcscf: discovered Y, Z (using Y)` at start, `pcscf:
+  PCSCF_DISCOVERED entry '…' is not an IPv6 address; ignored`; `pcscf:
+  resuming on X, the registration's SA peer; the next fresh registration
+  goes to Y` (+ ` (the peer is not in today's list)`, or `… (no P-CSCF
+  configured or discovered)`), `the fresh registration moves from P-CSCF X
+  to Y`, `back to P-CSCF X: the old registration stands until the next fresh
+  attempt`, `no reg state file; resume falls back to fresh` and `the state file names
   another SA pair (0x…/0x…[ to X]) than the kernel's (0x…/0x… to Y): another
   attempt's; resume falls back to fresh` (` to X` only when the file records a
   P-CSCF — a pre-1.0.0 file does not; with no fresh target both end in
-  `nothing can resume it: the pair is removed` instead), `no P-CSCF for a fresh
-  registration: none configured (PCSCF=)`.
+  `nothing can resume it: the pair is removed` instead), `no P-CSCF for a
+  fresh registration: none configured (PCSCF=) and none discovered
+  (PCSCF_DISCOVERED empty)`.
 - `PCSCF='…' is not written as ip prints it; use PCSCF=…` (under `bring-up
   FAILED:`) — one accepted spelling of the setting (§7.2 step 3); the
   bring-up script's `ims-pdn-up: PCSCF '…': write the bare address, as ip
@@ -1184,7 +1194,19 @@ minimum `/etc/imsd.env` are in the README.
 
 The README's first table. The protected client/server ports are fixed at
 45061/45062 (`imsd::util::PortUc`/`PortUs`) — changing them in source also
-requires updating the firewall rules `ims-pdn-up.sh` installs.
+requires updating the firewall rules `ims-pdn-up.sh` installs. `PCSCF` and
+`PCSCF_DISCOVERED` are read at start (`FreshPcscfFromEnv`, for the start line
+and again by the engine): the first is one address in RFC 5952 form (§7.2 step 3: another spelling is
+refused at bring-up), and wins, the second a comma-separated IPv6 list whose
+first entry `CanonicalIp6` accepts is the fresh target otherwise (an IPv4
+address, a name, a literal with a zone or a dotted-quad tail is logged and
+skipped). A resume goes to the kernel's SA
+peer whatever they say (and routes it itself); beyond the resume's `pcscf:`
+line, having a fresh target decides what a refused or failed resume
+leads to — the fresh registration (a refusal without a Retry-After is not
+counted) or, with none, the pair kept for the restart or removed (§7.2
+step 1) — and a comma-separated `PCSCF=` stops the bring-up before the
+resume.
 
 ### 10.2 imsd-media (per call, set through imsd's environment)
 
@@ -1272,9 +1294,8 @@ only the imsd side of its bus choice.
   (`DUMP_SIP=0`), and never leave the phone in a commit.
 - The ims PDN is a walled garden: `ims-pdn-up.sh` keeps it from becoming
   the default route and gives the P-CSCF a host route; imsd adds one per
-  call for the media peer (§7.3) and, at a resume, one for the registration's
-  SA peer when that differs from the fresh target (§7.2: the script routed
-  only the configured address). Nothing else is routed over it.
+  call for the media peer (§7.3) and one for the P-CSCF it registers to or resumes on (§7.2 step 3; the
+  script routes only the configured address). Nothing else is routed over it.
   A change that routes anything else over it needs a reason and a bench.
 - The fixed protected ports (45061/45062) are opened in nftables for
   `qmapmux*` only, by the bring-up script.

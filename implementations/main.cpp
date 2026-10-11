@@ -295,6 +295,20 @@ void LogAudioSession() {
     Log(AudioSessionLine(s) + (s.name.empty() ? "; looked up again at each call, set AUDIO_USER to pin one" : ""));
 }
 
+// The P-CSCF a fresh registration goes to, from the environment: PCSCF=
+// when set (one address, any spelling — a list is left as it came and
+// refused at bring-up), else the first address of PCSCF_DISCOVERED=, the
+// list the bring-up read from the PDN's PCO (comma-separated IPv6, PCO
+// order). `discovered` and `rejected` get the list and what was not an
+// IPv6 literal, for the caller's log lines.
+std::string FreshPcscfFromEnv(std::vector<std::string>* discovered = nullptr, std::vector<std::string>* rejected = nullptr) {
+    std::string configured = imsd::util::CanonicalAddr(EnvOr("PCSCF", ""));
+    std::vector<std::string> list = imsd::util::ParseAddressList(EnvOr("PCSCF_DISCOVERED", ""), rejected);
+    if (discovered) *discovered = list;
+    if (!configured.empty()) return configured;
+    return list.empty() ? std::string() : list.front();
+}
+
 // ---- sockaddr helper ------------------------------------------------------
 socklen_t MakeAddr(std::string_view ip, int port, sockaddr_storage& ss) {
     std::memset(&ss, 0, sizeof ss);
@@ -942,11 +956,25 @@ void PostEvent(std::unique_ptr<Event> ev) {
 class Engine {
 public:
     Engine() {
-        // The P-CSCF a fresh registration goes to: PCSCF= (no baked-in
-        // default — carrier infrastructure). A resume follows the kernel's
-        // SAs instead (TryResume), whatever this says today.
-        pcscfTarget_ = imsd::util::CanonicalAddr(EnvOr("PCSCF", ""));
-        pcscf_ = pcscfTarget_;
+        // The P-CSCF a fresh registration goes to: PCSCF= when set, else the
+        // first address the bring-up read from the PDN's PCO
+        // (PCSCF_DISCOVERED=); no baked-in default — carrier infrastructure.
+        // A resume follows the kernel's SAs instead (TryResume), whatever
+        // this says today.
+        {
+            std::vector<std::string> rejected;
+            pcscfTarget_ = FreshPcscfFromEnv(&pcscfCandidates_, &rejected);
+            pcscf_ = pcscfTarget_;
+            std::string configured = imsd::util::CanonicalAddr(EnvOr("PCSCF", ""));
+            std::string list;
+            for (const std::string& c : pcscfCandidates_) list += (list.empty() ? "" : ", ") + c;
+            if (!configured.empty())
+                Log(pcscfCandidates_.empty() ? std::format("pcscf: configured {}", configured)
+                                             : std::format("pcscf: configured {}; discovery gave {} (ignored: PCSCF= wins)", configured, list));
+            else if (!pcscfCandidates_.empty())
+                Log(std::format("pcscf: discovered {} (using {})", list, pcscfTarget_));
+            for (const std::string& r : rejected) Log(std::format("pcscf: PCSCF_DISCOVERED entry '{}' is not an IPv6 address; ignored", r));
+        }
         pcscfPort_ = std::atoi(EnvOr("PCSCF_PORT", "5060").c_str());
         dev_ = EnvOr("DEV", "qmapmux0.0");
         outDir_ = EnvOr("OUT_DIR", StateDir());
@@ -1156,13 +1184,15 @@ private:
 
     // config
     std::string pcscf_, dev_, outDir_, local_, ealgOffer_, mediaBin_;
-    // The P-CSCF a fresh registration goes to (PCSCF=). pcscf_ is the one in
+    // The P-CSCF a fresh registration goes to (PCSCF=, else the first of
+    // PCSCF_DISCOVERED=) and the whole discovered list. pcscf_ is the one in
     // use: the same, or the kernel's SA peer while a resumed registration
     // made to another one lives (TryResume) — the next fresh registration
     // moves to the target, and back when it fails before the SA setup
     // (FreshRecover), as local_ does against pdnLocal_.
     std::string pcscfTarget_;
-    static constexpr std::string_view NoFreshPcscf = "no P-CSCF for a fresh registration: none configured (PCSCF=)";
+    std::vector<std::string> pcscfCandidates_;
+    static constexpr std::string_view NoFreshPcscf = "no P-CSCF for a fresh registration: none configured (PCSCF=) and none discovered (PCSCF_DISCOVERED empty)";
     // The PDN's own address (LOCAL, else DetectLocal) — every fresh
     // registration's. local_ differs from it only while a resume runs on the
     // address an older registration was made on (TryResume).
@@ -1352,6 +1382,11 @@ private:
         local_ = pdnLocal_; ctx_.local = local_;
         KeepHolds();
         pcscf_ = pcscfTarget_;
+        // the target's host route is imsd's own: the bring-up script routes only
+        // the configured address (§7.2 step 3), not a target set in /etc/imsd.env
+        // as PCSCF_DISCOVERED= nor a route lost with the PDN — the same idempotent
+        // replace as a media peer's
+        RunCmd({"ip", Is6(pcscf_) ? "-6" : "-4", "route", "replace", pcscf_, "dev", dev_});
         if (recovery_.Next(Boot()).at > Boot()) Log(std::format("the network's hold stands; {}", NextStep()));
         if (!WaitForPolicy()) throw Stopping{};
         FreshRegister();
@@ -1373,13 +1408,12 @@ private:
         // the replace covers a target that changed under a running phone.
         auto peer = imsd::ipsec::SaPeer(policy.out);
         if (!peer) return ResumeOutcome::None;
-        bool routePeer = false;
         if (*peer != pcscf_) {
+            bool listed = *peer == pcscfTarget_ || std::ranges::find(pcscfCandidates_, *peer) != pcscfCandidates_.end();
             Log(pcscfTarget_.empty()
-                ? std::format("pcscf: resuming on {}, the registration's SA peer (no P-CSCF configured)", *peer)
-                : std::format("pcscf: resuming on {}, the registration's SA peer; the configured P-CSCF is {} — the next fresh registration moves there", *peer, pcscfTarget_));
+                ? std::format("pcscf: resuming on {}, the registration's SA peer (no P-CSCF configured or discovered)", *peer)
+                : std::format("pcscf: resuming on {}, the registration's SA peer; the next fresh registration goes to {}{}", *peer, pcscfTarget_, listed ? "" : " (the peer is not in today's list)"));
             pcscf_ = *peer;
-            routePeer = true;   // routed below, once the SAs are confirmed: a peer named by a pair that is not ours gets no route into the PDN
         }
         auto sa = imsd::ipsec::ParseExistingSa(state.out, policy.out, pcscf_, local_);
         // The registration may sit on another address of the link: before
@@ -1403,7 +1437,10 @@ private:
             }
         }
         if (!sa) { Log(std::format("the SA pair to {} has no SA on an address of {}: nothing to resume", pcscf_, dev_)); return ResumeOutcome::Dead; }
-        if (routePeer) RunCmd({"ip", Is6(pcscf_) ? "-6" : "-4", "route", "replace", pcscf_, "dev", dev_});
+        // the peer's host route is imsd's own once the SAs are confirmed (a peer
+        // named by a pair that is not ours gets no route into the PDN), whether
+        // or not the bring-up script routed the same address — idempotent
+        RunCmd({"ip", Is6(pcscf_) ? "-6" : "-4", "route", "replace", pcscf_, "dev", dev_});
         auto ps = LoadState();
         if (!ps || !ps->callid) { Log(std::format("no reg state file; {}", ResumeDeadNext())); return ResumeOutcome::Dead; }
         // A file another attempt left behind — one that got through the SA
@@ -2046,6 +2083,8 @@ private:
             Log(std::format("the fresh registration moves from {} to the PDN's own address {}", local_, pdnLocal_));
             MoveTo(pdnLocal_);
         }
+        // the fresh target's host route, imsd's own (BringUp's fresh path does the same)
+        RunCmd({"ip", Is6(pcscf_) ? "-6" : "-4", "route", "replace", pcscf_, "dev", dev_});
         bool ok = false;
         try {
             RefreshPani();
@@ -2680,7 +2719,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     local = imsd::util::CanonicalAddr(local);
-    Log(std::format("LOCAL={} P-CSCF=[{}]:{}", local, imsd::util::CanonicalAddr(EnvOr("PCSCF", "(unset)")), EnvOr("PCSCF_PORT", "5060")));
+    std::string freshPcscf = FreshPcscfFromEnv();
+    Log(std::format("LOCAL={} P-CSCF=[{}]:{}", local, freshPcscf.empty() ? "(none)" : freshPcscf, EnvOr("PCSCF_PORT", "5060")));
     if (!session) LogAudioSession();
     imsd::bus::AuthorizeCalls = !session;
 
