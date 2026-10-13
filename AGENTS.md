@@ -39,7 +39,7 @@ PipeWire. The verified device/carrier combinations are in the README.
 | `interfaces/Imsd-Sip.cppm` | `imsd::sip` — SIP as a text layer plus TCP framing: header extraction, status codes, the granted lifetime, `ResponseOf` transaction matching. Not a full RFC 3261 parser, deliberately. |
 | `interfaces/Imsd-Sdp.cppm` | `imsd::sdp` — SDP offer/answer: the AMR-WB + AMR + telephone-event offer (optional IR.92 preconditions), the parser the media plane needs, `BuildAnswer` for the terminating side, the `CODECS` override. |
 | `interfaces/Imsd-Aka.cppm` | `imsd::aka` — USIM AKA glue: the AKAv1-MD5 digest (RFC 3310), IMPI/IMPU/realm from IMSI + MCC/MNC, parsers for `qmicli --uim-get-card-status` and `mmcli` output, the AUTHENTICATE APDU and its response. |
-| `interfaces/Imsd-Ipsec.cppm` | `imsd::ipsec` — the two ESP SA pairs (TS 33.203) as `ip xfrm` argv lists, the Security-Server mechanism selection, and the reader that reconstructs SPIs/ports from `ip xfrm state`/`policy` text for a warm resume. |
+| `interfaces/Imsd-Ipsec.cppm` | `imsd::ipsec` — the two ESP SA pairs (TS 33.203) as `ip xfrm` argv lists, the Security-Server mechanism selection, and the reader that reconstructs SPIs/ports from `ip xfrm state`/`policy` text for a warm resume, and (1.0.0) `OwnXfrmDeleteCommands`, the deletes by exact key of what two rules select — the policies carrying imsd's fingerprint and the reqid-1/2 transport-mode ESP states in their direction or on the UE's ims-PDN address, whoever installed them (§12). |
 | `interfaces/Imsd-Messages.cppm` | `imsd::msg` — every SIP request and response imsd sends, built from an explicit `Context` and per-request variables so the builders are pure functions; byte-pinned by `tests/Messages`. Also `IsEmergency`. |
 | `interfaces/Imsd-Engine.cppm` | `imsd::engine` — the decisions as pure reducers: `CallMachine` (one call's dialog, returning `Action`s for the shell) and `RegRecovery` (the registration recovery policy, §7.4). |
 | `interfaces/ImsdBus.cppm` | `imsd::bus` — the polkit gate in front of call control, shared by imsd and imsd-ofonod. GLib, so outside `imsd-core`. |
@@ -95,7 +95,11 @@ refusal's Retry-After fed as a hold, the old registration written off after
 any failed resume), the `OnLink` read that writes the old registration off
 when its address has left the netdev (`FreshRecover` after a failed move,
 `AddressGone`), and `PacketServiceUp`'s read of
-ModemManager before a silent cycle is counted; the shell's reaction to a NOTIFY
+ModemManager before a silent cycle is counted;
+and the xfrm deletes the SA setup runs — `OwnXfrmDeleteCommands` builds them
+from the kernel text, with a test; the shell reads that text and runs them
+(§12);
+the shell's reaction to a NOTIFY
 terminating our binding (the flow closed at once, or kept under a call and
 closed when the call ends, a reconnect cycle's or the bring-up resume's wait
 ended by it — the reducer's verdict is pinned, the reaction is not); and the
@@ -223,7 +227,13 @@ What the suites pin:
 - `Aka` — the AKAv1-MD5 digest, identity derivation, the `qmicli`/`mmcli`
   text parsers, the AUTHENTICATE APDU and its response parser.
 - `Ipsec` — the exact `ip xfrm` argv lists for the SA pairs, the
-  Security-Server mechanism selection, the SA reader.
+  Security-Server mechanism selection, the SA reader, and
+  `OwnXfrmDeleteCommands` (our pair's eight deletes byte-exact on
+  the fixture in the registered FP6's shape (synthetic addresses and keys), a VPN's tunnel SA and policies beside it
+  untouched, another transport-mode user's pair on other ports and addresses
+  untouched — its reqid-1 ESP state on the UE's address deleted, its AH state
+  left —, a policy-less state on the UE's address deleted, one between
+  other addresses left).
 - `Messages` — every outgoing SIP message byte-for-byte, cross-generated from
   the Python reference stack imsd replaced.
 - `Sip` — the text layer's edge cases (empty header values, line anchoring,
@@ -328,7 +338,14 @@ Rules:
   socket (a silent call) — a pin naming an account with one ran, 2026-10-04.
   `DetectLocal`'s three-tier address ranking for a run without `LOCAL`
   (§10.1) ran through a fake `ip` (2026-10-05: the phone's listing of the
-  netdev and two cut-down ones).
+  netdev and two cut-down ones). The 1.0.0 arms no bench has reached: the SA
+  setup's deletes with another transport-mode user's pair in the kernel
+  (`tests/Ipsec` only — with a VPN's tunnel policy and tunnel state there,
+  left in place through a fresh registration, they ran on the dev phone,
+  2026-10-12); `RunOwnXfrmDeletes`' line for a delete that failed (`… -> rc
+  N`: an entry gone between the read and the delete); the holds file's `pdn`
+  compare in canonical form (no capture stages a holds file whose `pdn` is
+  spelled unlike `LOCAL`).
 - `imsd-media --selftest` round-trips the RFC 4867 payload packing (both
   formats, both AMR codecs) and the G.711 tables. `MIC_SRC=<file>` (raw s16
   PCM at the codec rate, paced in real time) and `PCM_DUMP=1` are test seams
@@ -1084,6 +1101,22 @@ only the imsd side of its bus choice.
   frozen ABI; the writes are polkit-gated (§7.1, §8.1). Do not add an
   ungated write member, and do not add a root translation daemon that
   forwards calls without gating its own callers through `imsd-bus`.
+- imsd deletes by exact key what two rules select, whoever installed it. A
+  fresh registration's SA setup deletes — `ip xfrm state delete src dst proto
+  esp spi`, `ip xfrm policy delete <selector> dir` — what two rules select
+  (`OwnXfrmDeleteCommands`): a transport-mode policy with reqid 1 or 2 whose
+  selector carries the protected port 45061/45062 on the UE side (imsd's
+  fingerprint), and a transport-mode reqid-1/2 ESP state running from such a
+  policy's source to its destination or anchored on the UE's ims-PDN address
+  (a state whose policy add failed goes too; an AH or IPComp state is not
+  selected). Never `ip xfrm state|policy flush`: a policy-based VPN's
+  (strongSwan's, libreswan's) SAs and policies, or another transport-mode
+  user's pair on other ports and addresses, stay. Before 1.0.0 the setup
+  flushed the host's whole xfrm state and policy. Residual: a transport-mode
+  policy with reqid 1 and the UE-side port 45061, or reqid 2 and 45062 — alone
+  or paired, between any addresses — goes, with the reqid-1/2 transport-mode
+  ESP states in its direction, and a reqid-1/2 transport-mode ESP state on the
+  UE's ims-PDN address goes whoever made it (`tests/Ipsec` pins both).
 - The bus policies deliberately let any local account *reach* both names;
   authorization is polkit's, not the policy file's. Keep it that way: a
   policy that names an account breaks the moment the account is called

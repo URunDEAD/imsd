@@ -19,7 +19,11 @@ SPIs in use, which a reregistration's new SPIs must differ from (and the
 state file falls back to) — and a one-mechanism Security-Server value that
 stands in for the Security-Verify when the state file holds no list for the
 SA pair in the kernel (`ChooseResumeSecurityVerify` decides; since 0.3.12
-the 401's own list is stored there).
+the 401's own list is stored there). Since 1.0.0 also
+`OwnXfrmDeleteCommands`: the deletes by exact key of what two rules select —
+the policies carrying imsd's fingerprint and the reqid-1/2 transport-mode ESP
+states in their direction or on the UE's ims-PDN address, whoever installed
+them (§12).
 
 Pure std C++ (the shell runs the commands and captures the text). Command
 shapes and the parser are pinned by tests/Ipsec.
@@ -114,9 +118,11 @@ export namespace imsd::ipsec {
         }
     }
 
-    // The full `ip xfrm` argv sequence to install a fresh SA pair: flush
-    // state+policy, add the four ESP states, add the four transport policies.
-    // Order matches imscall.setup_sa exactly. Callers validate p.alg with
+    // The full `ip xfrm` argv sequence to install a fresh SA pair: the four
+    // ESP states, then the four transport policies — no flush: the caller
+    // takes imsd's previous entries out first (OwnXfrmDeleteCommands), so
+    // another IPsec user's stay. Order otherwise matches imscall.setup_sa.
+    // Callers validate p.alg with
     // KernelAuth() first; an unknown alg goes to the kernel by its own name
     // and is rejected there, never mapped to a default.
     std::vector<std::vector<std::string>> BuildSetupCommands(const SaParams& p) {
@@ -127,8 +133,6 @@ export namespace imsd::ipsec {
         std::vector<std::string> enc = detail::EncArgs(p);
         int plen = imsd::util::Is6(local) ? 128 : 32;
         std::vector<std::vector<std::string>> cmds;
-        cmds.push_back({"ip", "xfrm", "state", "flush"});
-        cmds.push_back({"ip", "xfrm", "policy", "flush"});
         cmds.push_back(detail::StateAdd(local, pcscf, p.spiPs, 1, auth, ikx, enc));
         cmds.push_back(detail::StateAdd(pcscf, local, p.spiUc, 1, auth, ikx, enc));
         cmds.push_back(detail::StateAdd(local, pcscf, p.spiPc, 2, auth, ikx, enc));
@@ -138,10 +142,6 @@ export namespace imsd::ipsec {
         cmds.push_back(detail::PolicyAdd(local, pcscf, plen, p.portUs, p.portPc, "out", local, pcscf, 2));
         cmds.push_back(detail::PolicyAdd(pcscf, local, plen, p.portPc, p.portUs, "in",  pcscf, local, 2));
         return cmds;
-    }
-
-    std::vector<std::vector<std::string>> BuildTeardownCommands() {
-        return {{"ip", "xfrm", "state", "flush"}, {"ip", "xfrm", "policy", "flush"}};
     }
 
     // ---- Security-Server (RFC 3329 §2.2) -----------------------------------
@@ -367,6 +367,21 @@ export namespace imsd::ipsec {
             if (ec != std::errc{} || p != tok.data() + tok.size()) return std::nullopt;
             return v;
         }
+
+        // A policy block of imsd's own: transport mode, reqid 1 or 2, and the
+        // fixed protected port on the UE side — sport PortUc/PortUs on `dir
+        // out`, dport on `dir in` (BuildSetupCommands' PolicyAdd shape). Reqid
+        // and mode alone are anyone's (L2TP/IPsec, a host-to-host SA); the
+        // ports are the fingerprint. The one predicate every reader of the
+        // kernel's policy text uses.
+        inline bool OwnPolicy(std::string_view b) {
+            auto reqid = ParseDec(TokenAfter(b, "reqid "));
+            if (!reqid || (*reqid != 1 && *reqid != 2) || b.find("mode transport") == std::string_view::npos) return false;
+            const int port = *reqid == 1 ? imsd::util::PortUc : imsd::util::PortUs;
+            if (b.find("dir out") != std::string_view::npos) return ParseDec(TokenAfter(b, "sport ")) == port;
+            if (b.find("dir in") != std::string_view::npos) return ParseDec(TokenAfter(b, "dport ")) == port;
+            return false;
+        }
     }
 
     // Reconstruct SA facts from `ip xfrm state` + `ip xfrm policy` text.
@@ -398,7 +413,14 @@ export namespace imsd::ipsec {
             if (src == p && dst == l && *reqid == 2) sa.spiUs = *spi;
         }
         for (std::string_view b : detail::SrcBlocks(policyText)) {
-            if (b.find("dir out") == std::string_view::npos) continue;
+            if (b.find("dir out") == std::string_view::npos || !detail::OwnPolicy(b)) continue;
+            // the ports come from our own pair — a policy of imsd's own
+            // (detail::OwnPolicy) between our two addresses — never from a
+            // foreign policy that happens to carry ports
+            std::string_view srcTok = detail::TokenAfter(b, "src ");
+            std::string_view dstTok = detail::TokenAfter(b, "dst ");
+            if (imsd::util::CanonicalAddr(srcTok.substr(0, srcTok.find('/'))) != l) continue;
+            if (imsd::util::CanonicalAddr(dstTok.substr(0, dstTok.find('/'))) != p) continue;
             auto dport = detail::ParseDec(detail::TokenAfter(b, "dport "));
             auto reqid = detail::ParseDec(detail::TokenAfter(b, "reqid "));
             if (!dport || !reqid) continue;
@@ -451,5 +473,58 @@ export namespace imsd::ipsec {
             if (std::ranges::find(locals, src) == locals.end()) locals.push_back(src);
         }
         return locals;
+    }
+
+    // The `ip xfrm … delete` argv lists that take the entries two rules select
+    // out of the kernel as the two texts show it: every policy
+    // of imsd's own (detail::OwnPolicy — transport mode, reqid 1 or 2, the
+    // fixed protected port on the UE side: the ports BuildSetupCommands
+    // installs), by the selector `ip xfrm policy` prints (src, dst, proto,
+    // sport, dport, dev) and its direction; and every transport-mode ESP state
+    // with reqid 1 or 2 running from such a policy's source to its destination,
+    // or anchored on `local`, the UE's ims-PDN address, by src, dst and SPI —
+    // policy or not: a setup whose policy add failed leaves such states, and
+    // an ESP one another transport-mode user put on that address with reqid 1
+    // or 2 goes with them (§12; an AH or IPComp state is not selected).
+    // Everything else — a policy-based
+    // VPN's tunnel entries, another transport-mode user's on other ports and
+    // addresses — stays: the fresh registration's SA setup runs these before
+    // BuildSetupCommands' adds, and flushes nothing (§12). Residual: a
+    // transport-mode policy with reqid 1 and the UE-side port 45061, or reqid
+    // 2 and 45062, alone or paired, carries the fingerprint and goes with the
+    // reqid-1/2 transport-mode ESP states in its direction, and a reqid-1/2
+    // transport-mode ESP state on `local` goes whoever made it (tests/Ipsec).
+    std::vector<std::vector<std::string>> OwnXfrmDeleteCommands(std::string_view stateText, std::string_view policyText, std::string_view local) {
+        auto addr = [](std::string_view tok) { return imsd::util::CanonicalAddr(tok.substr(0, tok.find('/'))); };
+        const std::string l = imsd::util::CanonicalAddr(local);
+        std::vector<std::pair<std::string, std::string>> pairs;   // (src, dst) of imsd's policies
+        std::vector<std::vector<std::string>> policyDels;
+        for (std::string_view b : detail::SrcBlocks(policyText)) {
+            if (!detail::OwnPolicy(b)) continue;
+            const std::string_view src = detail::TokenAfter(b, "src ");
+            const std::string_view dst = detail::TokenAfter(b, "dst ");
+            pairs.emplace_back(addr(src), addr(dst));
+            // the selector line as `ip xfrm policy` prints it: src dst [proto] [sport] [dport] [dev] — every token
+            // present goes into the delete (the tmpl line's `proto esp` is not the selector's), none is emitted empty
+            const std::string_view sel = b.substr(0, b.find('\n'));
+            std::vector<std::string> del{"ip", "xfrm", "policy", "delete", "src", std::string(src), "dst", std::string(dst)};
+            for (const char* key : {"proto ", "sport ", "dport ", "dev "})
+                if (std::string_view v = detail::TokenAfter(sel, key); !v.empty()) { del.emplace_back(key, std::strlen(key) - 1); del.emplace_back(v); }
+            del.emplace_back("dir"); del.emplace_back(detail::TokenAfter(b, "dir "));
+            policyDels.push_back(std::move(del));
+        }
+        std::vector<std::vector<std::string>> cmds;
+        for (std::string_view b : detail::SrcBlocks(stateText)) {
+            if (b.find("proto esp ") == std::string_view::npos) continue;   // the delete names proto esp: an AH or IPComp state is not this rule's
+            if (b.find("reqid 1 mode transport") == std::string_view::npos && b.find("reqid 2 mode transport") == std::string_view::npos) continue;
+            const std::string_view src = detail::TokenAfter(b, "src ");
+            const std::string_view dst = detail::TokenAfter(b, "dst ");
+            bool mine = !l.empty() && (addr(src) == l || addr(dst) == l);
+            for (const auto& p : pairs) if (p.first == addr(src) && p.second == addr(dst)) { mine = true; break; }
+            if (!mine) continue;
+            cmds.push_back({"ip", "xfrm", "state", "delete", "src", std::string(src), "dst", std::string(dst), "proto", "esp", "spi", std::string(detail::TokenAfter(b, "spi "))});
+        }
+        cmds.insert(cmds.end(), policyDels.begin(), policyDels.end());
+        return cmds;
     }
 }

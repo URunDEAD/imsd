@@ -101,6 +101,54 @@ int main() {
         Check(SaLocals(State, "2001:db8::999").empty(), "SaLocals: no SA to that P-CSCF -> none");
     }
 
+    // ---- OwnXfrmDeleteCommands: imsd's own entries out of the kernel by exact key; everything else stays
+    {
+        const std::string ue = "2001:db8:1111:2222:3333:4444:5555:db43";
+        // a policy-based VPN's: a tunnel policy (v6, reqid 1), an IPv4 one to 0.0.0.0/0, a tunnel SA
+        const std::string vpn = "src 2001:db8::1/128 dst 2001:db8::2/128 \n\tdir out priority 0 \n\ttmpl src 2001:db8::1 dst 2001:db8::2\n\t\tproto esp reqid 1 mode tunnel\n";
+        const std::string vpn4 = "src 192.0.2.10/32 dst 0.0.0.0/0 \n\tdir out priority 383615 ptype main \n\ttmpl src 192.0.2.10 dst 192.0.2.1\n\t\tproto esp reqid 1 mode tunnel\n";
+        const std::string tunState = "src 2001:db8::1 dst 2001:db8::2\n\tproto esp spi 0x00000777 reqid 7 mode tunnel\n\treplay-window 32 \n";
+        // another transport-mode user's reqid 1 + 2 pair on other ports, with its SA between other addresses
+        const std::string otherOut2 = "src " + ue + "/128 dst 2001:db8::106/128 sport 1 dport 2 \n\tdir out priority 0 \n\ttmpl src " + ue + " dst 2001:db8::106\n\t\tproto esp reqid 2 mode transport\n";
+        const std::string otherOut1 = "src " + ue + "/128 dst 2001:db8::106/128 sport 3 dport 4 \n\tdir out priority 0 \n\ttmpl src " + ue + " dst 2001:db8::106\n\t\tproto esp reqid 1 mode transport\n";
+        const std::string otherState = "src 2001:db8::7 dst 2001:db8::106\n\tproto esp spi 0x00000106 reqid 2 mode transport\n\treplay-window 0 \n";
+        auto dels = OwnXfrmDeleteCommands(State, Policy, ue);
+        Check(dels.size() == 8, "OwnXfrmDeleteCommands: our four states and four policies -> 8 deletes");
+        Check(dels.size() == 8 && Join(dels[0]) == "ip xfrm state delete src 2001:db8::105 dst " + ue + " proto esp spi 0x0a84ab2f", "OwnXfrmDeleteCommands: a state by src, dst and SPI, byte-exact");
+        Check(dels.size() == 8 && Join(dels[4]) == "ip xfrm policy delete src 2001:db8::105/128 dst " + ue + "/128 sport 33421 dport 45062 dir in", "OwnXfrmDeleteCommands: a policy by its selector and direction, byte-exact");
+        Check(dels.size() == 8 && Join(dels[1]) == "ip xfrm state delete src " + ue + " dst 2001:db8::105 proto esp spi 0x0526f2c1" && Join(dels[2]) == "ip xfrm state delete src 2001:db8::105 dst " + ue + " proto esp spi 0x0071acd4" && Join(dels[3]) == "ip xfrm state delete src " + ue + " dst 2001:db8::105 proto esp spi 0x0526f2c0",
+              "OwnXfrmDeleteCommands: the other three states byte-exact, in the kernel's order");
+        Check(dels.size() == 8 && Join(dels[5]) == "ip xfrm policy delete src " + ue + "/128 dst 2001:db8::105/128 sport 45062 dport 33421 dir out" && Join(dels[6]) == "ip xfrm policy delete src 2001:db8::105/128 dst " + ue + "/128 sport 6000 dport 45061 dir in" && Join(dels[7]) == "ip xfrm policy delete src " + ue + "/128 dst 2001:db8::105/128 sport 45061 dport 6000 dir out",
+              "OwnXfrmDeleteCommands: the other three policies byte-exact, in the kernel's order");
+        auto besideVpn = OwnXfrmDeleteCommands(std::string(State) + tunState, std::string(Policy) + vpn + vpn4, ue);
+        Check(besideVpn.size() == 8 && std::ranges::none_of(besideVpn, [](const auto& c) { auto j = Join(c); return j.contains("2001:db8::2") || j.contains("192.0.2.10") || j.contains("0x00000777"); }),
+              "OwnXfrmDeleteCommands: a VPN's tunnel SA and two tunnel policies beside ours -> ours only, theirs untouched");
+        Check(OwnXfrmDeleteCommands(otherState, otherOut2 + otherOut1, ue).empty(), "OwnXfrmDeleteCommands: another transport-mode reqid 1 + 2 pair on other ports, with its SA between other addresses -> nothing deleted");
+        Check(OwnXfrmDeleteCommands(std::string(State) + otherState, std::string(Policy) + otherOut2 + otherOut1, ue).size() == 8, "OwnXfrmDeleteCommands: the same beside our pair -> ours only");
+        Check(OwnXfrmDeleteCommands("", "", ue).empty(), "OwnXfrmDeleteCommands: nothing -> nothing");
+        Check(OwnXfrmDeleteCommands(State, "", ue).size() == 4, "OwnXfrmDeleteCommands: policy-less states of imsd's on the UE's address are deleted (a setup whose policy add failed leaves them)");
+        Check(OwnXfrmDeleteCommands(otherState, "", ue).empty(), "OwnXfrmDeleteCommands: a policy-less state between other addresses is left");
+        // the fingerprint selects, not a pair: a lone transport-mode reqid-1 policy carrying the protected port between other addresses goes, with the reqid-1 state between them (the §12 residual)
+        const std::string loneOther = "src 2001:db8::7/128 dst 2001:db8::106/128 sport 45061 dport 4 \n\tdir out priority 0 \n\ttmpl src 2001:db8::7 dst 2001:db8::106\n\t\tproto esp reqid 1 mode transport\n";
+        const std::string loneOtherState = "src 2001:db8::7 dst 2001:db8::106\n\tproto esp spi 0x00000107 reqid 1 mode transport\n\treplay-window 0 \n";
+        Check(OwnXfrmDeleteCommands(loneOtherState, loneOther, ue).size() == 2, "OwnXfrmDeleteCommands: a lone policy carrying the fingerprint between other addresses, and the reqid-1 state in its direction, are deleted (the fingerprint selects, not a pair)");
+        // a reqid-1/2 transport-mode state on the UE's address goes whoever made it: the other user's SA between the UE address and its peer, its policies on other ports staying (the §12 residual)
+        const std::string otherOnUe = "src " + ue + " dst 2001:db8::106\n\tproto esp spi 0x00000108 reqid 1 mode transport\n\treplay-window 0 \n";
+        auto onUe = OwnXfrmDeleteCommands(otherOnUe, otherOut2 + otherOut1, ue);
+        Check(onUe.size() == 1 && Join(onUe[0]) == "ip xfrm state delete src " + ue + " dst 2001:db8::106 proto esp spi 0x00000108", "OwnXfrmDeleteCommands: another transport-mode user's reqid-1 state on the UE's address is deleted whoever made it; its policies on other ports stay (the §12 residual)");
+        Check(OwnXfrmDeleteCommands("src " + ue + " dst 2001:db8::106\n\tproto ah spi 0x00000109 reqid 1 mode transport\n\treplay-window 0 \n", otherOut2 + otherOut1, ue).empty(), "OwnXfrmDeleteCommands: an AH reqid-1 transport state on the UE's address is not selected (the delete names proto esp)");
+        // the selector as `ip xfrm policy` prints it: a fingerprinted policy with a protocol (and a dev) keeps them in its delete, a missing port is no empty token
+        const std::string protoOther = "src 2001:db8::7/128 dst 2001:db8::106/128 proto udp sport 45061 dport 4 \n\tdir out priority 0 \n\ttmpl src 2001:db8::7 dst 2001:db8::106\n\t\tproto esp reqid 1 mode transport\n";
+        auto protoDels = OwnXfrmDeleteCommands("", protoOther, ue);
+        Check(protoDels.size() == 1 && Join(protoDels[0]) == "ip xfrm policy delete src 2001:db8::7/128 dst 2001:db8::106/128 proto udp sport 45061 dport 4 dir out", "OwnXfrmDeleteCommands: a fingerprinted policy with a protocol in its selector is deleted by that selector (proto kept; the tmpl's 'proto esp' is not the selector's)");
+        const std::string portlessOther = "src 2001:db8::7/128 dst 2001:db8::106/128 sport 45061 dev qmapmux0.0 \n\tdir out priority 0 \n\ttmpl src 2001:db8::7 dst 2001:db8::106\n\t\tproto esp reqid 1 mode transport\n";
+        auto portlessDels = OwnXfrmDeleteCommands("", portlessOther, ue);
+        Check(portlessDels.size() == 1 && Join(portlessDels[0]) == "ip xfrm policy delete src 2001:db8::7/128 dst 2001:db8::106/128 sport 45061 dev qmapmux0.0 dir out", "OwnXfrmDeleteCommands: a selector without a dport and with a dev -> no empty token, the dev kept");
+        // the SA reader's ports come from our pair, never from a foreign transport policy that happens to carry ports
+        auto saBeside = ParseExistingSa(State, std::string(Policy) + otherOut2, "2001:db8::105", ue);
+        Check(saBeside && saBeside->portPc == 33421 && saBeside->portPs == 6000, "ParseExistingSa: a foreign transport policy's ports beside ours are not taken");
+    }
+
     // ---- fresh setup command sequence
     {
         SaParams p;
@@ -111,23 +159,21 @@ int main() {
         p.spiUc = 100; p.spiUs = 200; p.spiPc = 300; p.spiPs = 400;
         p.portUc = 45061; p.portUs = 45062; p.portPs = 6000; p.portPc = 33421;
         auto cmds = BuildSetupCommands(p);
-        Check(cmds.size() == 10, "flush x2 + 4 states + 4 policies");
-        Check(Join(cmds[0]) == "ip xfrm state flush", "state flush first");
-        Check(Join(cmds[1]) == "ip xfrm policy flush", "policy flush second");
+        Check(cmds.size() == 8, "4 states + 4 policies, no flush (OwnXfrmDeleteCommands takes imsd's previous entries out)");
         // reqid1 outbound state: src LOCAL dst P spi=spiPs, IK auth, CK enc
-        Check(Join(cmds[2]) ==
+        Check(Join(cmds[0]) ==
               "ip xfrm state add src 2001:db8::db43 dst 2001:db8::105 "
               "proto esp spi 400 mode transport reqid 1 "
               "auth-trunc hmac(sha1) 0xabababababababababababababababab 96 "
               "enc cbc(aes) 0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
               "state add reqid1 outbound byte-exact");
         // first out policy: sport PORT_UC dport PORT_PS reqid 1
-        Check(Join(cmds[6]) == "ip xfrm policy add src 2001:db8::db43/128 dst 2001:db8::105/128 " "sport 45061 dport 6000 dir out tmpl src 2001:db8::db43 " "dst 2001:db8::105 proto esp reqid 1 mode transport", "policy add out reqid1 byte-exact");
+        Check(Join(cmds[4]) == "ip xfrm policy add src 2001:db8::db43/128 dst 2001:db8::105/128 " "sport 45061 dport 6000 dir out tmpl src 2001:db8::db43 " "dst 2001:db8::105 proto esp reqid 1 mode transport", "policy add out reqid1 byte-exact");
         // v4 uses /32
         SaParams p4 = p;
         p4.local = "10.0.0.2"; p4.pcscf = "10.0.0.1";
         auto c4 = BuildSetupCommands(p4);
-        Check(c4[6][5] == "10.0.0.2/32", "v4 prefix length /32");
+        Check(c4[4][5] == "10.0.0.2/32", "v4 prefix length /32");
     }
     // null cipher -> cipher_null + empty key arg
     {
@@ -137,7 +183,7 @@ int main() {
         p.ck = {};
         p.ealg = "null";
         auto cmds = BuildSetupCommands(p);
-        auto& st = cmds[2];
+        auto& st = cmds[0];
         Check(st[st.size() - 3] == "enc" && st[st.size() - 2] == "cipher_null" && st[st.size() - 1].empty(), "null cipher: cipher_null + empty key");
     }
 
@@ -149,7 +195,7 @@ int main() {
         p.ck = {};
         p.alg = "hmac-md5-96"; p.ealg = "null";
         auto cmds = BuildSetupCommands(p);
-        Check(cmds[2][17] == "hmac(md5)" && cmds[2][18] == "0x01010101010101010101010101010101" && cmds[2][19] == "96", "md5: auth-trunc hmac(md5) IK 96");
+        Check(cmds[0][17] == "hmac(md5)" && cmds[0][18] == "0x01010101010101010101010101010101" && cmds[0][19] == "96", "md5: auth-trunc hmac(md5) IK 96");
         Check(KernelAuth("hmac-sha-1-96") == "hmac(sha1)" && KernelAuth("hmac-md5-96") == "hmac(md5)" && !KernelAuth("hmac-sha-256-128"), "KernelAuth names");
         Check(KnownEalg("null") && KnownEalg("aes-cbc") && KnownEalg("des-ede3-cbc") && !KnownEalg("aes-gcm") && !KnownEalg("") && !KnownEalg("3des"), "KnownEalg set (canonical names only)");
     }

@@ -114,6 +114,18 @@ std::string RedactKeys(const std::vector<std::string>& argv) {
     return s;
 }
 
+// imsd's own xfrm entries out of the kernel, each by its key (the
+// OwnXfrmDeleteCommands list — never `ip xfrm … flush`: another IPsec user's
+// entries, a policy-based VPN's, stay, §12); a delete that fails (an entry
+// gone between the read and the delete) is logged and the rest go on. At
+// file scope, as LoadHolds and PersistHolds are.
+void RunOwnXfrmDeletes(const std::vector<std::vector<std::string>>& cmds) {
+    for (auto& cmd : cmds) {
+        int rc = RunCmd(cmd);
+        if (rc != 0) Log(std::format("{} -> rc {}", RedactKeys(cmd), rc));
+    }
+}
+
 // ---- small text extractors (401 header params, qmicli "completed:") -------
 
 std::optional<std::string> QuotedAfter(std::string_view text, std::string_view key) {
@@ -1471,6 +1483,13 @@ private:
         sp.portUc = PortUc; sp.portUs = PortUs; sp.portPs = portPs; sp.portPc = portPc;
         sp.alg = alg;
         sp.ealg = ealg;
+        // imsd's previous pair out first, each entry by its key — not `ip xfrm …
+        // flush`: another IPsec user's entries (a policy-based VPN's) stay (§12)
+        {
+            auto state = RunCapture({"ip", "xfrm", "state"});
+            auto policy = RunCapture({"ip", "xfrm", "policy"});
+            RunOwnXfrmDeletes(imsd::ipsec::OwnXfrmDeleteCommands(state.out, policy.out, local_));
+        }
         saReplaced_ = true;   // from here on the old registration's SAs are gone
         for (auto& cmd : imsd::ipsec::BuildSetupCommands(sp)) {
             int rc = RunCmd(cmd);
@@ -1501,7 +1520,7 @@ private:
             if (autoTcp) {
                 // Two unanswered TCP connects: treat the P-CSCF as UDP-only
                 // and register again over UDP — a new challenge and a new SA
-                // pair (the SA setup flushes this one), same ports.
+                // pair (the SA setup takes this one out), same ports.
                 Log("protected TCP connect unanswered; registering fresh over UDP");
                 SetTransport(Transport::Udp);
                 FreshRegisterAttempt();
@@ -1873,7 +1892,7 @@ private:
     }
 
     // The rest of what a restart does, in place: a new Call-ID, a new
-    // challenge, a new SA pair (FreshRegister flushes the old ones), then
+    // challenge, a new SA pair (FreshRegister takes the old ones out), then
     // the post-registration steps. A refused or throttled attempt waits on
     // the throttle schedule (a wait no Dial cuts short — on KPN a refused
     // attempt costs the old registration) and a silent one on the
