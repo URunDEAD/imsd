@@ -11,7 +11,10 @@
 // reject -> 486, remote CANCEL -> 200+487, unusable offer -> 488 (naming
 // what was offered), a landline gateway's G.711-only and AMR-NB offers
 // ring and are answered at the offer's own payload types, ring timeout ->
-// 480, BYE both ways. Then RegRecovery, the registration recovery policy:
+// 480, BYE both ways. DTMF: the tones reach the media leg on an active
+// call that negotiated telephone-event, and are dropped — with the reason
+// — before the answer, after the call, without the negotiation or with a
+// character that is no tone. Then RegRecovery, the registration recovery policy:
 // the refusal and silence thresholds, local refusals, the reconnect and
 // fresh backoffs, the throttle schedule, Retry-After, which waits a Dial
 // may cut short, when the old registration counts as gone, the holds a
@@ -90,6 +93,21 @@ namespace {
             "v=0\r\no=- 1 1 IN IP6 2001:db8::9\r\ns=-\r\nc=IN IP6 2001:db8::9\r\n"
             "t=0 0\r\nm=audio 6004 RTP/AVP 97\r\na=rtpmap:97 AMR-WB/16000/1\r\n", callid);
     }
+    // A 200 OK around an arbitrary SDP answer, Content-Length from it — a
+    // message the shell's framing would deliver whole.
+    std::string R200Sdp(std::string_view callid, std::string_view sdp) {
+        return std::format(
+            "SIP/2.0 200 OK\r\n"
+            "Via: SIP/2.0/TCP [2001:db8::db43]:45061;branch=z9hG4bKx\r\n"
+            "From: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>;tag=it\r\n"
+            "To: <sip:1233@ims>;tag=remote7\r\n"
+            "Call-ID: {}\r\n"
+            "CSeq: 1 INVITE\r\n"
+            "Contact: <sip:termgw@[2001:db8::9]:5060>\r\n"
+            "Content-Type: application/sdp\r\n"
+            "Content-Length: {}\r\n\r\n{}", callid, sdp.size(), sdp);
+    }
+    constexpr std::string_view SdpHead = "v=0\r\no=- 1 1 IN IP6 2001:db8::9\r\ns=-\r\nc=IN IP6 2001:db8::9\r\nt=0 0\r\n";
     std::string Final(std::string_view callid, int code, std::string_view text) {
         return std::format(
             "SIP/2.0 {} {}\r\n"
@@ -209,6 +227,7 @@ int main() {
         Check(media && media->media.remotePort == 6004, "media remote port");
         Check(media && media->media.payloadType == 97, "media pt");
         Check(media && media->media.codec == "AMR-WB", "media codec");
+        Check(media && !media->media.dtmfPt, "an answer without telephone-event: the leg has no DTMF pt");
         const Action* active = Find(a200, Action::Type::State);
         Check(active && active->state == "active" && active->reason == "accepted", "200 emits active/accepted");
         Check(m.State() == CallState::Active, "state active");
@@ -220,6 +239,12 @@ int main() {
         Check(!Has(a200b, Action::Type::StartMedia) && !Has(a200b, Action::Type::State), "retransmitted 200: no second media start, no state action");
         Check(m.State() == CallState::Active, "state still active after the retransmit");
 
+        // DTMF on a call whose answer negotiated no telephone-event: dropped, said why
+        auto adt = m.OnDtmf("1");
+        Check(!Has(adt, Action::Type::SendDtmf), "no telephone-event negotiated: no SendDtmf");
+        const Action* dtLog = Find(adt, Action::Type::Log);
+        Check(dtLog && dtLog->text == "call ims-call-1: DTMF '1' dropped: no telephone-event negotiated for this call", "...and the line says so");
+
         // media leg exits code 3 (downlink dried up) -> BYE + terminated
         auto amx = m.OnMediaExit(3);
         Check(Sent(amx, "BYE ") != nullptr, "media far-end hangup sends BYE");
@@ -228,6 +253,43 @@ int main() {
         Check(Has(amx, Action::Type::StopMedia), "stops media");
         Check(Has(amx, Action::Type::Deleted), "emits deleted");
         Check(m.Terminated(), "terminated");
+    }
+
+    // ---- DTMF, outgoing: the answer echoes our telephone-event/16000 at pt
+    //      98; the tones go to the leg once active, in upper case, and are
+    //      dropped before the answer, with a character that is no tone,
+    //      and after the call
+    {
+        imsd::util::Rng rng(43);
+        CallMachine m(c, rng, "ims-call-1d", "1233", 50004, false);
+        m.Start();
+        auto early = m.OnDtmf("1");
+        Check(!Has(early, Action::Type::SendDtmf), "DTMF while dialing: not sent");
+        const Action* earlyLog = Find(early, Action::Type::Log);
+        Check(earlyLog && earlyLog->text == "call ims-call-1d: DTMF '1' dropped: the call is dialing", "...the line names the state");
+        auto a200 = m.OnInviteResponse(R200Sdp(m.CallId(), std::format("{}m=audio 6004 RTP/AVP 97 98 100\r\na=rtpmap:97 AMR-WB/16000/1\r\na=rtpmap:98 telephone-event/16000\r\na=rtpmap:100 telephone-event/8000\r\n", SdpHead)));
+        const Action* media = Find(a200, Action::Type::StartMedia);
+        Check(media && media->media.dtmfPt == 98, "the leg carries the answer's telephone-event pt at the codec's clock (98, not the narrowband 100)");
+        Check(m.State() == CallState::Active, "active");
+        auto sent = m.OnDtmf("12#*a");
+        const Action* dt = Find(sent, Action::Type::SendDtmf);
+        Check(dt && dt->text == "12#*A", "active + negotiated: SendDtmf with the tones, letters upper-cased");
+        const Action* dtLog = Find(sent, Action::Type::Log);
+        Check(dtLog && dtLog->text == "call ims-call-1d: DTMF '12#*A' -> media leg (telephone-event pt 98)", "...and the line names the pt");
+        auto bad = m.OnDtmf("1x");
+        Check(!Has(bad, Action::Type::SendDtmf), "a character that is no tone: nothing sent, not even the '1'");
+        const Action* badLog = Find(bad, Action::Type::Log);
+        Check(badLog && badLog->text == "call ims-call-1d: DTMF '1x' dropped: 'x' is not a tone", "...the line names the character");
+        Check(m.OnDtmf("").empty(), "an empty string: nothing, silently");
+        const std::string atMost(DtmfMaxTones, '1');
+        auto most = m.OnDtmf(atMost);
+        const Action* maxDt = Find(most, Action::Type::SendDtmf);
+        Check(maxDt && maxDt->text == atMost, "a string of DtmfMaxTones tones goes");
+        auto tooMany = m.OnDtmf(std::format("{}1", atMost));
+        Check(!Has(tooMany, Action::Type::SendDtmf) && Find(tooMany, Action::Type::Log) && Find(tooMany, Action::Type::Log)->text == std::format("call ims-call-1d: DTMF of {} tones dropped: more than {}", DtmfMaxTones + 1, DtmfMaxTones), "one more: dropped, the line names the bound");
+        m.OnHangup();
+        auto late = m.OnDtmf("5");
+        Check(!Has(late, Action::Type::SendDtmf) && Find(late, Action::Type::Log) && Find(late, Action::Type::Log)->text.ends_with("the call is terminated"), "DTMF after the call: dropped, the line names the state");
     }
 
     // ---- remote BYE mid-call
@@ -368,6 +430,11 @@ int main() {
         Check(ok && ok->text.contains("a=rtpmap:104 AMR-WB/16000/1\r\n"), "answer keeps AMR-WB at the offer's pt");
         Check(ok && ok->text.contains("a=fmtp:104 octet-align=1\r\n"), "answer mirrors octet-align");
         Check(ok && ok->text.contains("a=rtpmap:105 telephone-event/16000\r\n"), "answer keeps telephone-event");
+        const Action* mtMedia = Find(aa, Action::Type::StartMedia);
+        Check(mtMedia && mtMedia->media.dtmfPt == 105, "incoming: the leg carries the offer's telephone-event pt");
+        auto mtDtmf = m.OnDtmf("9");
+        const Action* mtDt = Find(mtDtmf, Action::Type::SendDtmf);
+        Check(mtDt && mtDt->text == "9", "incoming, accepted: the tones go to the leg");
         Check(ok && ok->text.contains("Session-Expires: 1800;refresher=uac\r\n"), "200 echoes Session-Expires, caller refreshes");
         Check(ok && ok->text.contains("Contact: <sip:001010123456789@"), "200 carries our Contact");
         // the 180 and 200 carry the SAME To tag (one dialog)

@@ -31,6 +31,7 @@ reach the bus via g_idle_add, where the calls table + status snapshot live
 #include <gio/gio.h>
 #include <glib-unix.h>
 #include <ifaddrs.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -1052,6 +1053,10 @@ public:
         std::scoped_lock g(cmdLock_);
         cmds_.push_back({Cmd::Kind::Accept, uni, {}});
     }
+    void SendDtmf(const std::string& uni, const std::string& tones) {
+        std::scoped_lock g(cmdLock_);
+        cmds_.push_back({Cmd::Kind::Dtmf, uni, tones});
+    }
     void Stop() {
         { std::scoped_lock g(cmdLock_); cmds_.push_back({Cmd::Kind::Stop, {}, {}}); }
         quit_.store(true);
@@ -1140,7 +1145,7 @@ public:
     }
 
 private:
-    struct Cmd { enum class Kind { Dial, HangUp, Accept, Stop } kind; std::string uni, number; };
+    struct Cmd { enum class Kind { Dial, HangUp, Accept, Dtmf, Stop } kind; std::string uni, arg; };   // arg: the number to dial, or the tones
     struct Stopping {};   // the engine was told to stop while a bring-up waited
 
     // A bring-up the network deferred (a fresh-SA throttle) or refused: wait
@@ -1247,6 +1252,7 @@ private:
     bool dropCall_ = false;
     bool closeFlowWhenIdle_ = false;   // a binding was terminated under a call: its flow closes with the call
     pid_t mediaPid_ = -1;
+    int mediaCtl_ = -1;       // our end of the leg's control pipe (its stdin)
     double deadline_ = 0;
     // reply_ answers the inbound request being dispatched right now;
     // callReply_ is the call's durable response channel — refreshed from
@@ -2368,8 +2374,8 @@ private:
     bool ClearForDial(const Cmd& c, bool emergency) {
         if (!call_) return true;
         if (!emergency) {
-            Log(std::format("dial({}) refused: call in progress", c.number));
-            CallInfo bad{c.uni, c.number, "terminated", "error", NowEpoch(), 0};
+            Log(std::format("dial({}) refused: call in progress", c.arg));
+            CallInfo bad{c.uni, c.arg, "terminated", "error", NowEpoch(), 0};
             PostAdded(bad);
             PostState(c.uni, "terminated", "error");
             PostDeleted(c.uni);
@@ -2385,7 +2391,7 @@ private:
     void HandleCmd(const Cmd& c) {
         if (c.kind == Cmd::Kind::Stop) { quit_.store(true); return; }
         if (c.kind == Cmd::Kind::Dial) {
-            bool emergency = imsd::msg::IsEmergency(c.number, emergencyExtra_);
+            bool emergency = imsd::msg::IsEmergency(c.arg, emergencyExtra_);
             if (!ClearForDial(c, emergency)) return;
             // a dead client flow fails the INVITE instantly — give the
             // recovery path one immediate shot first: user action cuts the
@@ -2404,9 +2410,9 @@ private:
             if (emergency)
                 Log(std::format("EMERGENCY dial ({}): urn:service:sos over the live registration, "
                                 "fallback plain INVITE — stage 1, no emergency registration/PDN; "
-                                "carrier-side behavior UNVERIFIED", c.number));
-            call_.emplace(ctx_, rng_, c.uni, c.number, rtpPort_, precond_, emergency, codecs_);
-            CallInfo info{c.uni, c.number, "dialing", "outgoing", NowEpoch(), 0};
+                                "carrier-side behavior UNVERIFIED", c.arg));
+            call_.emplace(ctx_, rng_, c.uni, c.arg, rtpPort_, precond_, emergency, codecs_);
+            CallInfo info{c.uni, c.arg, "dialing", "outgoing", NowEpoch(), 0};
             PostAdded(info);
             bool ok = Execute(call_->Start());
             if (!ok && call_ && !call_->Terminated()) { Execute(call_->Fail("error")); }
@@ -2416,6 +2422,9 @@ private:
         } else if (c.kind == Cmd::Kind::Accept) {
             if (call_ && call_->Uni() == c.uni) { Execute(call_->OnAccept()); MaybeDropCall(); }
             else Log(std::format("Accept({}) ignored: no such ringing call", c.uni));
+        } else if (c.kind == Cmd::Kind::Dtmf) {
+            if (call_ && call_->Uni() == c.uni) Execute(call_->OnDtmf(c.arg));
+            else Log(std::format("SendDtmf({}, '{}') ignored: no such call", c.uni, c.arg));
         }
     }
 
@@ -2515,6 +2524,7 @@ private:
                     break;
                 case T::StartMedia: StartMedia(a.media); break;
                 case T::StopMedia: StopMedia(); break;
+                case T::SendDtmf: SendDtmfToMedia(a.text); break;
                 case T::State:
                     if (announce) PostState(call_->Uni(), a.state, a.reason);
                     break;
@@ -2541,7 +2551,7 @@ private:
 
     void StartMedia(const imsd::engine::MediaLeg& leg) {
         if (!leg.Valid()) { Log("SDP answer missing media endpoint; no media leg"); return; }
-        Log(std::format("media {} pt={} octet={} -> [{}]:{}", leg.codec, leg.payloadType, leg.octetAlign, leg.remoteIp, leg.remotePort));
+        Log(std::format("media {} pt={} octet={} -> [{}]:{}, telephone-event pt {}", leg.codec, leg.payloadType, leg.octetAlign, leg.remoteIp, leg.remotePort, leg.dtmfPt ? std::to_string(*leg.dtmfPt) : std::string("none")));
         if (Is6(leg.remoteIp)) RunCmd({"ip", "-6", "route", "replace", leg.remoteIp, "dev", dev_});
         else
             RunCmd({"ip", "route", "replace", leg.remoteIp, "dev", dev_});
@@ -2555,8 +2565,21 @@ private:
             session = ResolveAudioSession();
             Log(AudioSessionLine(session) + (session.name.empty() ? "; this call has no audio" : ""));
         }
+        // the control pipe: imsd-media reads `dtmf <tones>` lines on its
+        // stdin (§7.6); our end closes with the leg, no other child inherits
+        // it, and it never blocks the engine thread — a leg that stopped
+        // reading fails the write (EAGAIN once the pipe is full) instead
+        int ctl[2] = {-1, -1};
+        if (pipe(ctl) != 0) {
+            Log(std::format("media control pipe: {}; this call has no DTMF", std::strerror(errno)));
+        } else {
+            fcntl(ctl[0], F_SETFD, FD_CLOEXEC);
+            fcntl(ctl[1], F_SETFD, FD_CLOEXEC);
+            fcntl(ctl[1], F_SETFL, O_NONBLOCK);
+        }
         pid_t pid = fork();
         if (pid == 0) {
+            if (ctl[0] >= 0) dup2(ctl[0], STDIN_FILENO);   // dup2 clears the close-on-exec
             if (geteuid() == 0) {
                 // no session is said with an empty value: imsd-media reads a
                 // missing variable as a caller older than 0.3.10
@@ -2570,16 +2593,42 @@ private:
             setenv("DTX", EnvOr("DTX", "0").c_str(), 1);
             setenv("OCTET_ALIGN", leg.octetAlign ? "1" : "0", 1);
             setenv("CODEC", leg.codec.c_str(), 1);
+            setenv("DTMF_PT", leg.dtmfPt ? std::to_string(*leg.dtmfPt).c_str() : "", 1);
             std::vector<char*> c;
             for (auto& s : argv) c.push_back(const_cast<char*>(s.c_str()));
             c.push_back(nullptr);
             execvp(c[0], c.data());
             _exit(127);
         }
+        if (ctl[0] >= 0) close(ctl[0]);
+        if (pid < 0 && ctl[1] >= 0) { close(ctl[1]); ctl[1] = -1; }
         mediaPid_ = pid;
+        mediaCtl_ = ctl[1];
+    }
+
+    // The engine's SendDtmf action: one `dtmf <tones>` line down the
+    // control pipe, whole or not at all — a write of at most PIPE_BUF bytes
+    // to a pipe is atomic, and the engine's DtmfMaxTones keeps the line
+    // under it (a longer line is refused here too, never half-written to
+    // be joined with the next). The leg may have died since the action was
+    // decided (its exit is reaped on this thread, after the actions ran):
+    // then the write fails with EPIPE — SIGPIPE is ignored in main() — and
+    // the tones are lost with the call, which the reap ends.
+    void SendDtmfToMedia(const std::string& tones) {
+        if (mediaCtl_ < 0) { Log(std::format("DTMF '{}' not sent: no control pipe to the media leg", tones)); return; }
+        const std::string line = std::format("dtmf {}\n", tones);
+        if (line.size() > PIPE_BUF) { Log(std::format("DTMF of {} tones not sent: longer than the control pipe's atomic write", tones.size())); return; }
+        const ssize_t n = write(mediaCtl_, line.data(), line.size());
+        if (n != static_cast<ssize_t>(line.size())) Log(std::format("DTMF '{}' not sent: {}", tones, n < 0 ? std::strerror(errno) : "short write to the media leg"));
+    }
+
+    void CloseMediaCtl() {
+        if (mediaCtl_ >= 0) close(mediaCtl_);
+        mediaCtl_ = -1;
     }
 
     void StopMedia() {
+        CloseMediaCtl();
         if (mediaPid_ <= 0) return;
         kill(mediaPid_, SIGTERM);
         for (int i = 0; i < 100; i++) {
@@ -2599,6 +2648,7 @@ private:
         if (r == 0) return;  // still running
         int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         mediaPid_ = -1;  // reaped; don't re-terminate
+        CloseMediaCtl();
         Execute(call_->OnMediaExit(code));
         MaybeDropCall();
     }
@@ -2676,7 +2726,10 @@ void HandleMethodCall(GDBusConnection*, const gchar*, const gchar*, const gchar*
         return;
     }
     if (m == "SendDtmf") {
-        Log("SendDtmf accepted but not yet sent (TODO RFC4733)");
+        const gchar* uni = nullptr;
+        const gchar* tones = nullptr;
+        g_variant_get(params, "(&s&s)", &uni, &tones);
+        TheEngine->SendDtmf(uni ? uni : "", tones ? tones : "");
         g_dbus_method_invocation_return_value(inv, nullptr);
         return;
     }
@@ -2740,6 +2793,11 @@ int main(int argc, char** argv) {
         std::println(std::cerr, "imsd: must run as root (xfrm / qmicli)");
         return 1;
     }
+    // A write to the media leg's control pipe after the leg died must fail
+    // with EPIPE, not end the daemon (the client flow's sends carry
+    // MSG_NOSIGNAL; an inbound connection's reply is a plain write and is
+    // covered by this too).
+    signal(SIGPIPE, SIG_IGN);
 
     // The bring-up found nothing to do (IMSD_IDLE= in /run/imsd.env — the
     // script's arms: no SIM, a refused ims PDN): say so and

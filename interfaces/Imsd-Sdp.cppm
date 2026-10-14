@@ -9,7 +9,9 @@ The offer is by default an AMR-WB (octet-aligned) + AMR + telephone-event
 shape with an optional GSMA IR.92 QoS-precondition block; it is what
 commercial IMS cores expect from a VoLTE UE, and its exact bytes are pinned by
 tests/Sdp. The parser extracts only what the media plane needs: remote
-address/port, the negotiated payload type, the codec and octet-align mode — it
+address/port, the negotiated payload type, the codec and octet-align mode, and
+the telephone-event payload type among the m-line's formats at that codec's
+clock (DTMF, RFC 4733) — it
 reads answers to our offers and inbound offers alike (same fields either way).
 The codecs it knows are the ones imsd-media can play: AMR-WB, AMR (narrowband)
 and G.711 (PCMA/PCMU) — the last two are what a PSTN gateway offers when a
@@ -150,22 +152,68 @@ export namespace imsd::sdp {
         int payloadType = -1;
         bool octetAlign = false;
         std::string codec = "AMR-WB";   // "AMR-WB" | "AMR" | "PCMA" | "PCMU" | "" (none we play)
+        std::optional<int> dtmfPt;      // telephone-event at the codec's clock rate; nullopt = no DTMF
     };
+
+    // Sample rate of a codec we play: AMR-WB is 16 kHz, everything else
+    // (AMR, G.711) is narrowband 8 kHz. Also the RTP clock rate.
+    int CodecRate(std::string_view codec) { return codec == "AMR-WB" ? 16000 : 8000; }
+    constexpr std::string_view Avp = " RTP/AVP ";   // after the m=audio port: the one profile we speak
+
+    // The m=audio line's payload types in its order; empty without the line,
+    // its port or the " RTP/AVP " literal.
+    std::vector<int> AudioFormats(std::string_view body) {
+        std::vector<int> pts;
+        auto m = Find(body, "m=audio ");
+        if (!m) return pts;
+        std::string_view portTok = TokenAt(body, *m + 8);
+        std::size_t afterPort = *m + 8 + portTok.size();
+        if (!ParseInt(portTok) || !body.substr(afterPort).starts_with(Avp)) return pts;
+        // digits + spaces up to CR/LF
+        std::size_t ptsBegin = afterPort + Avp.size();
+        std::size_t ptsEnd = body.find_first_not_of("0123456789 ", ptsBegin);
+        std::string_view ptsRun = body.substr(ptsBegin, ptsEnd == std::string_view::npos ? std::string_view::npos : ptsEnd - ptsBegin);
+        for (auto part : std::views::split(ptsRun, ' '))
+            if (auto v = ParseInt(std::string_view(part))) pts.push_back(*v);
+        return pts;
+    }
+
+    // A payload type's rtpmap encoding, `NAME/CLOCK[/CHANNELS]` upper-cased
+    // (RFC 4566 §6: encoding names are case-insensitive); empty without one.
+    std::string Rtpmap(std::string_view body, int pt) {
+        const std::string key = std::format("a=rtpmap:{} ", pt);
+        auto at = Find(body, key);
+        if (!at) return "";
+        std::size_t begin = *at + key.size();
+        std::size_t end = body.find_first_of("\r\n", begin);
+        std::string enc(body.substr(begin, end == std::string_view::npos ? std::string_view::npos : end - begin));
+        for (char& c : enc)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return enc;
+    }
+
+    // Payload type of `telephone-event/<clockRate>` among the m=audio line's
+    // formats (DTMF, RFC 4733); nullopt when the line lists none. An rtpmap
+    // the line does not list is not negotiated: nothing is sent with a format
+    // the answer does not carry (RFC 3264 §8.3.2). The clock is matched
+    // whole: `/8000` is not `/80000`.
+    std::optional<int> TelephoneEventPt(std::string_view body, int clockRate) {
+        const std::string needle = std::format("TELEPHONE-EVENT/{}", clockRate);
+        for (int pt : AudioFormats(body)) {
+            const std::string enc = Rtpmap(body, pt);
+            const bool whole = enc.size() == needle.size() || (enc.size() > needle.size() && (enc[needle.size()] == '/' || enc[needle.size()] == ' '));
+            if (enc.starts_with(needle) && whole) return pt;
+        }
+        return std::nullopt;
+    }
 
     // The encoding name an offer gives a payload type: its a=rtpmap line,
     // upper-cased (RFC 4566 §6: encoding names are case-insensitive), else
     // the static assignment for 0/8 (RFC 3551 §6 — a G.711 offer may carry
     // no rtpmap at all). Empty when neither applies.
     std::string CodecName(std::string_view body, int pt) {
-        std::string key = std::format("a=rtpmap:{} ", pt);
-        if (auto at = Find(body, key)) {
-            std::size_t nameBegin = *at + key.size();
-            std::size_t nameEnd = body.find_first_of("/\r\n", nameBegin);
-            std::string name(body.substr(nameBegin, nameEnd == std::string_view::npos ? std::string_view::npos : nameEnd - nameBegin));
-            for (char& c : name)
-                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            return name;
-        }
+        const std::string enc = Rtpmap(body, pt);
+        if (!enc.empty()) return enc.substr(0, enc.find('/'));
         if (pt == 0) return "PCMU";
         if (pt == 8) return "PCMA";
         return "";
@@ -202,7 +250,10 @@ export namespace imsd::sdp {
     // non-empty `prefs` replaces the codec order (and restricts acceptance
     // to the codecs named) — the CODECS override. With no acceptable codec
     // at all, the first pt is used and codec comes back EMPTY — pretending
-    // otherwise would defeat codec checks upstream.
+    // otherwise would defeat codec checks upstream. The telephone-event pt
+    // is the one at the chosen codec's clock (an event's rate is its rtpmap
+    // clock, RFC 4733 §2.4.1; an offer with two codec clocks lists
+    // telephone-event at each), so a tone goes out on the stream's own clock.
     Answer ParseAnswer(std::string_view body, std::span<const std::string> prefs = {}) {
         Answer a;
         if (auto at = Find(body, "c=IN IP6 ")) a.ip = TokenAt(body, *at + 9);
@@ -214,17 +265,10 @@ export namespace imsd::sdp {
         auto port = ParseInt(portTok);
         // both the port and the " RTP/AVP " literal are required
         std::size_t afterPort = *m + 8 + portTok.size();
-        constexpr std::string_view Avp = " RTP/AVP ";
         if (!port || !body.substr(afterPort).starts_with(Avp)) return a;
         a.port = *port;
 
-        // payload-type list: digits + spaces up to CR/LF
-        std::size_t ptsBegin = afterPort + Avp.size();
-        std::size_t ptsEnd = body.find_first_not_of("0123456789 ", ptsBegin);
-        std::string_view ptsRun = body.substr(ptsBegin, ptsEnd == std::string_view::npos ? std::string_view::npos : ptsEnd - ptsBegin);
-        std::vector<int> pts;
-        for (auto part : std::views::split(ptsRun, ' '))
-            if (auto v = ParseInt(std::string_view(part))) pts.push_back(*v);
+        std::vector<int> pts = AudioFormats(body);
         if (pts.empty()) return a;
 
         auto hasOctetAlign = [&](int p) {
@@ -261,26 +305,8 @@ export namespace imsd::sdp {
             a.codec.clear();
         }
         a.octetAlign = a.codec.starts_with("AMR") && hasOctetAlign(a.payloadType);
+        if (!a.codec.empty()) a.dtmfPt = TelephoneEventPt(body, CodecRate(a.codec));
         return a;
-    }
-
-    // Payload type of `telephone-event/<clockRate>` in a body's rtpmap lines
-    // (DTMF, RFC 4733); nullopt when the offer doesn't carry one.
-    std::optional<int> TelephoneEventPt(std::string_view body, int clockRate) {
-        std::string needle = std::format("telephone-event/{}", clockRate);
-        std::size_t pos = 0;
-        while ((pos = body.find("a=rtpmap:", pos)) != std::string_view::npos) {
-            std::size_t ptBegin = pos + 9;
-            std::size_t lineEnd = body.find_first_of("\r\n", ptBegin);
-            std::size_t sp = body.find(' ', ptBegin);
-            if (sp != std::string_view::npos && (lineEnd == std::string_view::npos || sp < lineEnd)) {
-                auto pt = ParseInt(body.substr(ptBegin, sp - ptBegin));
-                std::string_view name = body.substr(sp + 1, (lineEnd == std::string_view::npos ? body.size() : lineEnd) - sp - 1);
-                if (pt && name.starts_with(needle)) return pt;
-            }
-            pos = ptBegin;
-        }
-        return std::nullopt;
     }
 
     struct AnswerSpec {
@@ -293,14 +319,11 @@ export namespace imsd::sdp {
         std::optional<int> dtmfPt;      // the offer's telephone-event pt, if any
     };
 
-    // Sample rate of a codec we play: AMR-WB is 16 kHz, everything else
-    // (AMR, G.711) is narrowband 8 kHz. Also the RTP clock rate.
-    int CodecRate(std::string_view codec) { return codec == "AMR-WB" ? 16000 : 8000; }
-
     // SDP answer to an inbound audio offer: single codec at the offer's own
     // payload type, octet-align echoed only when the offer used it (absence
     // = bandwidth-efficient, RFC 4867 §8.1; G.711 has no fmtp at all),
-    // telephone-event kept when offered. b=AS is the codec's peak payload
+    // telephone-event kept when the offer's m-line lists one at the codec's
+    // clock (ParseAnswer's rule). b=AS is the codec's peak payload
     // rate plus IP/UDP/RTP overhead at 20 ms. Byte layout pinned by tests/Sdp.
     std::string BuildAnswer(const AnswerSpec& s) {
         std::string ipver = Is6(s.local) ? "IP6" : "IP4";

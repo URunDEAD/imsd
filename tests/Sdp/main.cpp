@@ -207,7 +207,21 @@ int main() {
             "a=rtpmap:105 telephone-event/16000\r\n"
             "a=rtpmap:106 telephone-event/8000\r\n";
         Check(TelephoneEventPt(offer, 16000) == 105, "telephone-event pt by clock rate");
-        Check(TelephoneEventPt(offer, 8000) == 106, "narrowband telephone-event pt");
+        Check(!TelephoneEventPt(offer, 8000), "an rtpmap the m-line does not list (106 among 104 105) is not negotiated");
+        Check(ParseAnswer(offer).dtmfPt == 105, "the answer's dtmfPt is the one at the chosen codec's clock (AMR-WB: 16000)");
+        std::string both = std::format("{}a=rtpmap:99 AMR/8000/1\r\n", offer);
+        both.replace(both.find("RTP/AVP 104 105"), 15, "RTP/AVP 104 99 105 106");
+        std::array<std::string, 1> nb = {"AMR"};
+        Check(ParseAnswer(both, nb).dtmfPt == 106, "...and the narrowband one when AMR is chosen");
+        Check(TelephoneEventPt(both, 8000) == 106, "listed on the m-line, the narrowband telephone-event pt is found");
+        Check(!ParseAnswer(offer, nb).dtmfPt, "no codec we play chosen: no dtmfPt either");
+        Check(!ParseAnswer("c=IN IP4 192.0.2.1\r\n" "m=audio 5000 RTP/AVP 8\r\n" "a=rtpmap:8 PCMA/8000\r\n").dtmfPt, "no telephone-event in the answer: dtmfPt empty");
+        Check(!ParseAnswer("c=IN IP4 192.0.2.1\r\n" "m=audio 5000 RTP/AVP 8\r\n" "a=rtpmap:8 PCMA/8000\r\n" "a=rtpmap:101 telephone-event/8000\r\n").dtmfPt, "the answer dropped telephone-event from its m-line and kept the rtpmap: not negotiated (RFC 3264 §8.3.2: nothing is sent with a format the answer does not list)");
+        Check(ParseAnswer("c=IN IP4 192.0.2.1\r\n" "m=audio 5000 RTP/AVP 8 101\r\n" "a=rtpmap:101 telephone-event/8000\r\n").dtmfPt == 101, "G.711 answer with telephone-event/8000: dtmfPt 101");
+        Check(!ParseAnswer("c=IN IP4 192.0.2.1\r\n" "m=audio 5000 RTP/AVP 8 101\r\n" "a=rtpmap:101 telephone-event/16000\r\n").dtmfPt, "telephone-event at the wrong clock for the codec is not the call's");
+        Check(ParseAnswer("c=IN IP4 192.0.2.1\r\n" "m=audio 5000 RTP/AVP 8 101\r\n" "a=rtpmap:101 TELEPHONE-EVENT/8000\r\n").dtmfPt == 101, "the name in another case (RFC 4566: case-insensitive)");
+        Check(TelephoneEventPt("m=audio 1 RTP/AVP 98\r\na=rtpmap:98 Telephone-Event/16000/1\r\n", 16000) == 98, "mixed case, with a channel count");
+        Check(!TelephoneEventPt("m=audio 1 RTP/AVP 98\r\na=rtpmap:98 telephone-event/80000\r\n", 8000), "the clock is matched whole: /80000 is not /8000");
         Check(!TelephoneEventPt(offer, 48000).has_value(), "absent clock rate -> nullopt");
         Check(!TelephoneEventPt("m=audio 1 RTP/AVP 0\r\n", 16000).has_value(), "no rtpmap -> nullopt");
     }

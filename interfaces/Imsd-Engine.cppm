@@ -18,8 +18,10 @@ That keeps the whole call FSM — PRACK on reliable 18x, ACK of 2xx vs non-2xx
 finals, CANCEL/answer races, remote BYE, media-plane far-end-hangup, the
 emergency attempt chain (urn:service:sos first for a classified number, one
 fallback to a plain INVITE of the digits; a 380 Alternative Service upgrade
-the other way), and the terminating (UAS) side: 100/180 on an inbound INVITE,
-200-with-answer on Accept, 486 reject, the remote-CANCEL 200+487 pair —
+the other way), the terminating (UAS) side: 100/180 on an inbound INVITE,
+200-with-answer on Accept, 486 reject, the remote-CANCEL 200+487 pair — and
+DTMF, which reaches the media leg only on an active call whose SDP
+negotiated telephone-event, as the tones a keypad has —
 unit-testable against recorded network dialogs with no I/O (tests/Engine).
 
 State/reason strings are the frozen D-Bus vocabulary the dialer maps on
@@ -280,12 +282,15 @@ export namespace imsd::engine {
 
     // Parsed SDP answer needed to bring up the media leg. `codec` is one of
     // imsd-media's: "AMR-WB", "AMR", "PCMA", "PCMU" (empty = none we play).
+    // `dtmfPt` is the telephone-event payload type at the codec's clock
+    // (RFC 4733); nullopt = none negotiated, no DTMF on this call.
     struct MediaLeg {
         std::string remoteIp;
         int remotePort = 0;
         int payloadType = -1;
         bool octetAlign = false;
         std::string codec = "AMR-WB";
+        std::optional<int> dtmfPt;
         bool Valid() const { return !remoteIp.empty() && remotePort > 0 && payloadType >= 0; }
     };
 
@@ -295,6 +300,7 @@ export namespace imsd::engine {
             SendResponse,  // answer the just-handled inbound request on its origin channel
             StartMedia,    // bring up the media leg described by `media`
             StopMedia,     // tear the media leg down
+            SendDtmf,      // hand `text` (the tones) to the running media leg
             State,         // emit CallStateChanged(uni, `state`, `reason`)
             Deleted,       // emit CallDeleted(uni); drop this machine
             SetDeadline,   // arm a setup timer for `seconds`; fire calls OnDeadline()
@@ -307,6 +313,11 @@ export namespace imsd::engine {
         MediaLeg media;
         double seconds = 0;
     };
+
+    // The most tones one SendDtmf may carry (a keypad sends one; a dialer's
+    // string is a short sequence): the leg's `dtmf <tones>\n` line stays
+    // within one atomic pipe write, POSIX's 512-byte PIPE_BUF floor.
+    inline constexpr std::size_t DtmfMaxTones = 128;
 
     // ring/answer budget, and how long to wait for a 487 after CANCEL — the
     // imsd.py INVITE_TIMEOUT / CANCEL_487_TIMEOUT constants.
@@ -435,7 +446,7 @@ export namespace imsd::engine {
             spec.payloadType = leg.payloadType;
             spec.octetAlign = leg.octetAlign;
             spec.codec = leg.codec;
-            spec.dtmfPt = imsd::sdp::TelephoneEventPt(Body(invite_), imsd::sdp::CodecRate(leg.codec));
+            spec.dtmfPt = leg.dtmfPt;
             localSdp_ = imsd::sdp::BuildAnswer(spec);
             // session timers: echo the caller's Session-Expires; with no
             // refresher stated, make the caller (uac) the refresher — its
@@ -608,6 +619,45 @@ export namespace imsd::engine {
             return a;
         }
 
+        // The user pressed keys: the tones go to the media leg as RFC 4733
+        // events on an active call whose SDP negotiated telephone-event at
+        // the codec's clock; otherwise they are dropped with a line that
+        // says why — there is no second method (no SIP INFO).
+        // Upper and lower case letters are one event; anything but 0-9, *,
+        // # and A-D drops the whole string rather than sending part of
+        // what was pressed, and so does a string past DtmfMaxTones — a
+        // keypad sends one key, a dialer's string a short sequence; the
+        // bound keeps the leg's control line within one atomic pipe write
+        // (PIPE_BUF), so a line is sent whole or not at all.
+        std::vector<Action> OnDtmf(std::string_view tones) {
+            std::vector<Action> a;
+            if (tones.size() > DtmfMaxTones) {
+                a.push_back(LogAct(std::format("call {}: DTMF of {} tones dropped: more than {}", uni_, tones.size(), DtmfMaxTones)));
+                return a;
+            }
+            std::string sent;
+            for (char c : tones) {
+                const char u = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (!((u >= '0' && u <= '9') || u == '*' || u == '#' || (u >= 'A' && u <= 'D'))) {
+                    a.push_back(LogAct(std::format("call {}: DTMF '{}' dropped: '{}' is not a tone", uni_, tones, c)));
+                    return a;
+                }
+                sent += u;
+            }
+            if (sent.empty()) return a;
+            if (state_ != CallState::Active) {
+                a.push_back(LogAct(std::format("call {}: DTMF '{}' dropped: the call is {}", uni_, sent, engine::StateStr(state_))));
+                return a;
+            }
+            if (!dtmfPt_) {
+                a.push_back(LogAct(std::format("call {}: DTMF '{}' dropped: no telephone-event negotiated for this call", uni_, sent)));
+                return a;
+            }
+            a.push_back(LogAct(std::format("call {}: DTMF '{}' -> media leg (telephone-event pt {})", uni_, sent, *dtmfPt_)));
+            a.push_back(Action{Action::Type::SendDtmf, sent});
+            return a;
+        }
+
         // The shell is abandoning this machine (an emergency dial preempts
         // it while it waits on a CANCEL's 487): terminate bookkeeping only —
         // the CANCEL already sent stands, and the late final for this
@@ -687,6 +737,7 @@ export namespace imsd::engine {
         bool userCancelled_ = false;   // CANCEL came from OnHangup, not a deadline
         std::set<std::string> pracked_;
         std::string answerSdp_;
+        std::optional<int> dtmfPt_;    // the running leg's telephone-event pt, set at media start
 
         // Fresh dialog identity for the current attempt. A fallback INVITE
         // after a final response is a new transaction AND a clean new dialog
@@ -779,6 +830,7 @@ export namespace imsd::engine {
             leg.payloadType = ans.payloadType;
             leg.octetAlign = ans.octetAlign;
             leg.codec = ans.codec;
+            leg.dtmfPt = ans.dtmfPt;
             return leg;
         }
 
@@ -820,6 +872,7 @@ export namespace imsd::engine {
             return a;
         }
         Action StartMediaAct(const MediaLeg& leg) {
+            dtmfPt_ = leg.dtmfPt;
             Action a{Action::Type::StartMedia};
             a.media = leg;
             return a;
