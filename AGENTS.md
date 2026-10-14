@@ -48,7 +48,7 @@ PipeWire. The verified device/carrier combinations are in the README.
 | `interfaces/Imsd-Qmi.cppm` | `imsd::qmi` — the QMI WDS request bytes `imsd-pcscf` sends (Bind Mux Data Port, Set IP Family, Get Packet Service Status, Get Current Settings, Get Profile Settings), the message/TLV parser, the P-CSCF list readers (0x22 flag, 0x23 IPv4, 0x24 FQDN, 0x2E IPv6 — the last one libqmi does not model). |
 | `interfaces/ImsdBus.cppm` | `imsd::bus` — the polkit gate in front of call control, shared by imsd and imsd-ofonod. GLib, so outside `imsd-core`. |
 | `implementations/main.cpp` | The `imsd` daemon shell: GLib main loop, GDBus service, sockets, subprocesses, the registration sequence and the run loop that pumps the core. |
-| `implementations/media.cpp` | `imsd-media`, the per-call RTP leg. Pure std + POSIX, dlopen's the AMR codecs. |
+| `implementations/media.cpp` | `imsd-media`, the per-call RTP leg, DTMF included (RFC 4733 events, queued by `dtmf <tones>` lines on its stdin). Pure std + POSIX, dlopen's the AMR codecs. |
 | `implementations/pcscf.cpp` | `imsd-pcscf`, the P-CSCF reader: the AF_QIPCRTR socket, the WDS service lookup and the Bind Mux Data Port / Set IP Family / Get Current Settings sequence around `Imsd:Qmi` (plus Get Profile Settings with `--profile`, Get Packet Service Status with `-v`). std + POSIX + the Linux QRTR UAPI (`<linux/qrtr.h>`), no GLib; never Start/Stop Network. |
 | `implementations/dialerd.cpp` | `imsd-dialerd`, the Plasma Mobile session-bus backend (`org.kde.telephony.*`). |
 | `implementations/ofonod.cpp` | `imsd-ofonod`, the GNOME Calls system-bus backend (`org.ofono`). |
@@ -439,9 +439,18 @@ Rules:
   QRTR control lookup and the matching of answers by type, transaction and
   message id are shell code (`pcscf.cpp`) no test reaches.
 - `imsd-media --selftest` round-trips the RFC 4867 payload packing (both
-  formats, both AMR codecs) and the G.711 tables. `MIC_SRC=<file>` (raw s16
+  formats, both AMR codecs), the G.711 tables, and pins the RFC 4733 event
+  payload bytes and the keypad-to-event codes. `MIC_SRC=<file>` (raw s16
   PCM at the codec rate, paced in real time) and `PCM_DUMP=1` are test seams
-  for driving the leg against a synthetic RTP peer without a phone.
+  for driving the leg against a synthetic RTP peer without a phone; the fp6
+  journal's `utilities/media_loopback.py` is that peer, and its `--dtmf`
+  arm writes a `dtmf <tones>` line to the leg's stdin and checks the events
+  on the wire (one timestamp per event, the marker, the growing duration,
+  the end bit three times, the shared sequence and timestamp space with the
+  audio; with the mic file, or without a mic — `--no-mic`, the silence tick
+  carrying the events) — the sender's shape is proven there and on the dev phone's wire
+  (the fp6 journal's dtmf benches: their pcaps go through the same checks);
+  what a gateway does with the events is proven only by a call to one.
 - `imsd --session` and `imsd-ofonod --session` own their names on the session
   bus for development without root, polkit or a phone (§8.3).
 
@@ -1016,7 +1025,7 @@ this deadline). States and reasons are the frozen D-Bus vocabulary:
   `urn:service:sos` first, with one fallback to a plain INVITE of the digits;
   a plain INVITE answered `380 Alternative Service` with an emergency body is
   re-attempted as `urn:service:sos`.
-- `SendDtmf` is a stub (RFC 4733 not implemented).
+- `SendDtmf` is a stub.
 - Incoming calls reach imsd only when the network's T-ADS routes the call to
   the IMS domain; the REGISTER Contact advertises the MMTEL ICSI and
   `+sip.instance` for that. When T-ADS still picks CS, no INVITE arrives —
@@ -1032,7 +1041,22 @@ narrowband and G.711 PCMA/PCMU (8 kHz, what a PSTN gateway offers); AMR
 frames ride RFC 4867 payloads, octet-aligned or bandwidth-efficient
 (`OCTET_ALIGN`, mirrored from the SDP). The AMR codecs are dlopen'd
 (`libvo-amrwbenc` + `libopencore-amrwb` for WB, `libopencore-amrnb` for NB);
-G.711 is a table. **Exit code 3 means the downlink dried up** for
+G.711 is a table. DTMF (RFC 4733 telephone-events; `DTMF_PT` names their
+payload type, unset = none; nothing in imsd supplies the lines or the
+variable at this commit — a hand run or the loopback does): each `dtmf
+<tones>` line on its stdin queues the tones, and a tone takes seven 20 ms
+slots of the uplink in place of the audio frames — the event's five
+(100 ms at -10 dBm0: the marker bit on the first packet, the duration
+growing a slot at a time, the end bit on the fifth packet) and two in
+which the end packet goes out again (RFC 4733 §2.5.1.4) — then three
+slots of audio before the next tone; the audio's own sender carries the
+events — per captured frame (a silence tick without a mic) the event
+packet goes in the frame's place, one packet per slot — so events and
+audio share the stream's sequence and timestamp space (RFC 4733 §2.1), the
+clock stays the capture's, and the audio after an event is stamped as if
+it had run through it; a line of more than 4096 bytes is
+dropped through its end and the next line goes. **Exit
+code 3 means the downlink dried up** for
 `MEDIA_TIMEOUT` seconds (default 6.0) — the far-end-hangup signal, which on
 carriers whose BYE never reaches our SAs is the reliable teardown trigger.
 Per-call stats land in `OUT_DIR` (default the state dir); `RTP_DUMP=1`
@@ -1398,13 +1422,14 @@ resume.
 
 ### 10.2 imsd-media (per call, set through imsd's environment)
 
-The README's second table. Two pairs are not configuration and are left out
+The README's second table. These are not configuration and are left out
 there:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `CODEC`, `OCTET_ALIGN` | *(from the SDP)* | set by imsd from the negotiated answer; not configuration |
 | `MIC_SRC`, `PCM_DUMP` | *(unset)* | test seams (§5) |
+| `DTMF_PT` | *(unset)* | the telephone-event payload type the leg sends with (§7.6); nothing in imsd sets it — a hand run or the loopback does |
 
 ### 10.3 ims-pdn-up.sh and imsd-ofonod
 
@@ -1543,6 +1568,20 @@ the related code.
 - **Modem attach-family forcing** (Odido, O2 UK, Swisscom): an APN-string
   IPv6 bearer request is refused when the attach PDN was granted IPv4-only;
   a profile-indexed request is not.
+- **pw-record delivers 20 ms frames in bursts** — of two on an AMR-WB
+  call (1.8 frames per burst on average, the bursts ~37 ms apart; the dev
+  phone, 2026-10-15/16: of the uplink's inter-packet gaps 42–45 % are
+  under 4 ms and 50–52 % are 30–40 ms, 3–8 % lie between and under 1 %
+  above — the fp6 journal's `2026-10-16-dtmf-bench-14/uplink-cadence.txt`
+  over benches 4, 5, 13 and 14, counted by the `cadence.py` beside it),
+  of three or four on a narrowband one (3.3 on average, ~68 ms apart;
+  70 % under 4 ms, 28 % over 40 ms — `2026-10-16-dtmf-bench-17-heard/uplink-cadence-narrowband.txt`,
+  bench 17's two calls; the burst sizes of all six legs in `burst-sizes.txt`
+  beside it). A sender on a clock of its own cannot count the frames a
+  140 ms window holds, so the events ride the frames' own slots (§7.6),
+  and an event's packets leave in those bursts: the audio's own spacing,
+  which RFC 4733 §2.5.1.2 calls the natural interval for event updates
+  (its 50 ms recommendation is for a spacing of the sender's own).
 - **pmOS's default nftables** drops inbound on `qmapmux*`; without the
   protected-port rule every network-initiated request (NOTIFY, MT INVITE)
   dies after ESP decapsulation and MT calls fall back to CS.

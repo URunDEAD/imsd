@@ -26,11 +26,20 @@ DTX silence (every missing 20 ms slot is decoded as a NO_DATA frame for
 CNG/PLC; zeros for G.711). MIC=1 feeds live pw-record audio through the
 encoder.
 
+DTMF goes out as RFC 4733 telephone-event packets at the payload type the
+SDP negotiated for the codec's clock (DTMF_PT; unset = none): stdin is the
+daemon's control pipe, and each `dtmf <tones>` line queues its tones (0-9,
+*, #, A-D). A tone takes seven 20 ms slots of the uplink in place of the
+audio frames — the event's five (100 ms at -10 dBm0) and two in which its
+end packet goes out again — then three slots of audio run before the next
+tone.
+
 Usage: imsd-media <local-ip> <rtp-port> <remote-ip> <remote-port> <pt> <secs> <out-base>
        imsd-media --selftest   (payload pack/depay roundtrip, both formats,
-                                both AMR codecs; G.711 table roundtrip)
+                                both AMR codecs; G.711 table roundtrip; the
+                                telephone-event payload and codes)
 Env: CODEC MIC PLAY GAIN PLAY_GAIN AMR_MODE DTX MEDIA_TIMEOUT RTP_DUMP
-OCTET_ALIGN AUDIO_USER MIC_SRC PCM_DUMP
+OCTET_ALIGN AUDIO_USER MIC_SRC PCM_DUMP DTMF_PT
 (OCTET_ALIGN=0 selects RFC 4867 bandwidth-efficient payloads both ways; the
 daemon sets it from the negotiated SDP — 1 is the default/legacy behavior.
 AMR_MODE is the encoder mode of whichever AMR codec is active; default 2
@@ -45,6 +54,7 @@ with no PipeWire and no network.)
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pwd.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -471,8 +481,13 @@ Child SpawnPw(bool play, bool toChild, int rate) {
         if (toChild) { dup2(pipefd[0], STDIN_FILENO); }
         else { dup2(pipefd[1], STDOUT_FILENO); }
         close(pipefd[0]); close(pipefd[1]);
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            // our stdin is the daemon's control pipe: not pw-record's to hold
+            if (!toChild) dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
         std::vector<char*> cargv;
         for (auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
         cargv.push_back(nullptr);
@@ -507,19 +522,32 @@ struct TxState {
     sockaddr_storage latched{}; socklen_t latchedLen = 0;
     std::uint64_t tx = 0;
     std::uint64_t txMic = 0;
+    std::uint64_t txDtmf = 0;
     std::atomic<bool> micOn{false};
 };
 
-void RtpSend(int sock, TxState& st, std::span<const std::uint8_t> payload) {
+// One packet on the uplink, audio or event. Every packet stands in one
+// 20 ms slot of the stream's single timestamp base (RFC 4733 §2.1: events
+// share the audio's sequence and timestamp space), so the next slot's
+// timestamp advances whichever kind went out; an audio frame is stamped
+// with its slot (`ts` empty), an event packet with the event's start
+// (`ts` given — constant over the event, §2.5.1.2). Returns the timestamp
+// used.
+std::uint32_t RtpSendPacket(int sock, TxState& st, int pt, bool marker, std::optional<std::uint32_t> ts, std::span<const std::uint8_t> payload) {
     std::uint8_t hdr[12];
-    sockaddr_storage a1, a2; socklen_t l1, l2;
+    sockaddr_storage a1;
+    sockaddr_storage a2;
+    socklen_t l1;
+    socklen_t l2;
+    std::uint32_t stamp;
     {
         std::scoped_lock g(st.lock);
+        stamp = ts.value_or(st.ts);
         hdr[0] = 0x80;
-        hdr[1] = static_cast<std::uint8_t>(st.pt & 0x7F);
+        hdr[1] = static_cast<std::uint8_t>((marker ? 0x80 : 0) | (pt & 0x7F));
         hdr[2] = (st.seq >> 8) & 0xFF; hdr[3] = st.seq & 0xFF;
-        hdr[4] = (st.ts >> 24) & 0xFF; hdr[5] = (st.ts >> 16) & 0xFF;
-        hdr[6] = (st.ts >> 8) & 0xFF;  hdr[7] = st.ts & 0xFF;
+        hdr[4] = (stamp >> 24) & 0xFF; hdr[5] = (stamp >> 16) & 0xFF;
+        hdr[6] = (stamp >> 8) & 0xFF;  hdr[7] = stamp & 0xFF;
         hdr[8] = (st.ssrc >> 24) & 0xFF; hdr[9] = (st.ssrc >> 16) & 0xFF;
         hdr[10] = (st.ssrc >> 8) & 0xFF; hdr[11] = st.ssrc & 0xFF;
         st.seq = (st.seq + 1) & 0xFFFF;
@@ -537,7 +565,103 @@ void RtpSend(int sock, TxState& st, std::span<const std::uint8_t> payload) {
     sendTo(a1, l1);
     // avoid double-send when latched == dst
     if (l2 && (l2 != l1 || std::memcmp(&a1, &a2, l1) != 0)) sendTo(a2, l2);
+    return stamp;
 }
+
+// an audio frame: the stream's payload type, stamped with its slot
+void RtpSend(int sock, TxState& st, std::span<const std::uint8_t> payload) {
+    RtpSendPacket(sock, st, st.pt, false, std::nullopt, payload);
+}
+
+// ---- DTMF: RFC 4733 telephone-event packets on the uplink -----------------
+// A tone is one event of five slots (100 ms): an event packet in each in
+// place of the audio frame, the duration growing by a slot, the marker bit
+// on the first, the end bit on the fifth, which goes out three times, the
+// repeats in two slots of their own (§2.5.1.4) — then three slots of audio
+// before the next tone. The gateway's detector sees a 100 ms tone and a
+// 100 ms gap: what a keypad press produces, and Q.24's 40 ms minimums
+// with margin. The audio's own senders carry the events — per slot, a
+// captured frame in the mic thread or a silence tick in the main loop
+// without a mic (and the latch burst), `DtmfSender::SendSlot` sends
+// either the event packet the slot carries or the frame, under one lock —
+// so one packet leaves per slot, no frame can land inside an event
+// whichever thread holds the slot, and the stream's clock stays the
+// capture's; the slots an event took advanced it like frames
+// (RtpSendPacket), so the audio that follows is stamped as if it had run
+// through it.
+constexpr int DtmfToneSlots = 5;
+constexpr int DtmfEndRepeats = 2;
+constexpr int DtmfGapSlots = 3;
+constexpr std::uint8_t DtmfVolume = 10;   // -10 dBm0 (§2.3.4: 0 to -63)
+
+// The event code of a keypad character (§3.2: 0-9, * = 10, # = 11, A-D =
+// 12-15, either case); nullopt for anything else.
+std::optional<int> DtmfEvent(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c == '*') return 10;
+    if (c == '#') return 11;
+    if (c >= 'A' && c <= 'D') return 12 + (c - 'A');
+    if (c >= 'a' && c <= 'd') return 12 + (c - 'a');
+    return std::nullopt;
+}
+
+// §2.3: event, E | R | volume, the duration in timestamp units, big-endian.
+std::array<std::uint8_t, 4> DtmfPayload(int event, bool end, std::uint16_t duration) {
+    return {static_cast<std::uint8_t>(event),
+            static_cast<std::uint8_t>((end ? 0x80 : 0) | DtmfVolume),
+            static_cast<std::uint8_t>(duration >> 8),
+            static_cast<std::uint8_t>(duration & 0xFF)};
+}
+
+// The tones the control pipe queued, paid out one slot at a time by the
+// audio's own senders: one sender per slot, so no frame can land inside an
+// event and the stream's clock is the capture's.
+class DtmfSender {
+public:
+    void Queue(std::string_view tones) {
+        std::scoped_lock g(lock_);
+        for (char c : tones)
+            if (auto ev = DtmfEvent(c)) queue_.push_back(*ev);
+    }
+    // Called by the audio's sender for every uplink slot, with the frame
+    // it would send: under one lock the slot is decided and sent — the
+    // event packet the slot carries (returns true: the frame stays unsent),
+    // or the frame (false; an empty frame, a DTX gap, sends nothing). One
+    // decision and one send per slot, so no frame can land inside an event
+    // whichever thread holds the slot.
+    bool SendSlot(int sock, TxState& st, int pt, std::span<const std::uint8_t> frame) {
+        std::scoped_lock g(lock_);
+        if (gap_ > 0) {
+            gap_--;
+        } else if (event_ >= 0 || !queue_.empty()) {
+            if (event_ < 0) {
+                event_ = queue_.front();
+                queue_.pop_front();
+                slot_ = 0;
+                start_.reset();
+            }
+            slot_++;
+            const int reported = std::min(slot_, DtmfToneSlots);
+            const auto payload = DtmfPayload(event_, slot_ >= DtmfToneSlots, static_cast<std::uint16_t>(reported * st.tsStep));
+            start_ = RtpSendPacket(sock, st, pt, slot_ == 1, start_, payload);
+            { std::scoped_lock s(st.lock); st.txDtmf++; }
+            if (slot_ == DtmfToneSlots + DtmfEndRepeats) {
+                event_ = -1;
+                gap_ = DtmfGapSlots;
+            }
+            return true;
+        }
+        if (!frame.empty()) RtpSend(sock, st, frame);
+        return false;
+    }
+private:
+    std::mutex lock_;
+    std::deque<int> queue_;
+    int event_ = -1;   // the event on the wire; -1 = none
+    int slot_ = 0;     // its packets sent so far
+    int gap_ = 0;      // slots of audio owed before the next event
+    std::optional<std::uint32_t> start_;   // the event's timestamp
+};
 
 std::vector<std::pair<std::uint8_t, std::vector<std::uint8_t>>>
 Depay(Codec c, std::span<const std::uint8_t> pl, bool octetAlign) {
@@ -578,7 +702,9 @@ struct PktItem { std::uint32_t ts; std::vector<std::uint8_t> payload; };
 
 // --selftest: pack->depay roundtrip of every frame type, both payload
 // formats, both AMR codecs; G.711 digital zero, idempotence over the whole
-// 16-bit range, and a 1 kHz sine surviving with the codec's nominal SNR.
+// 16-bit range, and a 1 kHz sine surviving with the codec's nominal SNR;
+// the RFC 4733 telephone-event payload bytes and every keypad character's
+// event code.
 int SelfTest() {
     for (Codec c : {Codec::AmrWb, Codec::AmrNb}) {
         for (int ft = 0; ft < 16; ft++) {
@@ -601,6 +727,26 @@ int SelfTest() {
     }
     if (LinearToAlaw(0) != 0xD5 || LinearToUlaw(0) != 0xFF) {
         std::println(std::cerr, "selftest FAIL G.711 digital zero");
+        return 1;
+    }
+    // RFC 4733 §2.3: event, E | R | volume (-10 dBm0), duration big-endian
+    if (DtmfPayload(1, false, 160) != std::array<std::uint8_t, 4>{0x01, 0x0A, 0x00, 0xA0}
+        || DtmfPayload(11, true, 1600) != std::array<std::uint8_t, 4>{0x0B, 0x8A, 0x06, 0x40}) {
+        std::println(std::cerr, "selftest FAIL telephone-event payload");
+        return 1;
+    }
+    // §3.2: every keypad character's event code, the letters in either case,
+    // and no code for anything else
+    for (const char* keys : {"0123456789*#ABCD", "0123456789*#abcd"}) {
+        for (int ev = 0; ev < 16; ev++) {
+            if (DtmfEvent(keys[ev]) != ev) {
+                std::println(std::cerr, "selftest FAIL telephone-event code of '{}'", keys[ev]);
+                return 1;
+            }
+        }
+    }
+    if (DtmfEvent('E') || DtmfEvent('e') || DtmfEvent(' ') || DtmfEvent('\n')) {
+        std::println(std::cerr, "selftest FAIL telephone-event codes");
         return 1;
     }
     for (Codec c : {Codec::Pcma, Codec::Pcmu}) {
@@ -661,6 +807,7 @@ int main(int argc, char** argv) {
     bool rtpDump = EnvBool("RTP_DUMP", false);
     std::string micSrc = EnvOr("MIC_SRC", "");
     bool pcmDump = EnvBool("PCM_DUMP", false);
+    const int dtmfPt = std::atoi(EnvOr("DTMF_PT", "0").c_str());
     constexpr int ExitMediaTimeout = 3;
     constexpr int PrimeFrames = 8;
     constexpr int MaxFill = 25;
@@ -693,8 +840,13 @@ int main(int argc, char** argv) {
     signal(SIGINT, OnSig);
     signal(SIGPIPE, SIG_IGN);
 
+    // ---- DTMF: the tones the control pipe (below) queues; the audio's
+    // senders pay them out slot by slot
+    DtmfSender dtmf;
+
     // ---- mic uplink thread: pw-record (or the MIC_SRC file, real-time paced)
-    // through the codec's encoder, one RTP packet per 20 ms frame
+    // through the codec's encoder, one RTP packet per 20 ms frame — or the
+    // event packet whose slot it is
     std::atomic<bool> stop{false};
     std::jthread micThread;
     if (mic) {
@@ -731,23 +883,23 @@ int main(int argc, char** argv) {
                     next += std::chrono::milliseconds(20);
                     std::this_thread::sleep_until(next);
                 }
+                st.micOn.store(true);
                 std::memcpy(samples.data(), raw.data(), raw.size());
                 if (gain != 1.0)
                     for (auto& sample : samples) {
                         int v = static_cast<int>(sample * gain);
                         sample = static_cast<std::int16_t>(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
                     }
-                std::vector<std::uint8_t> payload;
+                std::vector<std::uint8_t> payload;   // empty: a DTX gap, nothing to send in the slot
                 if (amr) {
                     std::vector<std::uint8_t> frame = enc.Encode(samples.data(), amrMode, dtx);
-                    if (frame.empty()) continue;
-                    payload = PayloadFromFrame(codec, frame, octetAlign);
+                    if (!frame.empty()) payload = PayloadFromFrame(codec, frame, octetAlign);
                 } else {
                     payload = G711Payload(codec, samples);
                 }
-                st.micOn.store(true);
+                // the slot's packet: the event's, or this frame
+                if (dtmf.SendSlot(sock, st, dtmfPt, payload) || payload.empty()) continue;
                 { std::scoped_lock g(st.lock); st.txMic++; }
-                RtpSend(sock, st, payload);
             }
             st.micOn.store(false);
             close(fd);
@@ -867,9 +1019,65 @@ int main(int argc, char** argv) {
         });
     }
 
+    // ---- the control pipe that queues the tones: the daemon's
+    // `dtmf <tones>` lines on stdin. No pipe (a hand run, /dev/null) ends
+    // the reader at once; the leg runs on.
+    std::jthread ctlThread([&] {
+        // a hand run in the background of a job-control shell: a read of
+        // its terminal would stop the whole process (SIGTTIN); blocked for
+        // this thread, the read fails with EIO and the reader ends
+        sigset_t ttin;
+        sigemptyset(&ttin);
+        sigaddset(&ttin, SIGTTIN);
+        pthread_sigmask(SIG_BLOCK, &ttin, nullptr);
+        std::string pending;
+        bool discarding = false;   // an overlong line is dropped through its end
+        char buf[256];
+        while (!stop.load()) {
+            pollfd pfd{STDIN_FILENO, POLLIN, 0};
+            if (poll(&pfd, 1, 100) <= 0) continue;
+            const ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
+            if (n <= 0) return;
+            std::string_view in(buf, static_cast<std::size_t>(n));
+            if (discarding) {
+                const std::size_t end = in.find('\n');
+                if (end == std::string_view::npos) continue;
+                in.remove_prefix(end + 1);
+                discarding = false;
+            }
+            pending.append(in);
+            // a line of more than 4096 bytes with no end in sight: dropped
+            // through its end; the next line goes
+            if (pending.size() > 4096 && pending.find('\n') == std::string::npos) {
+                std::println(std::cerr, "imsd-media: control line of {} bytes without an end dropped", pending.size());
+                pending.clear();
+                discarding = true;
+                continue;
+            }
+            std::size_t nl;
+            while ((nl = pending.find('\n')) != std::string::npos) {
+                const std::string line = pending.substr(0, nl);
+                pending.erase(0, nl + 1);
+                // the same bound on a line whose end came in the read that
+                // took it past 4096 bytes
+                if (nl > 4096) {
+                    std::println(std::cerr, "imsd-media: control line of {} bytes dropped", nl);
+                    continue;
+                }
+                if (!line.starts_with("dtmf ")) {
+                    std::println(std::cerr, "imsd-media: control line ignored: {}", line);
+                } else if (dtmfPt > 0) {
+                    dtmf.Queue(std::string_view(line).substr(5));
+                } else {
+                    std::println(std::cerr, "imsd-media: {} dropped: no telephone-event payload type (DTMF_PT)", line);
+                }
+            }
+        }
+    });
+
     // ---- main recv loop
     std::vector<std::uint8_t> silence = SilenceFrame(codec, 0, octetAlign);
-    for (int i = 0; i < 5; i++) RtpSend(sock, st, silence);  // latch burst
+    for (int i = 0; i < 5; i++) dtmf.SendSlot(sock, st, dtmfPt, silence);  // latch burst, the one path
 
     std::FILE* dump = rtpDump ? std::fopen((std::format("{}.rtp", out)).c_str(), "wb") : nullptr;
     double t0 = Now();
@@ -888,7 +1096,8 @@ int main(int argc, char** argv) {
             break;
         }
         if (now - lastTx >= 0.02 && !st.micOn.load()) {
-            RtpSend(sock, st, silence);
+            // no mic: the slot's packet is the event's, or a silence frame
+            dtmf.SendSlot(sock, st, dtmfPt, silence);
             lastTx = now;
         }
         std::uint8_t buf[65535];
@@ -942,6 +1151,7 @@ int main(int argc, char** argv) {
 
     stop.store(true);
     qcv.notify_all();
+    if (ctlThread.joinable()) ctlThread.join();
     if (micThread.joinable()) micThread.join();
     if (playThread.joinable()) playThread.join();
     if (dump) std::fclose(dump);
@@ -961,14 +1171,14 @@ int main(int argc, char** argv) {
     // .stats sidecar (tiny; always written)
     if (std::FILE* sf = std::fopen((std::format("{}.stats", out)).c_str(), "w")) {
         std::print(sf,
-            "{{\"codec\": \"{}\", \"tx\": {}, \"tx_mic\": {}, \"rx\": {}, \"rx_bytes\": {}, "
+            "{{\"codec\": \"{}\", \"tx\": {}, \"tx_mic\": {}, \"tx_dtmf\": {}, \"rx\": {}, \"rx_bytes\": {}, "
             "\"rx_played\": {}, \"cng\": {}, \"late\": {}, \"qdrop\": {}, "
-            "\"first_src\": \"{}\", \"dst\": \"{}:{}\", \"pt\": {}, \"mic\": {}, "
+            "\"first_src\": \"{}\", \"dst\": \"{}:{}\", \"pt\": {}, \"dtmf_pt\": {}, \"mic\": {}, "
             "\"play\": {}, \"amr_mode\": {}, \"media_ended\": {}}}",
-            CodecName(codec), st.tx, st.txMic, rx, rxBytes, rxPlayed, cng, late, qdrop, firstSrc,
-            rIp, rPort, pt, mic, play, amrMode, mediaEnded);
+            CodecName(codec), st.tx, st.txMic, st.txDtmf, rx, rxBytes, rxPlayed, cng, late, qdrop, firstSrc,
+            rIp, rPort, pt, dtmfPt, mic, play, amrMode, mediaEnded);
         std::fclose(sf);
     }
-    std::println("imsd-media: codec={} tx={} tx_mic={} rx={} rx_played={} cng={} late={} " "qdrop={} rx_bytes={} first_src={} media_ended={}", CodecName(codec), st.tx, st.txMic, rx, rxPlayed, cng, late, qdrop, rxBytes, firstSrc, mediaEnded);
+    std::println("imsd-media: codec={} tx={} tx_mic={} tx_dtmf={} rx={} rx_played={} cng={} late={} " "qdrop={} rx_bytes={} first_src={} media_ended={}", CodecName(codec), st.tx, st.txMic, st.txDtmf, rx, rxPlayed, cng, late, qdrop, rxBytes, firstSrc, mediaEnded);
     return mediaEnded ? ExitMediaTimeout : 0;
 }
