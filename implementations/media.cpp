@@ -32,14 +32,17 @@ daemon's control pipe, and each `dtmf <tones>` line queues its tones (0-9,
 *, #, A-D). A tone takes seven 20 ms slots of the uplink in place of the
 audio frames — the event's five (100 ms at -10 dBm0) and two in which its
 end packet goes out again — then three slots of audio run before the next
-tone.
+tone. The far end's events — taken at DTMF_RX_PT (default DTMF_PT) and
+at DTMF_PT, never at the audio's payload type — are played as the tones
+they stand for, in step with the audio clock.
 
 Usage: imsd-media <local-ip> <rtp-port> <remote-ip> <remote-port> <pt> <secs> <out-base>
        imsd-media --selftest   (payload pack/depay roundtrip, both formats,
                                 both AMR codecs; G.711 table roundtrip; the
-                                telephone-event payload and codes)
+                                telephone-event payload, codes and Q.23
+                                frequency pairs)
 Env: CODEC MIC PLAY GAIN PLAY_GAIN AMR_MODE DTX MEDIA_TIMEOUT RTP_DUMP
-OCTET_ALIGN AUDIO_USER MIC_SRC PCM_DUMP DTMF_PT
+OCTET_ALIGN AUDIO_USER MIC_SRC PCM_DUMP DTMF_PT DTMF_RX_PT
 (OCTET_ALIGN=0 selects RFC 4867 bandwidth-efficient payloads both ways; the
 daemon sets it from the negotiated SDP — 1 is the default/legacy behavior.
 AMR_MODE is the encoder mode of whichever AMR codec is active; default 2
@@ -613,6 +616,28 @@ std::array<std::uint8_t, 4> DtmfPayload(int event, bool end, std::uint16_t durat
             static_cast<std::uint8_t>(duration & 0xFF)};
 }
 
+// The tone an event stands for (ITU-T Q.23 / RFC 4733 §3.2): the keypad's
+// row and column frequencies of events 0-15; nullopt for any other event.
+struct DtmfPair { int low; int high; };
+std::optional<DtmfPair> DtmfFrequencies(int event) {
+    static constexpr std::array<int, 4> lows = {697, 770, 852, 941};
+    static constexpr std::array<int, 4> highs = {1209, 1336, 1477, 1633};
+    // keypad rows 1 2 3 A / 4 5 6 B / 7 8 9 C / * 0 # D, indexed by event
+    static constexpr std::array<std::pair<int, int>, 16> cell = {{
+        {3, 1}, {0, 0}, {0, 1}, {0, 2}, {1, 0}, {1, 1}, {1, 2}, {2, 0},
+        {2, 1}, {2, 2}, {3, 0}, {3, 2}, {0, 3}, {1, 3}, {2, 3}, {3, 3}}};
+    if (event < 0 || event > 15) return std::nullopt;
+    const auto [row, col] = cell[static_cast<std::size_t>(event)];
+    return DtmfPair{lows[static_cast<std::size_t>(row)], highs[static_cast<std::size_t>(col)]};
+}
+
+// Sample `k` of a tone at `rate`: the two sines at `amp` each.
+std::int16_t DtmfSample(DtmfPair f, std::uint32_t k, int rate, double amp) {
+    const double t = static_cast<double>(k) / rate;
+    const double v = amp * (std::sin(2 * std::numbers::pi * f.low * t) + std::sin(2 * std::numbers::pi * f.high * t));
+    return static_cast<std::int16_t>(std::lround(std::clamp(v, -32768.0, 32767.0)));
+}
+
 // The tones the control pipe queued, paid out one slot at a time by the
 // audio's own senders: one sender per slot, so no frame can land inside an
 // event and the stream's clock is the capture's.
@@ -697,14 +722,14 @@ std::vector<std::int16_t> G711DecodeFrame(Codec c, std::span<const std::uint8_t>
 std::atomic<bool> Quit{false};
 void OnSig(int) { Quit.store(true); }
 
-// playout queue item
-struct PktItem { std::uint32_t ts; std::vector<std::uint8_t> payload; };
+// playout queue item: an audio packet, or (`event`) a telephone-event one
+struct PktItem { std::uint32_t ts; std::vector<std::uint8_t> payload; bool event = false; };
 
 // --selftest: pack->depay roundtrip of every frame type, both payload
 // formats, both AMR codecs; G.711 digital zero, idempotence over the whole
 // 16-bit range, and a 1 kHz sine surviving with the codec's nominal SNR;
-// the RFC 4733 telephone-event payload bytes and every keypad character's
-// event code.
+// the RFC 4733 telephone-event payload bytes, every keypad character's
+// event code, every event's Q.23 frequency pair and no tone past D.
 int SelfTest() {
     for (Codec c : {Codec::AmrWb, Codec::AmrNb}) {
         for (int ft = 0; ft < 16; ft++) {
@@ -747,6 +772,22 @@ int SelfTest() {
     }
     if (DtmfEvent('E') || DtmfEvent('e') || DtmfEvent(' ') || DtmfEvent('\n')) {
         std::println(std::cerr, "selftest FAIL telephone-event codes");
+        return 1;
+    }
+    // Q.23: every event's pair — rows 697/770/852/941 Hz for 1 2 3 A, 4 5 6 B,
+    // 7 8 9 C, * 0 # D; columns 1209/1336/1477/1633 Hz — and no tone past D
+    static constexpr std::array<std::pair<int, int>, 16> q23 = {{
+        {941, 1336}, {697, 1209}, {697, 1336}, {697, 1477}, {770, 1209}, {770, 1336}, {770, 1477}, {852, 1209},
+        {852, 1336}, {852, 1477}, {941, 1209}, {941, 1477}, {697, 1633}, {770, 1633}, {852, 1633}, {941, 1633}}};
+    for (int ev = 0; ev < 16; ev++) {
+        const auto f = DtmfFrequencies(ev);
+        if (!f || f->low != q23[static_cast<std::size_t>(ev)].first || f->high != q23[static_cast<std::size_t>(ev)].second) {
+            std::println(std::cerr, "selftest FAIL telephone-event tone {}", ev);
+            return 1;
+        }
+    }
+    if (DtmfFrequencies(16) || DtmfFrequencies(-1)) {
+        std::println(std::cerr, "selftest FAIL telephone-event tones past D");
         return 1;
     }
     for (Codec c : {Codec::Pcma, Codec::Pcmu}) {
@@ -808,6 +849,7 @@ int main(int argc, char** argv) {
     std::string micSrc = EnvOr("MIC_SRC", "");
     bool pcmDump = EnvBool("PCM_DUMP", false);
     const int dtmfPt = std::atoi(EnvOr("DTMF_PT", "0").c_str());
+    const int dtmfRxPt = std::atoi(EnvOr("DTMF_RX_PT", EnvOr("DTMF_PT", "0").c_str()).c_str());
     constexpr int ExitMediaTimeout = 3;
     constexpr int PrimeFrames = 8;
     constexpr int MaxFill = 25;
@@ -935,6 +977,8 @@ int main(int argc, char** argv) {
     std::uint64_t cng = 0;
     std::uint64_t late = 0;
     std::uint64_t qdrop = 0;
+    std::uint64_t rxDtmf = 0;    // telephone-event packets from the far end
+    std::uint64_t tones = 0;     // events of theirs rendered as a tone
     std::jthread playThread;
     if (decodeOn) {
         playThread = std::jthread([&] {
@@ -966,6 +1010,7 @@ int main(int argc, char** argv) {
             };
             std::vector<std::int16_t> zero(frameSamples, 0);
             std::optional<std::uint32_t> expect;
+            std::optional<std::uint32_t> toneTs;   // the event being rendered, by its start stamp
             for (;;) {
                 PktItem item;
                 {
@@ -974,6 +1019,55 @@ int main(int argc, char** argv) {
                     if (playq.empty()) return;
                     item = std::move(playq.front());
                     playq.pop_front();
+                }
+                if (item.event) {
+                    // The far end's key press, played as the tone it stands
+                    // for (§2.5.2.2 leaves rendering to the receiver). The
+                    // gap before the event's start — a stock sender's DTX
+                    // silence often precedes a key press (dev phone,
+                    // 2026-10-15: 0 to 7 slots) — is filled as before an
+                    // audio frame, so the tone starts where the event does.
+                    // Each packet reports the event's duration so far from
+                    // its start stamp; what the clock has not covered yet is
+                    // synthesized — a retransmitted end packet adds nothing,
+                    // a lost update is caught up by the next. A far end
+                    // whose audio resumes past the event (the stock phone's
+                    // does) meets the clock with the usual fill.
+                    if (item.payload.size() < 4) continue;
+                    const auto freqs = DtmfFrequencies(item.payload[0]);
+                    if (!freqs) continue;
+                    const std::uint32_t dur = (static_cast<std::uint32_t>(item.payload[2]) << 8) | item.payload[3];
+                    const double amp = 16383.0 * std::pow(10.0, -(item.payload[1] & 0x3F) / 20.0);
+                    if (!expect) {
+                        for (int i = 0; i < PrimeFrames; i++)
+                            if (!writePcm(zero)) return;
+                        expect = item.ts;
+                    }
+                    const std::uint32_t before = (item.ts - *expect) & 0xFFFFFFFF;
+                    if (before < 0x80000000u) {
+                        int fill = static_cast<int>(before / frameSamples);
+                        if (fill > MaxFill) fill = 0;
+                        for (int i = 0; i < fill; i++) {
+                            cng++;
+                            std::uint8_t nodata = 0x7C;
+                            std::vector<std::int16_t> pcm = amr ? dec.Decode(&nodata, 1) : zero;
+                            applyGain(pcm);
+                            if (!writePcm(pcm)) return;
+                        }
+                        expect = item.ts;
+                    }
+                    const std::uint32_t end = (item.ts + dur) & 0xFFFFFFFF;
+                    const std::uint32_t ahead = (end - *expect) & 0xFFFFFFFF;
+                    if (ahead == 0 || ahead > static_cast<std::uint32_t>(2 * rate)) continue;   // covered, or not a tone's length
+                    if (!toneTs || *toneTs != item.ts) { toneTs = item.ts; tones++; }
+                    const std::uint32_t from = (*expect - item.ts) & 0xFFFFFFFF;
+                    std::vector<std::int16_t> pcm(ahead);
+                    for (std::uint32_t i = 0; i < ahead; i++)
+                        pcm[i] = DtmfSample(*freqs, from + i, rate, amp);
+                    applyGain(pcm);
+                    if (!writePcm(pcm)) return;
+                    expect = end;
+                    continue;
                 }
                 std::vector<std::vector<std::uint8_t>> frames;
                 if (amr) {
@@ -1135,7 +1229,14 @@ int main(int argc, char** argv) {
             std::fwrite(lb, 1, 4, dump);
             std::fwrite(buf, 1, static_cast<std::size_t>(n), dump);
         }
-        if (playThread.joinable() && n >= 12 && (buf[1] & 0x7F) == pt) {
+        // the far end's events arrive at the payload type our own SDP gave
+        // telephone-event (DTMF_RX_PT), or at the one we send with when the
+        // answerer numbers for itself — never at the audio's: a frame is
+        // audio first
+        const int rxPt = n >= 12 ? buf[1] & 0x7F : -1;
+        const bool isEvent = n >= 12 && rxPt != pt && ((dtmfRxPt > 0 && rxPt == dtmfRxPt) || (dtmfPt > 0 && rxPt == dtmfPt));
+        if (isEvent) rxDtmf++;
+        if (playThread.joinable() && n >= 12 && (rxPt == pt || isEvent)) {
             std::size_t off = RtpPayloadOffset(std::span(buf, static_cast<std::size_t>(n)));
             std::uint32_t pktTs = (static_cast<std::uint32_t>(buf[4]) << 24) |
                                   (buf[5] << 16) | (buf[6] << 8) | buf[7];
@@ -1144,7 +1245,7 @@ int main(int argc, char** argv) {
                 playq.pop_front();
                 qdrop++;
             }
-            playq.push_back({pktTs, std::vector<std::uint8_t>(buf + off, buf + n)});
+            playq.push_back({pktTs, std::vector<std::uint8_t>(buf + off, buf + n), isEvent});
             qcv.notify_one();
         }
     }
@@ -1172,13 +1273,13 @@ int main(int argc, char** argv) {
     if (std::FILE* sf = std::fopen((std::format("{}.stats", out)).c_str(), "w")) {
         std::print(sf,
             "{{\"codec\": \"{}\", \"tx\": {}, \"tx_mic\": {}, \"tx_dtmf\": {}, \"rx\": {}, \"rx_bytes\": {}, "
-            "\"rx_played\": {}, \"cng\": {}, \"late\": {}, \"qdrop\": {}, "
-            "\"first_src\": \"{}\", \"dst\": \"{}:{}\", \"pt\": {}, \"dtmf_pt\": {}, \"mic\": {}, "
+            "\"rx_played\": {}, \"rx_dtmf\": {}, \"tones\": {}, \"cng\": {}, \"late\": {}, \"qdrop\": {}, "
+            "\"first_src\": \"{}\", \"dst\": \"{}:{}\", \"pt\": {}, \"dtmf_pt\": {}, \"dtmf_rx_pt\": {}, \"mic\": {}, "
             "\"play\": {}, \"amr_mode\": {}, \"media_ended\": {}}}",
-            CodecName(codec), st.tx, st.txMic, st.txDtmf, rx, rxBytes, rxPlayed, cng, late, qdrop, firstSrc,
-            rIp, rPort, pt, dtmfPt, mic, play, amrMode, mediaEnded);
+            CodecName(codec), st.tx, st.txMic, st.txDtmf, rx, rxBytes, rxPlayed, rxDtmf, tones, cng, late, qdrop, firstSrc,
+            rIp, rPort, pt, dtmfPt, dtmfRxPt, mic, play, amrMode, mediaEnded);
         std::fclose(sf);
     }
-    std::println("imsd-media: codec={} tx={} tx_mic={} tx_dtmf={} rx={} rx_played={} cng={} late={} " "qdrop={} rx_bytes={} first_src={} media_ended={}", CodecName(codec), st.tx, st.txMic, st.txDtmf, rx, rxPlayed, cng, late, qdrop, rxBytes, firstSrc, mediaEnded);
+    std::println("imsd-media: codec={} tx={} tx_mic={} tx_dtmf={} rx={} rx_played={} rx_dtmf={} tones={} cng={} late={} " "qdrop={} rx_bytes={} first_src={} media_ended={}", CodecName(codec), st.tx, st.txMic, st.txDtmf, rx, rxPlayed, rxDtmf, tones, cng, late, qdrop, rxBytes, firstSrc, mediaEnded);
     return mediaEnded ? ExitMediaTimeout : 0;
 }

@@ -84,6 +84,11 @@ export namespace imsd::sdp {
         std::vector<std::string> codecs;  // offered codecs in order; empty = AMR-WB, AMR
     };
 
+    // The payload type our offer gives telephone-event at a clock rate: the
+    // number an answerer sends with (RFC 3264 §6.1), whatever the answer
+    // renumbered ours to.
+    int OfferedTelephoneEventPt(int clockRate) { return clockRate == 16000 ? 98 : 100; }
+
     // Our offer: AMR-WB (octet-aligned) first, AMR narrowband second — the
     // 3GPP-mandatory codec every IMS core and PSTN gateway can answer, so a
     // call we place TO a landline no longer depends on the far side
@@ -109,8 +114,8 @@ export namespace imsd::sdp {
         s += "t=0 0\r\n";
         std::string pts;
         for (const auto& c : codecs) pts += std::format(" {}", pt(c));
-        if (wb) pts += " 98";
-        if (nb) pts += " 100";
+        if (wb) pts += std::format(" {}", OfferedTelephoneEventPt(16000));
+        if (nb) pts += std::format(" {}", OfferedTelephoneEventPt(8000));
         s += std::format("m=audio {} RTP/AVP{}\r\n", o.rtpPort, pts);
         s += std::format("b=AS:{}\r\n", wb ? 41 : amr ? 30 : 80);
         s += "b=RS:512\r\n";
@@ -127,12 +132,12 @@ export namespace imsd::sdp {
             }
         }
         if (wb) {
-            s += "a=rtpmap:98 telephone-event/16000\r\n";
-            s += "a=fmtp:98 0-15\r\n";
+            s += std::format("a=rtpmap:{} telephone-event/16000\r\n", OfferedTelephoneEventPt(16000));
+            s += std::format("a=fmtp:{} 0-15\r\n", OfferedTelephoneEventPt(16000));
         }
         if (nb) {
-            s += "a=rtpmap:100 telephone-event/8000\r\n";
-            s += "a=fmtp:100 0-15\r\n";
+            s += std::format("a=rtpmap:{} telephone-event/8000\r\n", OfferedTelephoneEventPt(8000));
+            s += std::format("a=fmtp:{} 0-15\r\n", OfferedTelephoneEventPt(8000));
         }
         s += "a=ptime:20\r\n";
         s += "a=maxptime:240\r\n";

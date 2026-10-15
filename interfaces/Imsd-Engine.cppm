@@ -283,7 +283,15 @@ export namespace imsd::engine {
     // Parsed SDP answer needed to bring up the media leg. `codec` is one of
     // imsd-media's: "AMR-WB", "AMR", "PCMA", "PCMU" (empty = none we play).
     // `dtmfPt` is the telephone-event payload type at the codec's clock
-    // (RFC 4733); nullopt = none negotiated, no DTMF on this call.
+    // (RFC 4733) the leg sends with — the peer's SDP's; nullopt = none
+    // negotiated, no DTMF on this call. `dtmfRxPt` is a second number the
+    // leg takes events at: our own SDP's at that clock — our offer's
+    // number on a call we placed (an answerer sends with the offer's
+    // numbers, RFC 3264 §6.1, and may renumber ours in the answer), the
+    // offer's we echoed on a call we answered; the answer's telephone-event
+    // number instead when the answer gave the audio our offer's number,
+    // which is then the leg's audio number. The leg takes events at
+    // either number, never at the audio's.
     struct MediaLeg {
         std::string remoteIp;
         int remotePort = 0;
@@ -291,6 +299,7 @@ export namespace imsd::engine {
         bool octetAlign = false;
         std::string codec = "AMR-WB";
         std::optional<int> dtmfPt;
+        std::optional<int> dtmfRxPt;
         bool Valid() const { return !remoteIp.empty() && remotePort > 0 && payloadType >= 0; }
     };
 
@@ -831,6 +840,12 @@ export namespace imsd::engine {
             leg.octetAlign = ans.octetAlign;
             leg.codec = ans.codec;
             leg.dtmfPt = ans.dtmfPt;
+            // the second number the leg takes events at: our offer's on a call
+            // we placed — the answer's instead when the answer gave the audio
+            // that very number, which is then the leg's audio number
+            const int offered = imsd::sdp::OfferedTelephoneEventPt(imsd::sdp::CodecRate(leg.codec));
+            leg.dtmfRxPt = !leg.dtmfPt ? std::nullopt
+                : std::optional<int>(direction_ == Direction::Outgoing && offered != leg.payloadType ? offered : *leg.dtmfPt);
             return leg;
         }
 

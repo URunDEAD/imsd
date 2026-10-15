@@ -206,6 +206,7 @@ int main() {
             "a=rtpmap:104 AMR-WB/16000/1\r\n"
             "a=rtpmap:105 telephone-event/16000\r\n"
             "a=rtpmap:106 telephone-event/8000\r\n";
+        Check(OfferedTelephoneEventPt(16000) == 98 && OfferedTelephoneEventPt(8000) == 100, "our offer's telephone-event numbers per clock");
         Check(TelephoneEventPt(offer, 16000) == 105, "telephone-event pt by clock rate");
         Check(!TelephoneEventPt(offer, 8000), "an rtpmap the m-line does not list (106 among 104 105) is not negotiated");
         Check(ParseAnswer(offer).dtmfPt == 105, "the answer's dtmfPt is the one at the chosen codec's clock (AMR-WB: 16000)");

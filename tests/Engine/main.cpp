@@ -270,6 +270,7 @@ int main() {
         auto a200 = m.OnInviteResponse(R200Sdp(m.CallId(), std::format("{}m=audio 6004 RTP/AVP 97 98 100\r\na=rtpmap:97 AMR-WB/16000/1\r\na=rtpmap:98 telephone-event/16000\r\na=rtpmap:100 telephone-event/8000\r\n", SdpHead)));
         const Action* media = Find(a200, Action::Type::StartMedia);
         Check(media && media->media.dtmfPt == 98, "the leg carries the answer's telephone-event pt at the codec's clock (98, not the narrowband 100)");
+        Check(media && media->media.dtmfRxPt == 98, "outgoing: the far end sends at our offer's number for that clock");
         Check(m.State() == CallState::Active, "active");
         auto sent = m.OnDtmf("12#*a");
         const Action* dt = Find(sent, Action::Type::SendDtmf);
@@ -290,6 +291,35 @@ int main() {
         m.OnHangup();
         auto late = m.OnDtmf("5");
         Check(!Has(late, Action::Type::SendDtmf) && Find(late, Action::Type::Log) && Find(late, Action::Type::Log)->text.ends_with("the call is terminated"), "DTMF after the call: dropped, the line names the state");
+    }
+
+    // ---- DTMF, outgoing, the answer renumbered telephone-event (RFC 3264
+    //      allows it): we send with its number, the far end with our offer's
+    {
+        imsd::util::Rng rng(44);
+        CallMachine m(c, rng, "ims-call-1e", "1233", 50004, false);
+        m.Start();
+        auto a200 = m.OnInviteResponse(R200Sdp(m.CallId(), std::format("{}m=audio 6004 RTP/AVP 97 101\r\na=rtpmap:97 AMR-WB/16000/1\r\na=rtpmap:101 telephone-event/16000\r\n", SdpHead)));
+        const Action* media = Find(a200, Action::Type::StartMedia);
+        Check(media && media->media.dtmfPt == 101 && media->media.dtmfRxPt == 98, "renumbered answer: send with 101, listen on our 98");
+        // a narrowband answer: AMR at 99 with telephone-event/8000 at 102
+        imsd::util::Rng rng2(45);
+        CallMachine n(c, rng2, "ims-call-1f", "1233", 50004, false);
+        n.Start();
+        auto b200 = n.OnInviteResponse(R200Sdp(n.CallId(), std::format("{}m=audio 6004 RTP/AVP 99 102\r\na=rtpmap:99 AMR/8000/1\r\na=rtpmap:102 telephone-event/8000\r\n", SdpHead)));
+        const Action* nbMedia = Find(b200, Action::Type::StartMedia);
+        Check(nbMedia && nbMedia->media.codec == "AMR" && nbMedia->media.dtmfPt == 102 && nbMedia->media.dtmfRxPt == 100, "narrowband answer: send with its 102, listen on our offer's 100");
+        // an answer numbering for itself that gives the audio our offer's
+        // telephone-event number: the receive number is the answer's, never
+        // the audio's (every downlink frame would be taken for an event)
+        imsd::util::Rng rng3(46);
+        CallMachine o(c, rng3, "ims-call-1g", "1233", 50004, false);
+        o.Start();
+        auto c200 = o.OnInviteResponse(R200Sdp(o.CallId(), std::format("{}m=audio 6004 RTP/AVP 100 101\r\na=rtpmap:100 AMR/8000/1\r\na=rtpmap:101 telephone-event/8000\r\n", SdpHead)));
+        const Action* colMedia = Find(c200, Action::Type::StartMedia);
+        Check(colMedia && colMedia->media.payloadType == 100 && colMedia->media.dtmfPt == 101 && colMedia->media.dtmfRxPt == 101, "the audio at our telephone-event number: listen on the answer's 101, not the audio's 100");
+        auto again = m.OnInviteResponse(R200(m.CallId()));
+        Check(!Find(again, Action::Type::StartMedia), "a retransmitted 200 starts no second leg");
     }
 
     // ---- remote BYE mid-call
@@ -432,6 +462,7 @@ int main() {
         Check(ok && ok->text.contains("a=rtpmap:105 telephone-event/16000\r\n"), "answer keeps telephone-event");
         const Action* mtMedia = Find(aa, Action::Type::StartMedia);
         Check(mtMedia && mtMedia->media.dtmfPt == 105, "incoming: the leg carries the offer's telephone-event pt");
+        Check(mtMedia && mtMedia->media.dtmfRxPt == 105, "incoming: the far end sends at the number we echoed");
         auto mtDtmf = m.OnDtmf("9");
         const Action* mtDt = Find(mtDtmf, Action::Type::SendDtmf);
         Check(mtDt && mtDt->text == "9", "incoming, accepted: the tones go to the leg");

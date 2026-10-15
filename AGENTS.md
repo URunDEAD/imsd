@@ -40,7 +40,7 @@ PipeWire. The verified device/carrier combinations are in the README.
 | `interfaces/Imsd.cppm` | The primary module interface of `imsd-core`: `export import`s the eight partitions below. |
 | `interfaces/Imsd-Util.cppm` | `imsd::util` — SIP tokens, IPv6 host/port formatting, the RFC 5952 §4 IPv6 text (`CanonicalIp6`/`CanonicalAddr`; an IPv4-mapped address spelled in hex stays hex, where §5 and `inet_ntop` write it dotted) and the comma-separated address-list parser (`ParseAddressList`), hex/base64, MD5 (RFC 1321), the fixed protected ports `PortUc`/`PortUs` (45061/45062). |
 | `interfaces/Imsd-Sip.cppm` | `imsd::sip` — SIP as a text layer plus TCP framing: header extraction, status codes, the granted lifetime, `ResponseOf` transaction matching. Not a full RFC 3261 parser, deliberately. |
-| `interfaces/Imsd-Sdp.cppm` | `imsd::sdp` — SDP offer/answer: the AMR-WB + AMR + telephone-event offer (optional IR.92 preconditions), the parser the media plane needs (the codec, its payload type and mode, and the telephone-event payload type the m-line lists at that codec's clock), `BuildAnswer` for the terminating side, the `CODECS` override. |
+| `interfaces/Imsd-Sdp.cppm` | `imsd::sdp` — SDP offer/answer: the AMR-WB + AMR + telephone-event offer (optional IR.92 preconditions; `OfferedTelephoneEventPt` names its telephone-event numbers), the parser the media plane needs (the codec, its payload type and mode, and the telephone-event payload type the m-line lists at that codec's clock), `BuildAnswer` for the terminating side, the `CODECS` override. |
 | `interfaces/Imsd-Aka.cppm` | `imsd::aka` — USIM AKA glue: the AKAv1-MD5 digest (RFC 3310), IMPI/IMPU/realm from IMSI + MCC/MNC, parsers for `qmicli --uim-get-card-status` and `mmcli` output, the AUTHENTICATE APDU and its response. |
 | `interfaces/Imsd-Ipsec.cppm` | `imsd::ipsec` — the two ESP SA pairs (TS 33.203) as `ip xfrm` argv lists, the Security-Server mechanism selection, and the reader that reconstructs SPIs/ports from `ip xfrm state`/`policy` text for a warm resume, and (1.0.0) `SaPeer`, the P-CSCF the kernel's pair is to, read from the `dir out` policies that carry imsd's fingerprint, `OwnXfrmDeleteCommands`, the deletes by exact key of what two rules select — the policies carrying imsd's fingerprint and the reqid-1/2 transport-mode ESP states in their direction or on the UE's ims-PDN address, whoever installed them (§12), and `FileNamesAnotherPair`, whether a state file's `spi_uc`/`spi_us` name the kernel's pair (unknown on either side decides nothing). |
 | `interfaces/Imsd-Messages.cppm` | `imsd::msg` — every SIP request and response imsd sends, built from an explicit `Context` and per-request variables so the builders are pure functions; byte-pinned by `tests/Messages`. Also `IsEmergency`. |
@@ -48,7 +48,7 @@ PipeWire. The verified device/carrier combinations are in the README.
 | `interfaces/Imsd-Qmi.cppm` | `imsd::qmi` — the QMI WDS request bytes `imsd-pcscf` sends (Bind Mux Data Port, Set IP Family, Get Packet Service Status, Get Current Settings, Get Profile Settings), the message/TLV parser, the P-CSCF list readers (0x22 flag, 0x23 IPv4, 0x24 FQDN, 0x2E IPv6 — the last one libqmi does not model). |
 | `interfaces/ImsdBus.cppm` | `imsd::bus` — the polkit gate in front of call control, shared by imsd and imsd-ofonod. GLib, so outside `imsd-core`. |
 | `implementations/main.cpp` | The `imsd` daemon shell: GLib main loop, GDBus service, sockets, subprocesses, the registration sequence and the run loop that pumps the core. |
-| `implementations/media.cpp` | `imsd-media`, the per-call RTP leg, DTMF included (RFC 4733 events, queued by `dtmf <tones>` lines on its stdin). Pure std + POSIX, dlopen's the AMR codecs. |
+| `implementations/media.cpp` | `imsd-media`, the per-call RTP leg, DTMF included (RFC 4733 events out, queued by `dtmf <tones>` lines on its stdin; the far end's events in, played as tones). Pure std + POSIX, dlopen's the AMR codecs. |
 | `implementations/pcscf.cpp` | `imsd-pcscf`, the P-CSCF reader: the AF_QIPCRTR socket, the WDS service lookup and the Bind Mux Data Port / Set IP Family / Get Current Settings sequence around `Imsd:Qmi` (plus Get Profile Settings with `--profile`, Get Packet Service Status with `-v`). std + POSIX + the Linux QRTR UAPI (`<linux/qrtr.h>`), no GLib; never Start/Stop Network. |
 | `implementations/dialerd.cpp` | `imsd-dialerd`, the Plasma Mobile session-bus backend (`org.kde.telephony.*`). |
 | `implementations/ofonod.cpp` | `imsd-ofonod`, the GNOME Calls system-bus backend (`org.ofono`). |
@@ -292,7 +292,9 @@ What the suites pin:
   emergency chain, DTMF — sent to the leg on an active call that negotiated
   telephone-event, dropped with the reason before the answer, after the
   call, without the negotiation, for a character that is no tone or for a
-  string past `DtmfMaxTones`) and
+  string past `DtmfMaxTones`; the receive payload type: our offer's on a
+  renumbered answer, the answer's when the audio took ours, the echoed
+  offer's on an incoming call) and
   `RegRecovery` (thresholds, backoffs, the throttle
   schedule, Retry-After, which waits a Dial may cut short, when the old
   registration counts as gone, the holds a restart takes over, a binding the
@@ -444,7 +446,12 @@ Rules:
   calls from that phone (the offer's 111 at 16 kHz)
   10 and 4 keys sent from the keypad (benches 3 and 4); on Plasma Mobile,
   11 keys from Plasma Dialer's keypad on an incoming call and 3 on an
-  outgoing narrowband one, through `imsd-dialerd` (bench 10). Every event of
+  outgoing narrowband one, through `imsd-dialerd` (bench 10); the stock
+  phone's key presses heard as tones (on GNOME Calls: bench 3's twelve on
+  the renderer before the gap fill, bench 4's four on it with the gap
+  fill; on Plasma Mobile: bench 10's ten on an incoming wideband call and
+  two on an outgoing narrowband one, every received event rendered by the
+  leg's own count). Every event of
   ours in benches 1 to 3 and 5 to 17 is in the RFC 4733 shape on the wire
   with the clock shared with the audio, and so are three of bench 4's
   four: the third carried a mic frame after its first packet (seq 1761
@@ -470,8 +477,14 @@ Rules:
   telephone-event at the codec's clock (pinned in `tests/Sdp`), the shell's
   refusal of a line over PIPE_BUF and its `not sent: no control pipe` line
   on a call with no media leg (nothing pins these two), a `pipe()` failure, a write to a
-  dead leg's pipe (`DTMF '…' not sent: …`), a full pipe's EAGAIN, and
-  G.711 (the loopback only).
+  dead leg's pipe (`DTMF '…' not sent: …`), a full pipe's EAGAIN, G.711
+  (the loopback only), a received event with a code past D (dropped
+  unrendered) or one whose packet reports more than two seconds the clock
+  has not covered (that packet skipped — a long key press renders slot by
+  slot), a lost first packet of an event (the renderer starts where the
+  clock stands), and an answer that renumbers telephone-event or gives the
+  audio our number (`DTMF_RX_PT` — KPN echoes our numbers; pinned in
+  `tests/Engine` and by the loopback's collision arm).
 - `imsd-pcscf` ran on the dev phone (KPN) on 2026-10-11 against the live ims
   bearer: the `--mux 1 --profile 2 -v` sequence, a plain run, and `OutOfCall`
   on an unbound mux (the fp6 journal's `2026-10-11-pcscf-pco-probe` capture,
@@ -484,7 +497,8 @@ Rules:
   message id are shell code (`pcscf.cpp`) no test reaches.
 - `imsd-media --selftest` round-trips the RFC 4867 payload packing (both
   formats, both AMR codecs), the G.711 tables, and pins the RFC 4733 event
-  payload bytes and the keypad-to-event codes. `MIC_SRC=<file>` (raw s16
+  payload bytes, the keypad-to-event codes and every event's Q.23
+  frequency pair. `MIC_SRC=<file>` (raw s16
   PCM at the codec rate, paced in real time) and `PCM_DUMP=1` are test seams
   for driving the leg against a synthetic RTP peer without a phone; the fp6
   journal's `utilities/media_loopback.py` is that peer, and its `--dtmf`
@@ -492,9 +506,13 @@ Rules:
   on the wire (one timestamp per event, the marker, the growing duration,
   the end bit three times, the shared sequence and timestamp space with the
   audio; with the mic file, or without a mic — `--no-mic`, the silence tick
-  carrying the events) — the sender's shape is proven there and on the dev phone's wire
-  (the fp6 journal's dtmf benches: their pcaps go through the same checks);
-  what a gateway does with the events is proven only by a call to one.
+  carrying the events), and its `--dtmf-rx` arm has the peer send events and checks the
+  decoded downlink for each tone's two frequencies where the event sat, the
+  stream intact around it — the sender's shape is proven there and on the
+  dev phone's wire (the fp6 journal's dtmf benches: their pcaps go through
+  the same checks), the renderer's there — and on the dev phone by ear and
+  by the leg's count of events rendered (bench 10); what a gateway does
+  with the events is proven only by a call to one.
 - `imsd --session` and `imsd-ofonod --session` own their names on the session
   bus for development without root, polkit or a phone (§8.3).
 
@@ -1074,7 +1092,13 @@ sent, emit this D-Bus state change, arm this deadline). States and reasons are t
 - DTMF (`SendDtmf`): the tones go out as RFC 4733 telephone-event packets
   on the call's RTP stream, at the payload type the SDP negotiated for the
   codec's clock (`MediaLeg::dtmfPt`: the answer's for an outgoing call, the
-  offer's for an incoming one). The
+  offer's for an incoming one; the leg takes the far end's events at that
+  number and at `MediaLeg::dtmfRxPt`, `DTMF_RX_PT` — our own SDP's at that
+  clock: our offer's on a call we placed (the answerer sends with the
+  offer's numbers, RFC 3264 §6.1), the echoed offer's on one we answered
+  (the offerer with the answer's, §5.1); the answer's instead when
+  the answer gave the audio our offer's number, which is then the leg's
+  audio number — never at the audio's). The
   engine's `OnDtmf` lets them through on an active call that negotiated
   telephone-event and drops them otherwise, with a journal line that says
   why (before the answer, after the call, no telephone-event at the codec's
@@ -1114,8 +1138,21 @@ packet goes in the frame's place, one packet per slot — so events and
 audio share the stream's sequence and timestamp space (RFC 4733 §2.1), the
 clock stays the capture's, and the audio after an event is stamped as if
 it had run through it; a line of more than 4096 bytes is
-dropped through its end and the next line goes. **Exit
-code 3 means the downlink dried up** for
+dropped through its end and the next line goes. The far end's events —
+taken at `DTMF_RX_PT` (our offer's 98 or 100 on a call we placed, the
+number an answerer sends with, RFC 3264 §6.1, whatever the answer
+renumbered ours to; the offer's number we echoed on a call we answered;
+the answer's telephone-event number instead when the answer gave the
+audio our offer's number, which is then the leg's audio number) and at
+`DTMF_PT`, never at the audio's — are played as the tones they stand for
+(ITU-T Q.23's frequency pairs, at the packet's volume), in the playout, in
+step with the audio clock: the gap before the event's start (a stock
+sender's DTX silence often precedes a key press — 0 to 7 slots on the dev
+phone, 2026-10-15) is filled as before an audio frame, each packet reports
+the event's duration so far and what the clock has not covered is
+synthesized, so a retransmitted end packet adds nothing and a lost update
+is caught up by the next; a far end whose audio resumes past the event
+(the stock phone's does, §13) meets the clock with the usual fill. **Exit code 3 means the downlink dried up** for
 `MEDIA_TIMEOUT` seconds (default 6.0) — the far-end-hangup signal, which on
 carriers whose BYE never reaches our SAs is the reliable teardown trigger.
 Per-call stats land in `OUT_DIR` (default the state dir); `RTP_DUMP=1`
@@ -1211,7 +1248,8 @@ Lines the operator (and the scripts) look for, all prefixed `imsd: `:
   removed`).
 - `audio session: …` at start and at each call's media start; `CODECS override active: …`.
 - `media <codec> pt=N octet=true|false -> [X]:P, telephone-event pt N|none` at a
-  call's media start; `call X: DTMF '…' -> media leg (telephone-event pt
+  call's media start (`… pt N (theirs M)` when `DTMF_RX_PT` differs from
+  the one we send with); `call X: DTMF '…' -> media leg (telephone-event pt
   N)` for tones the engine lets through, `call X: DTMF '…' dropped: the call is <state>` /
   `… dropped: no telephone-event negotiated for this call` / `… dropped:
   'c' is not a tone` / `call X: DTMF of N tones dropped: more than 128` for
@@ -1497,7 +1535,7 @@ there:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CODEC`, `OCTET_ALIGN`, `DTMF_PT` | *(from the SDP)* | set by imsd from the negotiated answer (`DTMF_PT`: the telephone-event payload type at the codec's clock, empty when none was negotiated); not configuration |
+| `CODEC`, `OCTET_ALIGN`, `DTMF_PT`, `DTMF_RX_PT` | *(from the SDP)* | set by imsd from the SDP (`DTMF_PT`: the telephone-event payload type at the codec's clock the leg sends with, empty when none was negotiated; `DTMF_RX_PT`: a second number the leg takes events at — our own SDP's at that clock, or the answer's when the answer gave the audio our offer's number, §7.6); not configuration |
 | `MIC_SRC`, `PCM_DUMP` | *(unset)* | test seams (§5) |
 
 ### 10.3 ims-pdn-up.sh and imsd-ofonod
@@ -1658,7 +1696,19 @@ the related code.
   AMR-WB 107 with telephone-event 111; events of the sender's first shape
   (100 ms, a packet every 20 ms, at least 100 ms apart) were heard on that
   phone (bench 2 the first shape; bench 17 the one-sender shape — 28 keys
-  on two narrowband calls, every one heard there).
+  on two narrowband calls, every one heard there). On
+  its own AMR-WB calls to us (telephone-event 111 at 16 kHz) that phone
+  sends one event of 20 packets per key press (340 ms, -10 dBm0, an update
+  every 20 ms, the end packet three times), its audio resuming one to eight
+  slots past the event's end and the event preceded by a DTX gap of up to
+  seven slots (the fp6 journal's benches 2 to 4 and bench 10's incoming
+  call, their `far-end-events-*` files); on a call we placed that the
+  network answered narrowband (telephone-event 100 at 8 kHz) its two key
+  presses arrived as events of 22 and 19 packets (400 and 340 ms), the
+  audio resuming 15.8 and 19 slots (316 and 380 ms) past their ends, the
+  first off the stream's 20 ms timestamp grid (bench 10's outgoing call) —
+  whether that shape is the phone's or the network's interworking,
+  nothing on disk says.
 - **pmOS's default nftables** drops inbound on `qmapmux*`; without the
   protected-port rule every network-initiated request (NOTIFY, MT INVITE)
   dies after ESP decapsulation and MT calls fall back to CS.

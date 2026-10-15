@@ -2551,7 +2551,9 @@ private:
 
     void StartMedia(const imsd::engine::MediaLeg& leg) {
         if (!leg.Valid()) { Log("SDP answer missing media endpoint; no media leg"); return; }
-        Log(std::format("media {} pt={} octet={} -> [{}]:{}, telephone-event pt {}", leg.codec, leg.payloadType, leg.octetAlign, leg.remoteIp, leg.remotePort, leg.dtmfPt ? std::to_string(*leg.dtmfPt) : std::string("none")));
+        Log(std::format("media {} pt={} octet={} -> [{}]:{}, telephone-event pt {}{}", leg.codec, leg.payloadType, leg.octetAlign, leg.remoteIp, leg.remotePort,
+                        leg.dtmfPt ? std::to_string(*leg.dtmfPt) : std::string("none"),
+                        leg.dtmfRxPt && leg.dtmfRxPt != leg.dtmfPt ? std::format(" (theirs {})", *leg.dtmfRxPt) : std::string()));
         if (Is6(leg.remoteIp)) RunCmd({"ip", "-6", "route", "replace", leg.remoteIp, "dev", dev_});
         else
             RunCmd({"ip", "route", "replace", leg.remoteIp, "dev", dev_});
@@ -2594,6 +2596,7 @@ private:
             setenv("OCTET_ALIGN", leg.octetAlign ? "1" : "0", 1);
             setenv("CODEC", leg.codec.c_str(), 1);
             setenv("DTMF_PT", leg.dtmfPt ? std::to_string(*leg.dtmfPt).c_str() : "", 1);
+            setenv("DTMF_RX_PT", leg.dtmfRxPt ? std::to_string(*leg.dtmfRxPt).c_str() : "", 1);
             std::vector<char*> c;
             for (auto& s : argv) c.push_back(const_cast<char*>(s.c_str()));
             c.push_back(nullptr);
