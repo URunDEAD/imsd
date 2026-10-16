@@ -6,21 +6,11 @@
 Userspace IMS/VoLTE daemon for mainline Linux phones.
 
 Most Linux phones drive the modem's internal IMS engine.
-imsd implements the whole IMS client in userspace instead:
-SIP registration with USIM AKA authentication over kernel
-IPsec (ESP), call signalling, and the AMR-WB RTP media plane wired into
+imsd implements the whole IMS client in userspace instead wired into
 PipeWire so a stock mobile dialer like Plasma Dialer or GNOME Calls under Phosh
 can place and receive real VoLTE calls on a commercial network.
 
-## Status
-
-Call-capable, both directions: outgoing calls place, answer, carry full-duplex
-AMR-WB audio and tear down. Incoming calls ring, answer and carry media the
-same way, driven end-to-end from a stock dialer over a frozen D-Bus ABI.
-Not there yet: DTMF (`SendDtmf` is a stub), hold/multiparty/call waiting,
-USSD.
-
-Verified by community members to be fully working:
+Calls verified by community members to be fully working:
 
 | Device | OS | Carrier |
 |---|---|---|
