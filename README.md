@@ -28,6 +28,7 @@ Verified by community members to be fully working:
 | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Telekom Deutschland GER |
 | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Phonero |
 | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Telia Norge |
+| The Fairphone (Gen. 6) | postmarketOS, Linux 7.2.0 | o2-uk |
 
 ## What it needs
 
