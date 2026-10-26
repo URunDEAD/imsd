@@ -477,7 +477,9 @@ Child SpawnPw(bool play, bool toChild, int rate) {
     const char* tool = play ? "pw-play" : "pw-record";
     const char* lat = play ? "40ms" : "20ms";
     std::string rateStr = std::to_string(rate);
-    for (const char* a : {tool, "--raw", "--rate", rateStr.c_str(), "--channels", "1", "--format", "s16", "--latency", lat, "-"})
+    // media.role Phone (pulse "phone"): lets the session's call routing and
+    // role-based volume (Lomiri indicator-sound, WirePlumber) see call audio.
+    for (const char* a : {tool, "--media-role", "Phone", "--raw", "--rate", rateStr.c_str(), "--channels", "1", "--format", "s16", "--latency", lat, "-"})
         argv.emplace_back(a);
     pid_t pid = fork();
     if (pid == 0) {
